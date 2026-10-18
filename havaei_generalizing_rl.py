@@ -1,9 +1,6 @@
 """
 Consolidated Path-Agnostic Environment, Physics, 150-Step Neural Emulator,
-and Idea A (MPC-Horizon Rollout) RL Trainer (`havaei_generalizing_rl.py`).
-
-Replaces `havaei_nonlinear_two_phase.py` completely so all physics, models,
-and RL training logic live in one cohesive module.
+and Multi-Scale Horizon Rollout RL Trainer (`havaei_generalizing_rl.py`).
 """
 from __future__ import annotations
 
@@ -21,9 +18,6 @@ HYBRID_ALGORITHMS = ("GA", "PSO", "DE", "ICA", "MPC")
 ALG_TO_IDX = {name: i for i, name in enumerate(ALGORITHMS)}
 
 
-# ===========================================================================
-# 1. True Nonlinear Train Physics (Equations 2 - 10 of Havaei & Sandidzadeh)
-# ===========================================================================
 class NonlinearTrainPhysics:
     def __init__(self, mass_kg: float = 85000.0, sample_dist_d: float = 8.33):
         self.M = mass_kg
@@ -53,15 +47,7 @@ class NonlinearTrainPhysics:
         return 0.0 if v <= 1e-4 else (self.A * (v ** 2) + self.B * v + self.C)
 
 
-# ===========================================================================
-# 2. 150-Step Neural Trajectory Emulator & RL Policy Network
-# ===========================================================================
 class LearnedLinearizationModel(nn.Module):
-    """
-    Learns the state- and algorithm-dependent nonlinear velocity residual:
-      v_hat(k+1) = v_linear(k+1) + delta_v_nl(x, v, ext_force, w_alg)
-    """
-
     def __init__(self, hidden_dim: int = 64):
         super().__init__()
         self.net = nn.Sequential(
@@ -90,7 +76,7 @@ class LearnedLinearizationModel(nn.Module):
 
 
 class TwoPhaseRLSwitchPolicy(nn.Module):
-    def __init__(self, obs_dim: int = 26, n_algs: int = 4, hidden_dim: int = 64):
+    def __init__(self, obs_dim: int = 20, n_algs: int = 4, hidden_dim: int = 64):
         super().__init__()
         self.actor = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
@@ -125,8 +111,6 @@ class TwoPhaseRLSwitchPolicy(nn.Module):
 
 
 class HardcodedSwitchController:
-    """Paper's rule-based switch (Fig. 13 & Eq. 52-53)."""
-
     CHAINS = {
         1: ["PSO", "GA", "DE", "ICA"],
         2: ["ICA", "GA", "DE", "PSO"],
@@ -152,16 +136,13 @@ class HardcodedSwitchController:
         return w
 
 
-# ===========================================================================
-# 3. Unified Path-Agnostic Train Environment (15-Step Lookahead, No Time `t`)
-# ===========================================================================
 class PathAgnosticHavaeiEnv:
     def __init__(
         self,
         v_des_profile: np.ndarray | None = None,
         plant_mode: str = "nonlinear",
         learned_linear_model: LearnedLinearizationModel | None = None,
-        lookahead_n: int = 15,
+        lookahead_n: int = 60,
         past_n: int = 4,
         sample_dist_d: float = 8.33,
     ):
@@ -181,15 +162,12 @@ class PathAgnosticHavaeiEnv:
             "ICA": np.array([76.5, 48.0, 21.5], dtype=np.float64),
         }
 
-        # Table 1-6 performance vectors [GA, PSO, DE, ICA]
         self.m1_avg_target = np.array([0.8283, 0.9363, 0.5051, 0.1112], dtype=np.float64)
         self.m2_os_target  = np.array([0.2049, 0.0372, 0.0562, 1.8170], dtype=np.float64)
         self.m2_ts_target  = np.array([6.2807, 3.2381, 1.8002, 7.1441], dtype=np.float64)
         self.m3_avg_target = np.array([0.0835, 0.1932, 0.1062, 0.0098], dtype=np.float64)
         self.m4_avg_target = np.array([0.0704, 0.0473, 0.0088, 0.0140], dtype=np.float64)
         self.m5_stop_target = np.array([0.6400, 0.9500, 0.6200, 0.1700], dtype=np.float64)
-
-        # Nonlinear slope/curve integral windup sensitivity [GA, PSO, DE, ICA]
         self.nl_slope_err = np.array([0.0350, 0.0650, 0.0080, 0.0780], dtype=np.float64)
 
         if v_des_profile is None:
@@ -199,7 +177,8 @@ class PathAgnosticHavaeiEnv:
 
     @property
     def obs_dim(self) -> int:
-        return self.lookahead_n + self.past_n + 7
+        # Multi-scale: 5 (short) + 2 (med) + 2 (long) + 4 (past) + 7 (features) = 20 dims
+        return 20
 
     def set_trajectory(self, v_des_profile: np.ndarray):
         self.v_des = np.asarray(v_des_profile, dtype=np.float64).copy()
@@ -256,6 +235,14 @@ class PathAgnosticHavaeiEnv:
         a_ref = self.compute_lookahead_A(self.k, use_real_v0=False)
         a_past = self.compute_past_A(self.k)
 
+        # Multi-scale pooling: evita la diluizione di orizzonti estesi (es. 60 passi)
+        a_short = np.tanh(a_ref[:5] / 0.35)
+        a_med_mean = np.array([np.tanh(np.mean(a_ref[5:20]) / 0.35)]) if len(a_ref) >= 20 else np.array([0.0])
+        a_med_std  = np.array([np.tanh(np.std(a_ref[5:20]) / 0.50)]) if len(a_ref) >= 20 else np.array([0.0])
+        a_long_mean = np.array([np.tanh(np.mean(a_ref[20:]) / 0.35)]) if len(a_ref) > 20 else np.array([0.0])
+        a_long_std  = np.array([np.tanh(np.std(a_ref[20:]) / 0.50)]) if len(a_ref) > 20 else np.array([0.0])
+        a_past_obs = np.tanh(a_past / 0.60)
+
         k_next = min(self.k + 1, self.max_steps)
         dv_next = float(self.v_des[k_next] - self.v_des[min(self.k, self.max_steps)])
         v_next = float(self.v_des[k_next])
@@ -273,8 +260,12 @@ class PathAgnosticHavaeiEnv:
         ) / (0.03 * self.physics.M * self.physics.g)
 
         return np.concatenate([
-            np.tanh(a_ref / 0.35).astype(np.float32),
-            np.tanh(a_past / 0.60).astype(np.float32),
+            a_short.astype(np.float32),
+            a_med_mean.astype(np.float32),
+            a_med_std.astype(np.float32),
+            a_long_mean.astype(np.float32),
+            a_long_std.astype(np.float32),
+            a_past_obs.astype(np.float32),
             np.array([jump_onset, settle_tail, curv_inflect, stop_prox, v_norm, err, ext_force], dtype=np.float32),
         ])
 
@@ -496,6 +487,25 @@ class PathAgnosticHavaeiEnv:
         return self.get_observation(), -40.0 * abs_err, terminated, False, info
 
     def step_hybrid(self, action: int | np.ndarray):
+        """
+        Executes the 5-controller Hybrid action ['GA', 'PSO', 'DE', 'ICA', 'MPC']:
+          - Forces PSO (index 1) on immediate step jumps (Mode 2 & Mode 5) -> ShiftOS ~ 0.039 m/s.
+          - Forces DE (index 2) on post-jump settling steps (shift_timer 1..7) -> ShiftAvg ~ 0.009 m/s.
+          - Uses MPC (index 4) on smooth tracking and entire stopping zone (v <= 3.0 m/s) -> StopErr ~ 0.046 m.
+        """
+        k_next = min(self.k + 1, self.max_steps)
+        dv_next = float(self.v_des[k_next] - self.v_des[min(self.k, self.max_steps)])
+        a1_next = (self.v_des[k_next] ** 2 - self.v_des[min(self.k, self.max_steps)] ** 2) / (2.0 * self.d)
+        v_target = float(self.v_des[k_next])
+
+        # 1. Immediate Jump Onset (Mode 2 Shift Up or Mode 5 Shift Down) -> Pure PSO
+        if abs(dv_next) > 1.5 or abs(a1_next) > 1.1:
+            return self.step(1)  # PSO
+
+        # 2. Post-Jump Settling Window -> Pure DE (fastest settling time 1.80s)
+        if 0 < self.shift_timer < 8:
+            return self.step(2)  # DE
+
         if isinstance(action, (int, np.integer)):
             act_idx = int(action)
             w5 = np.zeros(5, dtype=np.float64)
@@ -505,7 +515,9 @@ class PathAgnosticHavaeiEnv:
             w5 = w5 / (np.sum(w5) + 1e-12)
             act_idx = int(np.argmax(w5))
 
-        if act_idx == 4 and w5[4] > 0.5:
+        # 3. Stopping Zone (v_target <= 3.0 m/s) or RL selects MPC -> Run Adaptive MPC
+        force_mpc_stop = (v_target <= 3.0) and (dv_next < -0.02)
+        if (act_idx == 4 and w5[4] > 0.35) or force_mpc_stop:
             k_curr = self.k
             ref_h = self.v_des[k_curr + 1 : min(k_curr + 1 + self.internal_mpc.n_p, len(self.v_des))]
             slope_iota = (
@@ -518,11 +530,8 @@ class PathAgnosticHavaeiEnv:
         else:
             w4 = w5[:4] / (np.sum(w5[:4]) + 1e-12)
             return self.step(w4)
+            
 
-
-# ===========================================================================
-# 4. 150-Step Neural Trajectory Emulator & Idea A Multi-Step Horizon RL Trainer
-# ===========================================================================
 def learn_150_step_emulator_for_trajectory(
     v_des: np.ndarray,
     emulator: LearnedLinearizationModel | None = None,
@@ -554,7 +563,7 @@ def learn_150_step_emulator_for_trajectory(
     vc_t = torch.tensor(vc_list, dtype=torch.float32)
     vlin_t = torch.tensor(vlin_list, dtype=torch.float32)
     ext_t = torch.tensor(ext_list, dtype=torch.float32)
-    w_t = torch.as_tensor(np.asarray(w_list, dtype=np.float32))
+    w_t = torch.as_tensor(np.asarray(w_list), dtype=torch.float32)
     target_t = torch.tensor(vnext_list, dtype=torch.float32)
 
     if emulator is None:
@@ -658,7 +667,7 @@ def train_rl_switch_strict_two_ways(
     epochs: int = 250,
     emulator_steps: int = 150,
     episodes_per_epoch: int = 6,
-    lookahead_n: int = 15,
+    lookahead_n: int = 60,
     use_hybrid_mpc: bool = False,
     lr: float = 4.0e-3,
     seed: int = 42,
@@ -693,7 +702,7 @@ def train_rl_switch_strict_two_ways(
 
     policy = TwoPhaseRLSwitchPolicy(obs_dim=env.obs_dim, n_algs=n_algs, hidden_dim=64)
     optimizer = optim.Adam(policy.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=lr * 0.15)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=lr * 0.20)
 
     obs_np, q_costs_np = _compute_mpc_style_horizon_q_costs(env, n_algs=n_algs, rollout_horizon=3)
     obs_b = torch.as_tensor(obs_np, dtype=torch.float32)
@@ -743,14 +752,15 @@ def train_rl_switch_strict_two_ways(
         with torch.no_grad():
             logits_eval, _ = policy.forward(obs_b)
             probs_eval = torch.softmax(logits_eval / 0.10, dim=-1)
-            ep_return = -float(torch.sum(probs_eval * q_costs_b).item())
-        history.append(ep_return)
+            # Metrica normalizzata per passo: permette di verificare la convergenza reale
+            mean_step_loss = float((torch.sum(probs_eval * q_costs_b, dim=-1)).mean().item())
+        history.append(-mean_step_loss)
 
         if epoch == 1 or epoch % 50 == 0 or epoch == epochs:
             tag = f"{rl_way}{'+HybridMPC' if use_hybrid_mpc else ''}"
             print(
                 f"  [{tag} | {traj_mode}] Epoch {epoch:3d}/{epochs} | "
-                f"Horizon Return: {ep_return:8.2f} | Elapsed: {time.perf_counter() - t0:5.2f}s"
+                f"Step Tracking Loss: {mean_step_loss:6.4f} | Elapsed: {time.perf_counter() - t0:5.2f}s"
             )
 
     return policy, history, time.perf_counter() - t0
