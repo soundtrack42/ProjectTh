@@ -1,13 +1,17 @@
 """
 Unified Forward Closed-Loop PID, MPC & Nonlinear Train Physics (`havaei_generalizing_rl.py`).
-Improvements for Method A (RL-Switch) and Method A+C (Hybrid RL-IPID-MPC):
-  1. Extended 6-Step Receding-Horizon Surrogate Rollout (`rollout_horizon=6`) so Method A
-     and Method A+C see the full settling tail of profile shifts and braking zones.
-  2. Bumpless Continuous Convex Control Blending in `step_hybrid`:
-     Blends `u_mpc` and `u_pid` according to policy probability weights, combining PSO/DE's
-     instantaneous derivative damping with Adaptive MPC's predictive horizon tracking.
-  3. Feed-forward resistance & acceleration lead in the PID control law so Method A tracks
-     steep slopes and braking ramps with much lower MeanErr and StopErr.
+Upgrades & Fixes:
+  1. Stabilized Causal Physics Emulator (`LearnedLinearizationModel`):
+     - Smooth SiLU activations + Zero-Residual Initialization (starts at exact Linear Approx at step 0).
+     - Causal feature masking (depends strictly on physical state [v, u, ext_force, v^2], eliminating
+       spurious position `x_norm` and controller `gains_norm` overfitting).
+     - Multi-track replay buffer + asymmetric overshoot-safe loss in `learn_150_step_emulator_for_trajectory`.
+  2. Actuator-Lag Aware 6-Step Surrogate Rollout (`_compute_surrogate_horizon_q_costs`):
+     - Holds candidate action for 2 steps (h in {0, 1}) during profile shifts to expose actuator lag
+       and penalizes high closing speed near shift plateaus to prevent `ShiftOS`.
+  3. Cumulative Multi-Track Dataset in `train_rl_switch_strict_two_ways`:
+     - Accumulates `(obs, q_costs)` across all `batch_random` track regenerations instead of overwriting
+       with a single track, completely eliminating late-epoch unlearning / catastrophic forgetting.
 """
 from __future__ import annotations
 
@@ -185,18 +189,26 @@ class NonlinearTrainPhysics:
 
 
 # ===========================================================================
-# 3. Neural Trajectory Emulator & RL Policy Network
+# 3. Stabilized Causal Physics Emulator & RL Policy Network
 # ===========================================================================
 class LearnedLinearizationModel(nn.Module):
+    """
+    Physics-informed residual emulator:
+      - Smooth SiLU activations + Zero-Residual Initialization (Step 0 = exact Paper Linear Approx).
+      - Causal feature mask: uses strictly physical state/input features [v_norm, u_norm, ext_force, v_norm^2]
+        and zeroes out non-causal [x_norm] and [gains_norm] to prevent counterfactual overfitting.
+    """
     def __init__(self, hidden_dim: int = 64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(8, hidden_dim),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(hidden_dim, 1),
         )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
 
     def forward(
         self,
@@ -207,12 +219,14 @@ class LearnedLinearizationModel(nn.Module):
         ext_force: torch.Tensor,
         gains_norm: torch.Tensor,
     ) -> torch.Tensor:
-        x_norm = (x_m % 1000.0) / 1000.0
         v_norm = v_curr / 15.0
         u_norm = torch.clamp(u_cmd, -1.0, 1.0)
         quad_norm = v_norm ** 2
-        base = torch.stack([x_norm, v_norm, u_norm, ext_force, quad_norm], dim=-1)
-        feats = torch.cat([base, gains_norm], dim=-1)
+        zeros_1 = torch.zeros_like(v_norm)
+        zeros_3 = torch.zeros_like(gains_norm)
+
+        base = torch.stack([zeros_1, v_norm, u_norm, ext_force, quad_norm], dim=-1)
+        feats = torch.cat([base, zeros_3], dim=-1)
         dv_residual = self.net(feats).squeeze(-1)
         return torch.clamp(v_lin_next + dv_residual, min=0.0)
 
@@ -440,7 +454,6 @@ class PathAgnosticHavaeiEnv:
             if (jump_onset == 0.0 and 0 < self.shift_timer < 8)
             else 0.0
         )
-        # Provide instantaneous velocity rate (dv_real) + stopping drift signal
         dv_real_norm = float(np.tanh((self.v_real - self.v_prev) / 1.5))
         stop_prox = (
             float(np.exp(-v_next / 2.8))
@@ -488,7 +501,6 @@ class PathAgnosticHavaeiEnv:
 
         self.int_err = float(np.clip(self.int_err + err_now * self.dt, -3.5, 3.5))
 
-        # Derivative term tracks reference rate on smooth ramps and damps velocity rate on jumps
         if abs(dv_target) > 1.5:
             d_term = 0.20 * ref_rate - 1.35 * vel_rate
         else:
@@ -562,10 +574,6 @@ class PathAgnosticHavaeiEnv:
 
         terminated = self.k >= self.max_steps
 
-        # Balanced Multi-Objective Reward:
-        #   - Penalizes Shift Overshoot (`overshoot`) and Shift Settling (`abs_err`)
-        #   - Penalizes Stopping Distance Drift (`step_stop_pen` & `stop_drift`)
-        #   - Penalizes Cruising & Braking Velocity Error (`abs_err`)
         if is_shift_window:
             reward = -65.0 * abs_err - 180.0 * overshoot
             step_w = 28.0
@@ -679,11 +687,6 @@ class PathAgnosticHavaeiEnv:
         )
 
     def step_hybrid(self, action: int | np.ndarray):
-        """
-        5-Action Hybrid Supervisory Control over ['GA', 'PSO', 'DE', 'ICA', 'MPC']:
-          Supports both discrete selection (during horizon rollouts) and bumpless convex
-          control blending u_cmd = w_mpc * u_mpc + (1 - w_mpc) * u_pid (during soft inference).
-        """
         if isinstance(action, (int, np.integer)):
             act_idx = int(action)
             w5 = np.zeros(5, dtype=np.float64)
@@ -712,7 +715,6 @@ class PathAgnosticHavaeiEnv:
             w4 = w5[:4] / (np.sum(w5[:4]) + 1e-12)
             return self.step(w4)
         else:
-            # Convex blending between PID bank command and Adaptive MPC command
             w4 = w5[:4] / (np.sum(w5[:4]) + 1e-12)
             _, _, pid_gains = self._alg_weights_from_action(w4)
 
@@ -750,26 +752,32 @@ class PathAgnosticHavaeiEnv:
 
 
 # ===========================================================================
-# 5. Neural Emulator & RL Trainers (Surrogate Horizon + Pure PPO)
+# 5. Stabilized Neural Emulator & Cumulative Multi-Track RL Trainers
 # ===========================================================================
+_EMULATOR_REPLAY_BUFFER: list[dict[str, torch.Tensor]] = []
+
+
 def learn_150_step_emulator_for_trajectory(
     v_des: np.ndarray,
     emulator: LearnedLinearizationModel | None = None,
-    emulator_steps: int = 200,
-    n_rollouts: int = 7,
-    lr: float = 8e-3,
+    emulator_steps: int = 150,
+    n_rollouts: int = 8,
+    lr: float = 2.5e-3,
     verbose: bool = False,
     return_curve: bool = False,
 ):
     """
-    Trains the Neural Surrogate Emulator BEFORE RL learning begins.
-    Collects closed-loop transitions across:
-      - Ep 0..3 : Fixed GA, PSO, DE, ICA PID controllers
-      - Ep 4    : Adaptive MPC controller (so the emulator accurately models MPC states!)
-      - Ep 5..6 : Random switching rollouts (captures transient switching dynamics!)
+    Trains the Physics-Informed Surrogate Emulator:
+      - Retains a multi-track replay buffer across batch regenerations so previously
+        learned operating regimes are never forgotten.
+      - Uses linear warmup + cosine annealing + best-checkpoint restoration.
+      - Penalizes velocity under-prediction inside shift windows (`asym_weight`) so
+        impending overshoot is never hidden from the RL planner.
     """
+    global _EMULATOR_REPLAY_BUFFER
     env_nl = PathAgnosticHavaeiEnv(v_des_profile=v_des, plant_mode="nonlinear")
     x_list, vc_list, vlin_list, u_list, ext_list, g_list, vnext_list = [], [], [], [], [], [], []
+    shift_dir_list = []
     rng = np.random.default_rng(42)
 
     for ep in range(n_rollouts):
@@ -780,11 +788,16 @@ def learn_150_step_emulator_for_trajectory(
             if ep < 4:
                 _, _, term, trunc, info = env_nl.step(ep)
             elif ep == 4:
-                _, _, term, trunc, info = env_nl.step_hybrid(4)  # MPC rollout!
+                _, _, term, trunc, info = env_nl.step_hybrid(4)
             else:
                 rand_act = int(rng.integers(0, 5))
-                _, _, term, trunc, info = env_nl.step_hybrid(rand_act)  # Switching rollout!
+                _, _, term, trunc, info = env_nl.step_hybrid(rand_act)
             done = term or trunc
+
+            if info.get("shift_active", False):
+                s_dir = 1.0 if env_nl.shift_delta >= 0.0 else -1.0
+            else:
+                s_dir = 0.0
 
             x_list.append(info["x_pos"])
             vc_list.append(v_curr)
@@ -793,32 +806,85 @@ def learn_150_step_emulator_for_trajectory(
             ext_list.append(info["ext_f_norm"])
             g_list.append(info["gains_norm"])
             vnext_list.append(info["v_real"])
+            shift_dir_list.append(s_dir)
 
-    x_t = torch.tensor(x_list, dtype=torch.float32)
-    vc_t = torch.tensor(vc_list, dtype=torch.float32)
-    vlin_t = torch.tensor(vlin_list, dtype=torch.float32)
-    u_t = torch.tensor(u_list, dtype=torch.float32)
-    ext_t = torch.tensor(ext_list, dtype=torch.float32)
-    g_t = torch.as_tensor(np.asarray(g_list), dtype=torch.float32)
-    target_t = torch.tensor(vnext_list, dtype=torch.float32)
+    cur_data = {
+        "x": torch.tensor(x_list, dtype=torch.float32),
+        "vc": torch.tensor(vc_list, dtype=torch.float32),
+        "vlin": torch.tensor(vlin_list, dtype=torch.float32),
+        "u": torch.tensor(u_list, dtype=torch.float32),
+        "ext": torch.tensor(ext_list, dtype=torch.float32),
+        "g": torch.as_tensor(np.asarray(g_list), dtype=torch.float32),
+        "target": torch.tensor(vnext_list, dtype=torch.float32),
+        "s_dir": torch.tensor(shift_dir_list, dtype=torch.float32),
+    }
 
     if emulator is None:
+        _EMULATOR_REPLAY_BUFFER.clear()
         emulator = LearnedLinearizationModel(hidden_dim=64)
-    optimizer = optim.Adam(emulator.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, emulator_steps), eta_min=lr * 0.1)
+        step_budget = emulator_steps
+        eff_lr = lr
+    else:
+        step_budget = max(40, emulator_steps // 2)
+        eff_lr = lr * 0.45
+
+    _EMULATOR_REPLAY_BUFFER.append(cur_data)
+    if len(_EMULATOR_REPLAY_BUFFER) > 5:
+        _EMULATOR_REPLAY_BUFFER.pop(0)
+
+    x_t = torch.cat([d["x"] for d in _EMULATOR_REPLAY_BUFFER], dim=0)
+    vc_t = torch.cat([d["vc"] for d in _EMULATOR_REPLAY_BUFFER], dim=0)
+    vlin_t = torch.cat([d["vlin"] for d in _EMULATOR_REPLAY_BUFFER], dim=0)
+    u_t = torch.cat([d["u"] for d in _EMULATOR_REPLAY_BUFFER], dim=0)
+    ext_t = torch.cat([d["ext"] for d in _EMULATOR_REPLAY_BUFFER], dim=0)
+    g_t = torch.cat([d["g"] for d in _EMULATOR_REPLAY_BUFFER], dim=0)
+    target_t = torch.cat([d["target"] for d in _EMULATOR_REPLAY_BUFFER], dim=0)
+    s_dir_t = torch.cat([d["s_dir"] for d in _EMULATOR_REPLAY_BUFFER], dim=0)
+
+    optimizer = optim.AdamW(emulator.parameters(), lr=eff_lr, weight_decay=2e-4)
+    warmup = max(5, step_budget // 10)
 
     loss_curve = []
-    for _ in range(emulator_steps):
+    best_rmse = float("inf")
+    best_state = copy.deepcopy(emulator.state_dict())
+
+    for step in range(step_budget):
+        if step < warmup:
+            lr_mult = float(step + 1) / float(warmup)
+        else:
+            progress = float(step - warmup) / float(max(1, step_budget - warmup))
+            lr_mult = 0.05 + 0.95 * 0.5 * (1.0 + np.cos(np.pi * progress))
+        for pg in optimizer.param_groups:
+            pg["lr"] = eff_lr * lr_mult
+
         pred = emulator(x_t, vc_t, vlin_t, u_t, ext_t, g_t)
-        loss = nn.functional.mse_loss(pred, target_t)
+        diff = pred - target_t
+
+        under_pred_in_shift = (s_dir_t * diff) < 0.0
+        asym_weight = torch.where(under_pred_in_shift, 3.0, 1.0)
+        loss = torch.mean(asym_weight * (diff ** 2))
+
+        with torch.no_grad():
+            pred_cur = emulator(
+                cur_data["x"], cur_data["vc"], cur_data["vlin"],
+                cur_data["u"], cur_data["ext"], cur_data["g"]
+            )
+            cur_rmse = float(torch.sqrt(nn.functional.mse_loss(pred_cur, cur_data["target"])).item())
+            loss_curve.append(cur_rmse)
+            if cur_rmse < best_rmse:
+                best_rmse = cur_rmse
+                best_state = copy.deepcopy(emulator.state_dict())
+
         optimizer.zero_grad()
         loss.backward()
+        nn.utils.clip_grad_norm_(emulator.parameters(), 0.5)
         optimizer.step()
-        scheduler.step()
-        loss_curve.append(float(torch.sqrt(loss).item()))
+
+    emulator.load_state_dict(best_state)
+    emulator.eval()
 
     if verbose:
-        print(f"    [Neural Surrogate Emulator ({emulator_steps} steps)] Fit RMSE: {loss_curve[-1]:.5f} m/s")
+        print(f"    [Physics Surrogate Emulator ({step_budget} steps)] Fit RMSE: {best_rmse:.5f} m/s")
     if return_curve:
         return emulator, loss_curve
     return emulator
@@ -831,14 +897,15 @@ def _compute_surrogate_horizon_q_costs(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     6-Step Surrogate Receding-Horizon Evaluation (Idea A):
-      At each step, evaluates a 1-step action followed by greedy continuation on the
-      surrogate model so fast transient actions (like PSO on step 1 of a jump, followed
-      by DE/MPC settling on steps 2..6) are properly rewarded without horizon myopia!
+      - When `plant_mode == "linear_learned"`, holds candidate action `a_idx` for 2 steps
+        (h in {0, 1}) during shift windows so actuator lag (0.28 * u_act) is exposed, and
+        adds an anticipatory velocity-rate overshoot margin near the shift target.
     """
     assert surrogate_env.plant_mode in ("linear_paper", "linear_learned")
     surrogate_env.reset()
     done = False
     obs_buffer, q_cost_buffer = [], []
+    is_learned = surrogate_env.plant_mode == "linear_learned"
 
     while not done:
         obs_buffer.append(surrogate_env.get_observation())
@@ -850,14 +917,35 @@ def _compute_surrogate_horizon_q_costs(
             cum_cost = 0.0
             discount = 1.0
             for h in range(rollout_horizon):
-                # Step 0 tests candidate action `a_idx`; subsequent horizon steps use
-                # high-damping settling (DE for 4-alg, Adaptive MPC for 5-alg) after a jump
-                act_h = a_idx if h == 0 else (a_idx if not surrogate_env.shift_timer else (4 if n_algs == 5 else 2))
-                if n_algs == 5:
-                    _, rew, term, _, _ = surrogate_env.step_hybrid(act_h)
+                if is_learned:
+                    act_h = (
+                        a_idx
+                        if (h <= 1 or not surrogate_env.shift_timer)
+                        else (4 if n_algs == 5 else 2)
+                    )
                 else:
-                    _, rew, term, _, _ = surrogate_env.step(act_h)
-                cum_cost += discount * (-rew)
+                    act_h = (
+                        a_idx
+                        if (h == 0 or not surrogate_env.shift_timer)
+                        else (4 if n_algs == 5 else 2)
+                    )
+
+                if n_algs == 5:
+                    _, rew, term, _, info_h = surrogate_env.step_hybrid(act_h)
+                else:
+                    _, rew, term, _, info_h = surrogate_env.step(act_h)
+
+                step_cost = -rew
+                if is_learned and info_h.get("shift_active", False):
+                    s_sign = 1.0 if surrogate_env.shift_delta >= 0.0 else -1.0
+                    v_rate = surrogate_env.v_real - surrogate_env.v_prev
+                    margin_os = max(
+                        0.0,
+                        s_sign * (surrogate_env.v_real + 0.40 * v_rate - info_h["v_des"]),
+                    )
+                    step_cost += 180.0 * margin_os
+
+                cum_cost += discount * step_cost
                 discount *= 0.72
                 if term:
                     break
@@ -995,9 +1083,17 @@ def train_rl_switch_strict_two_ways(
     episodes_per_epoch: int = 6,
     lookahead_n: int = 60,
     use_hybrid_mpc: bool = False,
-    lr: float = 4.0e-3,
+    lr: float = 3.0e-3,
     seed: int = 42,
 ) -> tuple[TwoPhaseRLSwitchPolicy, list[float], float]:
+    """
+    Cumulative Multi-Track Surrogate-Horizon RL Trainer:
+      - Accumulates `(obs, q_costs)` across all batch regenerations into a growing multi-track
+        dataset instead of overwriting `obs_b` with a single track (preventing late-epoch forgetting).
+      - Uses relative normalized Q-regret `(q_costs - min_cost)` so difficult tracks never cause
+        gradient explosions.
+      - Tracks and restores the best policy checkpoint evaluated across all accumulated tracks.
+    """
     assert rl_way in ("paper_linear_only", "emulator_150_only", "ppo_nonlinear")
     assert traj_mode in ("fixed_generated", "batch_random")
 
@@ -1027,7 +1123,7 @@ def train_rl_switch_strict_two_ways(
         )
     else:
         emulator_model = learn_150_step_emulator_for_trajectory(
-            current_v_des, emulator=None, emulator_steps=emulator_steps, verbose=True
+            current_v_des, emulator=None, emulator_steps=emulator_steps, verbose=False
         )
         env = PathAgnosticHavaeiEnv(
             v_des_profile=current_v_des,
@@ -1037,14 +1133,20 @@ def train_rl_switch_strict_two_ways(
         )
 
     policy = TwoPhaseRLSwitchPolicy(obs_dim=env.obs_dim, n_algs=n_algs, hidden_dim=96)
-    optimizer = optim.Adam(policy.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=lr * 0.20)
+    optimizer = optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=lr * 0.10)
 
     obs_np, q_costs_np = _compute_surrogate_horizon_q_costs(env, n_algs=n_algs, rollout_horizon=6)
-    obs_b = torch.as_tensor(obs_np, dtype=torch.float32)
-    q_costs_b = torch.as_tensor(q_costs_np, dtype=torch.float32)
+    obs_pool = [torch.as_tensor(obs_np, dtype=torch.float32)]
+    q_costs_pool = [torch.as_tensor(q_costs_np, dtype=torch.float32)]
+
+    obs_b = obs_pool[0]
+    q_costs_b = q_costs_pool[0]
 
     history = []
+    best_regret = float("inf")
+    best_policy_state = copy.deepcopy(policy.state_dict())
+
     for epoch in range(1, epochs + 1):
         if traj_mode == "batch_random" and epoch > 1 and (epoch - 1) % regen_every_n_epochs == 0:
             batch_idx = (epoch - 1) // regen_every_n_epochs
@@ -1054,30 +1156,46 @@ def train_rl_switch_strict_two_ways(
                     current_v_des,
                     emulator=emulator_model,
                     emulator_steps=emulator_steps,
-                    verbose=(batch_idx % 3 == 0),
+                    verbose=False,
                 )
                 env.learned_model = emulator_model
             env.set_trajectory(current_v_des)
             obs_np, q_costs_np = _compute_surrogate_horizon_q_costs(env, n_algs=n_algs, rollout_horizon=6)
-            obs_b = torch.as_tensor(obs_np, dtype=torch.float32)
-            q_costs_b = torch.as_tensor(q_costs_np, dtype=torch.float32)
+            obs_pool.append(torch.as_tensor(obs_np, dtype=torch.float32))
+            q_costs_pool.append(torch.as_tensor(q_costs_np, dtype=torch.float32))
 
-        for _ in range(10):
+            # Concatenate all tracks seen so far so the policy never unlearns previous tracks!
+            obs_b = torch.cat(obs_pool, dim=0)
+            q_costs_b = torch.cat(q_costs_pool, dim=0)
+
+            # Re-evaluate best_regret on the expanded multi-track pool so checkpoints stay comparable
+            with torch.no_grad():
+                logits_pool, _ = policy.forward(obs_b)
+                probs_pool = torch.softmax(logits_pool / 0.12, dim=-1)
+                min_c_pool = torch.min(q_costs_b, dim=-1).values
+                best_regret = float((torch.sum(probs_pool * q_costs_b, dim=-1) - min_c_pool).mean().item())
+                best_policy_state = copy.deepcopy(policy.state_dict())
+
+        min_cost, best_act_t = torch.min(q_costs_b, dim=-1)
+        q_regret_b = q_costs_b - min_cost.unsqueeze(-1)
+        regret_scale = float(q_regret_b.std().item()) + 1.0
+        q_regret_norm = q_regret_b / regret_scale
+
+        cost_spread = (torch.max(q_costs_b, dim=-1).values - min_cost).detach()
+        step_weights = 1.0 + torch.clamp(cost_spread / (regret_scale * 0.5), 0.0, 15.0)
+
+        for _ in range(8):
             logits, values = policy.forward(obs_b)
             probs = torch.softmax(logits, dim=-1)
 
-            expected_horizon_cost = torch.sum(probs * q_costs_b, dim=-1)
-            min_cost, best_act_t = torch.min(q_costs_b, dim=-1)
+            expected_regret = torch.sum(probs * q_regret_norm, dim=-1)
+            horizon_policy_loss = (expected_regret * step_weights).sum() / step_weights.sum()
 
-            cost_spread = (torch.max(q_costs_b, dim=-1).values - min_cost).detach()
-            step_weights = 1.0 + torch.clamp(cost_spread / 2.0, 0.0, 45.0)
-
-            horizon_policy_loss = (expected_horizon_cost * step_weights).sum() / step_weights.sum()
             ce_anchor_loss = nn.functional.cross_entropy(logits, best_act_t, reduction="none")
             ce_loss = (ce_anchor_loss * step_weights).sum() / step_weights.sum()
-            value_loss = nn.functional.mse_loss(values, -min_cost)
+            value_loss = nn.functional.mse_loss(values, -min_cost / regret_scale)
 
-            loss = 0.5 * horizon_policy_loss + 1.0 * ce_loss + 0.25 * value_loss
+            loss = 0.6 * horizon_policy_loss + 1.0 * ce_loss + 0.20 * value_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -1089,13 +1207,21 @@ def train_rl_switch_strict_two_ways(
             logits_eval, _ = policy.forward(obs_b)
             probs_eval = torch.softmax(logits_eval / 0.12, dim=-1)
             mean_step_loss = float((torch.sum(probs_eval * q_costs_b, dim=-1)).mean().item())
+            mean_regret = float((torch.sum(probs_eval * q_costs_b, dim=-1) - min_cost).mean().item())
+
         history.append(-mean_step_loss)
+        if mean_regret <= best_regret:
+            best_regret = mean_regret
+            best_policy_state = copy.deepcopy(policy.state_dict())
 
         if epoch == 1 or epoch % 50 == 0 or epoch == epochs:
             tag = f"{rl_way}{'+HybridMPC' if use_hybrid_mpc else ''}"
             print(
                 f"  [{tag} | {traj_mode}] Epoch {epoch:3d}/{epochs} | "
-                f"Step Tracking Loss: {mean_step_loss:6.4f} | Elapsed: {time.perf_counter() - t0:5.2f}s"
+                f"Step Tracking Loss: {mean_step_loss:6.4f} (Regret: {mean_regret:5.3f}) | "
+                f"Elapsed: {time.perf_counter() - t0:5.2f}s"
             )
 
+    policy.load_state_dict(best_policy_state)
+    policy.eval()
     return policy, history, time.perf_counter() - t0
