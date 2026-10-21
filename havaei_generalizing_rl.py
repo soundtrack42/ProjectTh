@@ -657,6 +657,28 @@ class PathAgnosticHavaeiEnv:
             next_v, v_lin, u_cmd, alg_name, w, gains_norm, k_curr, x_sample, ext_f_norm
         )
 
+    def step_custom_pid(self, pid_gains: np.ndarray, alg_name: str = "FUZZY"):
+        """Steps the environment using externally supplied continuous PID gains [Kp, Ki, Kd]."""
+        pid_gains = np.asarray(pid_gains, dtype=np.float64)
+        self.k += 1
+        k_curr = min(self.k, self.max_steps)
+        x_sample = k_curr * self.d
+        old_v = self.v_real
+
+        v_target = float(self.v_des[k_curr])
+        dv_target = v_target - float(self.v_des[max(0, k_curr - 1)])
+        ext_f_norm = (
+            self.physics.grade_resistance(x_sample) + self.physics.curve_resistance(x_sample)
+        ) / (0.03 * self.physics.M * self.physics.g)
+        gains_norm = pid_gains / self.gains_scale
+
+        u_cmd = self._compute_pid_command(pid_gains, v_target, dv_target)
+        next_v, v_lin = self._predict_next_velocity(old_v, u_cmd, x_sample, ext_f_norm, gains_norm)
+
+        return self._finalize_step(
+            next_v, v_lin, u_cmd, alg_name, np.zeros(4, dtype=np.float64), gains_norm, k_curr, x_sample, ext_f_norm
+        )
+
     def step_mpc(self, u_mpc: float):
         self.k += 1
         k_curr = min(self.k, self.max_steps)

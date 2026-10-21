@@ -361,6 +361,8 @@ def main():
     # 3. Comprehensive Evaluation Across N Unseen Trajectories
     specs = [
         ("Hardcoded-Switch IPID (Havaei)", "HARDCODED", None),
+        ("Fuzzy-PID (Standard Mamdani)", "FUZZY_STD", None),
+        ("ILR-PSO-Fuzzy-PID (He 2024)", "FUZZY_ILR_PSO", None),
         ("RL-Switch Way 1 (Linear Approx)", "RL_SOFT", rl_lin),
         *[(f"RL-Switch Way 2 ({s}-Step Emu)", "RL_SOFT", rl_emu_policies[s]) for s in step_budgets],
         ("Hybrid RL-MPC (Linear Approx)", "RL_HYBRID", hyb_lin),
