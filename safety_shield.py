@@ -447,8 +447,6 @@ class SafetyFilterShield:
         if (regime == "stop" and env.int_err > 0.0) or closing_fast_on_shift:
             env.int_err *= 0.20
 
-        # In station approach ("stop"), lock to 100% Adaptive MPC early (12 steps ahead)
-        # so the train enters the v_des <= 3.0 m/s zone with zero speed/actuator lag!
         if regime == "stop":
             env.int_err = 0.0
             w5_pure_mpc = np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float64)
