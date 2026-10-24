@@ -1,17 +1,7 @@
 """
 Unified Forward Closed-Loop PID, MPC & Nonlinear Train Physics (`havaei_generalizing_rl.py`).
-Upgrades & Fixes:
-  1. Stabilized Causal Physics Emulator (`LearnedLinearizationModel`):
-     - Smooth SiLU activations + Zero-Residual Initialization (starts at exact Linear Approx at step 0).
-     - Causal feature masking (depends strictly on physical state [v, u, ext_force, v^2], eliminating
-       spurious position `x_norm` and controller `gains_norm` overfitting).
-     - Multi-track replay buffer + asymmetric overshoot-safe loss in `learn_150_step_emulator_for_trajectory`.
-  2. Actuator-Lag Aware 6-Step Surrogate Rollout (`_compute_surrogate_horizon_q_costs`):
-     - Holds candidate action for 2 steps (h in {0, 1}) during profile shifts to expose actuator lag
-       and penalizes high closing speed near shift plateaus to prevent `ShiftOS`.
-  3. Cumulative Multi-Track Dataset in `train_rl_switch_strict_two_ways`:
-     - Accumulates `(obs, q_costs)` across all `batch_random` track regenerations instead of overwriting
-       with a single track, completely eliminating late-epoch unlearning / catastrophic forgetting.
+Includes atomic hooks for `SafetyFilterShield` (`safety_shield.py`) to support both
+Runtime Shielding and Filter-Aware RL Training (Section 3.5.3 of Hsu, Hu, & Fisac, 2024).
 """
 from __future__ import annotations
 
@@ -24,6 +14,7 @@ import torch.optim as optim
 from torch.distributions import Categorical
 
 from pure_mpc_controller import PureLiuMPC
+from safety_shield import SafetyFilterShield, ShieldConfig
 
 ALGORITHMS = ("GA", "PSO", "DE", "ICA")
 HYBRID_ALGORITHMS = ("GA", "PSO", "DE", "ICA", "MPC")
@@ -75,7 +66,6 @@ def optimize_heuristic_pid_bank(n_iters: int = 25, pop_size: int = 60, seed: int
         w3 = mode_weights[2] / (np.max(m_arr[:, 2]) + 1e-5)
         return w1 * m_arr[:, 0] + w2 * m_arr[:, 1] + w3 * m_arr[:, 2]
 
-    # 1. GA Optimization (Balanced)
     pop_ga = rng.uniform([30.0, 12.0, 20.0], [55.0, 28.0, 38.0], size=(pop_size, 3))
     for _ in range(n_iters):
         costs = eval_pop(pop_ga, (1.0, 1.0, 1.0))
@@ -88,7 +78,6 @@ def optimize_heuristic_pid_bank(n_iters: int = 25, pop_size: int = 60, seed: int
         pop_ga = np.clip(children, [25.0, 8.0, 15.0], [85.0, 55.0, 65.0])
     best_ga = pop_ga[int(np.argmin(eval_pop(pop_ga, (1.0, 1.0, 1.0))))]
 
-    # 2. PSO Optimization (Overshoot-Focused for Shift Mode)
     pop_pso = rng.uniform([22.0, 5.0, 42.0], [38.0, 14.0, 62.0], size=(pop_size, 3))
     vel_pso = np.zeros_like(pop_pso)
     pbest = pop_pso.copy()
@@ -106,7 +95,6 @@ def optimize_heuristic_pid_bank(n_iters: int = 25, pop_size: int = 60, seed: int
             gbest = pbest[int(np.argmin(pbest_cost))].copy()
     best_pso = gbest
 
-    # 3. DE Optimization (Settling & Braking Damping Focus)
     pop_de = rng.uniform([48.0, 18.0, 36.0], [66.0, 32.0, 54.0], size=(pop_size, 3))
     cost_de = eval_pop(pop_de, (2.0, 2.5, 0.8))
     for _ in range(n_iters):
@@ -122,7 +110,6 @@ def optimize_heuristic_pid_bank(n_iters: int = 25, pop_size: int = 60, seed: int
         cost_de[imp] = c_trial[imp]
     best_de = pop_de[int(np.argmin(cost_de))]
 
-    # 4. ICA Optimization (Fast Rise Time & Tight Steady Tracking)
     pop_ica = rng.uniform([68.0, 38.0, 16.0], [86.0, 56.0, 28.0], size=(pop_size, 3))
     for _ in range(n_iters):
         costs = eval_pop(pop_ica, (0.3, 1.0, 3.5))
@@ -192,12 +179,6 @@ class NonlinearTrainPhysics:
 # 3. Stabilized Causal Physics Emulator & RL Policy Network
 # ===========================================================================
 class LearnedLinearizationModel(nn.Module):
-    """
-    Physics-informed residual emulator:
-      - Smooth SiLU activations + Zero-Residual Initialization (Step 0 = exact Paper Linear Approx).
-      - Causal feature mask: uses strictly physical state/input features [v_norm, u_norm, ext_force, v_norm^2]
-        and zeroes out non-causal [x_norm] and [gains_norm] to prevent counterfactual overfitting.
-    """
     def __init__(self, hidden_dim: int = 64):
         super().__init__()
         self.net = nn.Sequential(
@@ -314,6 +295,7 @@ class PathAgnosticHavaeiEnv:
         lookahead_n: int = 60,
         past_n: int = 4,
         sample_dist_d: float = 8.33,
+        shield: SafetyFilterShield | None = None,
     ):
         assert plant_mode in ("nonlinear", "linear_paper", "linear_learned")
         self.plant_mode = plant_mode
@@ -322,6 +304,7 @@ class PathAgnosticHavaeiEnv:
         self.past_n = past_n
         self.d = sample_dist_d
         self.dt = 0.50
+        self.shield = shield
         self.physics = NonlinearTrainPhysics(sample_dist_d=sample_dist_d)
         self.internal_mpc = PureLiuMPC(
             n_p=10,
@@ -363,6 +346,8 @@ class PathAgnosticHavaeiEnv:
         self.shift_delta = 0.0
         self.stop_drift = 0.0
         self.internal_mpc.reset()
+        if self.shield is not None:
+            self.shield.reset_stats()
         return self.get_observation()
 
     def get_internal_state(self):
@@ -489,9 +474,16 @@ class PathAgnosticHavaeiEnv:
         pid_gains = sum(w[i] * self.pid_bank[ALGORITHMS[i]] for i in range(4))
         return w, alg_name, pid_gains
 
-    def _compute_pid_command(self, pid_gains: np.ndarray, v_target: float, dv_target: float) -> float:
+    def _compute_pid_command(
+        self,
+        pid_gains: np.ndarray,
+        v_target: float,
+        dv_target: float,
+        update_state: bool = True,
+    ) -> float:
         if v_target <= 1e-4 and abs(dv_target) <= 1e-4 and self.v_real < 0.04:
-            self.int_err = 0.0
+            if update_state:
+                self.int_err = 0.0
             return 0.0
 
         kp, ki, kd = float(pid_gains[0]), float(pid_gains[1]), float(pid_gains[2])
@@ -499,14 +491,16 @@ class PathAgnosticHavaeiEnv:
         vel_rate = (self.v_real - self.v_prev) / self.dt
         ref_rate = dv_target / self.dt
 
-        self.int_err = float(np.clip(self.int_err + err_now * self.dt, -3.5, 3.5))
+        new_int_err = float(np.clip(self.int_err + err_now * self.dt, -3.5, 3.5))
+        if update_state:
+            self.int_err = new_int_err
 
         if abs(dv_target) > 1.5:
             d_term = 0.20 * ref_rate - 1.35 * vel_rate
         else:
             d_term = 0.55 * ref_rate - 1.10 * vel_rate
 
-        u_raw = kp * err_now + ki * self.int_err + kd * d_term
+        u_raw = kp * err_now + ki * new_int_err + kd * d_term
         return float(np.clip(u_raw / self.u_scale, -1.0, 1.0))
 
     def _integrate_plant_physics(self, u_cmd: float, x_sample: float) -> tuple[float, float]:
@@ -538,6 +532,7 @@ class PathAgnosticHavaeiEnv:
         k_curr: int,
         x_sample: float,
         ext_f_norm: float,
+        shield_diff: float = 0.0,
     ):
         v_target = float(self.v_des[k_curr])
         v_prev_target = float(self.v_des[max(0, k_curr - 1)])
@@ -587,6 +582,11 @@ class PathAgnosticHavaeiEnv:
             reward = -45.0 * abs_err
             step_w = 1.5
 
+        # Filter-Aware RL penalty (Section 3.5.3 of Hsu, Hu, & Fisac, 2024):
+        # Penalizes the task policy when it forces the safety shield to intervene.
+        if self.shield is not None and shield_diff > 0.0:
+            reward -= self.shield.cfg.intervention_penalty_weight * shield_diff
+
         if terminated:
             reward -= 250.0 * self.stop_drift + 180.0 * self.v_real
 
@@ -609,6 +609,8 @@ class PathAgnosticHavaeiEnv:
             "shift_active": is_shift_window,
             "braking_active": (dv_now < -0.04) and not is_stopping_zone and not is_shift_window,
             "stopping_error": self.stop_drift,
+            "shield_intervened": shield_diff > 1e-5,
+            "shield_diff": shield_diff,
         }
         return self.get_observation(), float(reward), terminated, False, info
 
@@ -637,6 +639,10 @@ class PathAgnosticHavaeiEnv:
         return next_v, v_lin
 
     def step(self, action: int | np.ndarray):
+        shield_diff = 0.0
+        if self.shield is not None:
+            action, shield_diff = self.shield.filter_pid_weights(self, action)
+
         w, alg_name, pid_gains = self._alg_weights_from_action(action)
         self.k += 1
         k_curr = min(self.k, self.max_steps)
@@ -650,15 +656,14 @@ class PathAgnosticHavaeiEnv:
         ) / (0.03 * self.physics.M * self.physics.g)
         gains_norm = pid_gains / self.gains_scale
 
-        u_cmd = self._compute_pid_command(pid_gains, v_target, dv_target)
+        u_cmd = self._compute_pid_command(pid_gains, v_target, dv_target, update_state=True)
         next_v, v_lin = self._predict_next_velocity(old_v, u_cmd, x_sample, ext_f_norm, gains_norm)
 
         return self._finalize_step(
-            next_v, v_lin, u_cmd, alg_name, w, gains_norm, k_curr, x_sample, ext_f_norm
+            next_v, v_lin, u_cmd, alg_name, w, gains_norm, k_curr, x_sample, ext_f_norm, shield_diff=shield_diff
         )
 
     def step_custom_pid(self, pid_gains: np.ndarray, alg_name: str = "FUZZY"):
-        """Steps the environment using externally supplied continuous PID gains [Kp, Ki, Kd]."""
         pid_gains = np.asarray(pid_gains, dtype=np.float64)
         self.k += 1
         k_curr = min(self.k, self.max_steps)
@@ -672,14 +677,14 @@ class PathAgnosticHavaeiEnv:
         ) / (0.03 * self.physics.M * self.physics.g)
         gains_norm = pid_gains / self.gains_scale
 
-        u_cmd = self._compute_pid_command(pid_gains, v_target, dv_target)
+        u_cmd = self._compute_pid_command(pid_gains, v_target, dv_target, update_state=True)
         next_v, v_lin = self._predict_next_velocity(old_v, u_cmd, x_sample, ext_f_norm, gains_norm)
 
         return self._finalize_step(
             next_v, v_lin, u_cmd, alg_name, np.zeros(4, dtype=np.float64), gains_norm, k_curr, x_sample, ext_f_norm
         )
 
-    def step_mpc(self, u_mpc: float):
+    def step_mpc(self, u_mpc: float, shield_diff: float = 0.0):
         self.k += 1
         k_curr = min(self.k, self.max_steps)
         x_sample = k_curr * self.d
@@ -706,9 +711,30 @@ class PathAgnosticHavaeiEnv:
             k_curr,
             x_sample,
             ext_f_norm,
+            shield_diff=shield_diff,
         )
 
     def step_hybrid(self, action: int | np.ndarray):
+        k_curr_pre = self.k
+        x_sample_next = min(k_curr_pre + 1, self.max_steps) * self.d
+        ref_h = self.v_des[k_curr_pre + 1 : min(k_curr_pre + 1 + self.internal_mpc.n_p, len(self.v_des))]
+        slope_iota = (
+            (self.physics.grade_resistance(x_sample_next) + self.physics.curve_resistance(x_sample_next))
+            / (self.physics.M * self.physics.g)
+            if self.plant_mode != "linear_paper"
+            else 0.0
+        )
+
+        # Always keep internal_mpc synced with true velocity v_prev before querying u_mpc_cand!
+        self.internal_mpc.prev_v = float(self.v_prev)
+        u_mpc_cand = self.internal_mpc.select_action(
+            self.v_real, ref_h, slope_iota=slope_iota, dt_step=self.dt
+        )
+
+        shield_diff = 0.0
+        if self.shield is not None:
+            action, shield_diff = self.shield.filter_hybrid_weights(self, action, u_mpc_cand)
+
         if isinstance(action, (int, np.integer)):
             act_idx = int(action)
             w5 = np.zeros(5, dtype=np.float64)
@@ -720,27 +746,24 @@ class PathAgnosticHavaeiEnv:
 
         w_mpc = float(w5[4])
         if w_mpc >= 0.999:
-            k_curr = self.k
-            x_sample = (k_curr + 1) * self.d
-            ref_h = self.v_des[k_curr + 1 : min(k_curr + 1 + self.internal_mpc.n_p, len(self.v_des))]
-            slope_iota = (
-                (self.physics.grade_resistance(x_sample) + self.physics.curve_resistance(x_sample))
-                / (self.physics.M * self.physics.g)
-                if self.plant_mode != "linear_paper"
-                else 0.0
-            )
-            u_opt = self.internal_mpc.select_action(
-                self.v_real, ref_h, slope_iota=slope_iota, dt_step=self.dt
-            )
-            return self.step_mpc(u_opt)
+            return self.step_mpc(u_mpc_cand, shield_diff=shield_diff)
         elif w_mpc <= 0.02:
             w4 = w5[:4] / (np.sum(w5[:4]) + 1e-12)
-            return self.step(w4)
+            saved_shield = self.shield
+            self.shield = None
+            obs, rew, term, trunc, info = self.step(w4)
+            self.shield = saved_shield
+            # Bumpless transfer: sync internal_mpc.prev_u with the actual PID command executed!
+            self.internal_mpc.prev_u = float(info["u_pid"])
+            if self.shield is not None and shield_diff > 0.0:
+                rew -= self.shield.cfg.intervention_penalty_weight * shield_diff
+                info["shield_intervened"] = True
+                info["shield_diff"] = shield_diff
+            return obs, rew, term, trunc, info
         else:
             w4 = w5[:4] / (np.sum(w5[:4]) + 1e-12)
             _, _, pid_gains = self._alg_weights_from_action(w4)
 
-            k_curr_pre = self.k
             self.k += 1
             k_curr = min(self.k, self.max_steps)
             x_sample = k_curr * self.d
@@ -751,32 +774,23 @@ class PathAgnosticHavaeiEnv:
                 self.physics.grade_resistance(x_sample) + self.physics.curve_resistance(x_sample)
             ) / (0.03 * self.physics.M * self.physics.g)
 
-            ref_h = self.v_des[k_curr_pre + 1 : min(k_curr_pre + 1 + self.internal_mpc.n_p, len(self.v_des))]
-            slope_iota = (
-                (self.physics.grade_resistance(x_sample) + self.physics.curve_resistance(x_sample))
-                / (self.physics.M * self.physics.g)
-                if self.plant_mode != "linear_paper"
-                else 0.0
-            )
-            u_mpc = self.internal_mpc.select_action(
-                old_v, ref_h, slope_iota=slope_iota, dt_step=self.dt
-            )
-            u_pid = self._compute_pid_command(pid_gains, v_target, dv_target)
-            u_blend = float(np.clip(w_mpc * u_mpc + (1.0 - w_mpc) * u_pid, -1.0, 1.0))
+            u_pid = self._compute_pid_command(pid_gains, v_target, dv_target, update_state=True)
+            u_blend = float(np.clip(w_mpc * u_mpc_cand + (1.0 - w_mpc) * u_pid, -1.0, 1.0))
             self.internal_mpc.prev_u = u_blend
 
             gains_norm = pid_gains / self.gains_scale
             next_v, v_lin = self._predict_next_velocity(old_v, u_blend, x_sample, ext_f_norm, gains_norm)
             alg_name = HYBRID_ALGORITHMS[act_idx]
             return self._finalize_step(
-                next_v, v_lin, u_blend, alg_name, w4, gains_norm, k_curr, x_sample, ext_f_norm
+                next_v, v_lin, u_blend, alg_name, w4, gains_norm, k_curr, x_sample, ext_f_norm, shield_diff=shield_diff
             )
-
+        
 
 # ===========================================================================
 # 5. Stabilized Neural Emulator & Cumulative Multi-Track RL Trainers
 # ===========================================================================
 _EMULATOR_REPLAY_BUFFER: list[dict[str, torch.Tensor]] = []
+LAST_TRAINED_EMULATOR: LearnedLinearizationModel | None = None
 
 
 def learn_150_step_emulator_for_trajectory(
@@ -788,15 +802,7 @@ def learn_150_step_emulator_for_trajectory(
     verbose: bool = False,
     return_curve: bool = False,
 ):
-    """
-    Trains the Physics-Informed Surrogate Emulator:
-      - Retains a multi-track replay buffer across batch regenerations so previously
-        learned operating regimes are never forgotten.
-      - Uses linear warmup + cosine annealing + best-checkpoint restoration.
-      - Penalizes velocity under-prediction inside shift windows (`asym_weight`) so
-        impending overshoot is never hidden from the RL planner.
-    """
-    global _EMULATOR_REPLAY_BUFFER
+    global _EMULATOR_REPLAY_BUFFER, LAST_TRAINED_EMULATOR
     env_nl = PathAgnosticHavaeiEnv(v_des_profile=v_des, plant_mode="nonlinear")
     x_list, vc_list, vlin_list, u_list, ext_list, g_list, vnext_list = [], [], [], [], [], [], []
     shift_dir_list = []
@@ -904,6 +910,7 @@ def learn_150_step_emulator_for_trajectory(
 
     emulator.load_state_dict(best_state)
     emulator.eval()
+    LAST_TRAINED_EMULATOR = emulator
 
     if verbose:
         print(f"    [Physics Surrogate Emulator ({step_budget} steps)] Fit RMSE: {best_rmse:.5f} m/s")
@@ -917,12 +924,6 @@ def _compute_surrogate_horizon_q_costs(
     n_algs: int,
     rollout_horizon: int = 6,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    6-Step Surrogate Receding-Horizon Evaluation (Idea A):
-      - When `plant_mode == "linear_learned"`, holds candidate action `a_idx` for 2 steps
-        (h in {0, 1}) during shift windows so actuator lag (0.28 * u_act) is exposed, and
-        adds an anticipatory velocity-rate overshoot margin near the shift target.
-    """
     assert surrogate_env.plant_mode in ("linear_paper", "linear_learned")
     surrogate_env.reset()
     done = False
@@ -996,6 +997,7 @@ def train_ppo_policy(
     gamma: float = 0.96,
     gae_lambda: float = 0.92,
     seed: int = 42,
+    shield: SafetyFilterShield | None = None,
 ) -> tuple[TwoPhaseRLSwitchPolicy, list[float], float]:
     t0 = time.perf_counter()
     np.random.seed(seed)
@@ -1007,6 +1009,7 @@ def train_ppo_policy(
         v_des_profile=current_v_des,
         plant_mode="nonlinear",
         lookahead_n=lookahead_n,
+        shield=shield,
     )
 
     policy = TwoPhaseRLSwitchPolicy(obs_dim=env.obs_dim, n_algs=n_algs, hidden_dim=96)
@@ -1107,15 +1110,8 @@ def train_rl_switch_strict_two_ways(
     use_hybrid_mpc: bool = False,
     lr: float = 3.0e-3,
     seed: int = 42,
+    shield: SafetyFilterShield | None = None,
 ) -> tuple[TwoPhaseRLSwitchPolicy, list[float], float]:
-    """
-    Cumulative Multi-Track Surrogate-Horizon RL Trainer:
-      - Accumulates `(obs, q_costs)` across all batch regenerations into a growing multi-track
-        dataset instead of overwriting `obs_b` with a single track (preventing late-epoch forgetting).
-      - Uses relative normalized Q-regret `(q_costs - min_cost)` so difficult tracks never cause
-        gradient explosions.
-      - Tracks and restores the best policy checkpoint evaluated across all accumulated tracks.
-    """
     assert rl_way in ("paper_linear_only", "emulator_150_only", "ppo_nonlinear")
     assert traj_mode in ("fixed_generated", "batch_random")
 
@@ -1127,6 +1123,7 @@ def train_rl_switch_strict_two_ways(
             lookahead_n=lookahead_n,
             use_hybrid_mpc=use_hybrid_mpc,
             seed=seed,
+            shield=shield,
         )
 
     t0 = time.perf_counter()
@@ -1142,6 +1139,7 @@ def train_rl_switch_strict_two_ways(
             v_des_profile=current_v_des,
             plant_mode="linear_paper",
             lookahead_n=lookahead_n,
+            shield=shield,
         )
     else:
         emulator_model = learn_150_step_emulator_for_trajectory(
@@ -1152,6 +1150,7 @@ def train_rl_switch_strict_two_ways(
             plant_mode="linear_learned",
             learned_linear_model=emulator_model,
             lookahead_n=lookahead_n,
+            shield=shield,
         )
 
     policy = TwoPhaseRLSwitchPolicy(obs_dim=env.obs_dim, n_algs=n_algs, hidden_dim=96)
@@ -1186,11 +1185,9 @@ def train_rl_switch_strict_two_ways(
             obs_pool.append(torch.as_tensor(obs_np, dtype=torch.float32))
             q_costs_pool.append(torch.as_tensor(q_costs_np, dtype=torch.float32))
 
-            # Concatenate all tracks seen so far so the policy never unlearns previous tracks!
             obs_b = torch.cat(obs_pool, dim=0)
             q_costs_b = torch.cat(q_costs_pool, dim=0)
 
-            # Re-evaluate best_regret on the expanded multi-track pool so checkpoints stay comparable
             with torch.no_grad():
                 logits_pool, _ = policy.forward(obs_b)
                 probs_pool = torch.softmax(logits_pool / 0.12, dim=-1)
@@ -1237,7 +1234,7 @@ def train_rl_switch_strict_two_ways(
             best_policy_state = copy.deepcopy(policy.state_dict())
 
         if epoch == 1 or epoch % 50 == 0 or epoch == epochs:
-            tag = f"{rl_way}{'+HybridMPC' if use_hybrid_mpc else ''}"
+            tag = f"{rl_way}{'+HybridMPC' if use_hybrid_mpc else ''}{'+Shield' if shield is not None else ''}"
             print(
                 f"  [{tag} | {traj_mode}] Epoch {epoch:3d}/{epochs} | "
                 f"Step Tracking Loss: {mean_step_loss:6.4f} (Regret: {mean_regret:5.3f}) | "

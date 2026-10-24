@@ -1,11 +1,11 @@
 """
-Centralized Multi-Trajectory Benchmark Suite (`benchmark_central.py`)
-Compares:
-  - Fixed Heuristic PIDs (GA, PSO, DE, ICA)
-  - Fuzzy-PID (Standard Mamdani) & ILR-PSO-Fuzzy-PID (He et al., 2024)
+Fast Focused Benchmark Suite (`benchmark_central.py`)
+Focuses directly on:
   - Pure MPC & Adaptive MPC (Idea C)
-  - Hardcoded-Switch IPID (Havaei & Sandidzadeh)
-  - RL-Switch (PPO, Way 1 Linear, Way 2 Neural Emulator) & Hybrid RL-IPID-MPC
+  - Hardcoded-Switch IPID (Havaei reference)
+  - Unshielded RL vs. Shielded RL (1-Step DCBF vs. Multi-Step DMPS Rollout)
+  - Unshielded Hybrid RL-MPC vs. Shielded Hybrid RL-MPC (1-Step DCBF vs. Multi-Step DMPS Rollout)
+Use `--full-baselines` if you also want to run Fixed PIDs, Fuzzy-PIDs, Way 1, and PPO.
 """
 from __future__ import annotations
 
@@ -18,10 +18,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from pure_mpc_controller import PureLiuMPC
-from fuzzy_pid_controller import FuzzyPIDController, OPTIMIZED_ILR_PSO_FUZZY_PARAMS
+from fuzzy_pid_controller import FuzzyPIDController
+from safety_shield import SafetyFilterShield, ShieldConfig
+import havaei_generalizing_rl as hrl
 from havaei_generalizing_rl import (
-    ALGORITHMS,
-    ALG_TO_IDX,
     HYBRID_ALGORITHMS,
     COMPUTED_PID_BANK,
     HardcodedSwitchController,
@@ -115,13 +115,16 @@ def run_controller_benchmark(
     rl_policy=None,
     mpc_ctrl: PureLiuMPC | None = None,
     fuzzy_ctrl: FuzzyPIDController | None = None,
+    shield: SafetyFilterShield | None = None,
     lookahead_n: int = 60,
     record_traj: bool = False,
 ) -> dict:
     env = PathAgnosticHavaeiEnv(
         v_des_profile=v_des,
         plant_mode="nonlinear",
+        learned_linear_model=hrl.LAST_TRAINED_EMULATOR,
         lookahead_n=lookahead_n,
+        shield=shield,
     )
     obs = env.reset()
     done = False
@@ -157,12 +160,7 @@ def run_controller_benchmark(
                 fuzzy_ctrl = FuzzyPIDController(mode="ilr_pso" if controller_type == "FUZZY_ILR_PSO" else "standard")
             gains_k = fuzzy_ctrl.compute_gains(env)
             t1 = time.perf_counter()
-            if hasattr(env, "step_custom_pid"):
-                obs, _, term, trunc, info = env.step_custom_pid(gains_k, alg_name=controller_type)
-            else:
-                # Fallback if step_custom_pid was not added to PathAgnosticHavaeiEnv
-                env.pid_bank["GA"] = gains_k
-                obs, _, term, trunc, info = env.step(0)
+            obs, _, term, trunc, info = env.step_custom_pid(gains_k, alg_name=controller_type)
 
         elif controller_type == "HARDCODED":
             action = hc.select_action(env)
@@ -246,51 +244,36 @@ def run_controller_benchmark(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Unified Multi-Trajectory ATO Benchmark: RL vs IPID, Fuzzy-PID & MPC")
+    ap = argparse.ArgumentParser(description="Fast Focused ATO Shielding Benchmark (RL vs Shielded RL vs MPC)")
     ap.add_argument("--horizon", type=int, default=1000, help="Total working steps T per trajectory")
     ap.add_argument("--lookahead-n", type=int, default=60, help="Length of lookahead acceleration vector A")
-    ap.add_argument("--epochs", type=int, default=240, help="Total RL training epochs")
+    ap.add_argument("--epochs", type=int, default=200, help="Total RL training epochs")
     ap.add_argument("--regen-every", type=int, default=40, help="Regenerate random trajectory every N epochs")
-    ap.add_argument("--emulator-steps", type=int, default=150, help="Steps for Neural Trajectory Emulator in Way 2")
-    ap.add_argument("--eval-runs", type=int, default=30, help="Number of unseen random trajectories for evaluation")
+    ap.add_argument("--emulator-steps", type=int, default=150, help="Steps for Neural Trajectory Emulator")
+    ap.add_argument("--eval-runs", type=int, default=25, help="Number of unseen random trajectories for evaluation")
+    ap.add_argument("--full-baselines", action="store_true", help="Include Fixed PIDs, Fuzzy-PIDs, Way 1, and PPO")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--plot", type=str, default="central_benchmark_multi.png")
+    ap.add_argument("--plot", type=str, default="final_paper_benchmark.png")
     args = ap.parse_args()
 
     n_train_tracks = max(1, args.epochs // args.regen_every)
     print("=" * 136)
     print(
-        f"CENTRALIZED ATO BENCHMARK | Horizon T = {args.horizon} | Lookahead A = {args.lookahead_n} steps | "
-        f"Training: {args.epochs} Epochs ({n_train_tracks} Sequential Random Tracks) | Eval: {args.eval_runs} Unseen Tracks"
+        f"FOCUSED ATO SHIELDING BENCHMARK | Horizon T = {args.horizon} | "
+        f"Training: {args.epochs} Epochs ({n_train_tracks} Tracks) | Eval: {args.eval_runs} Unseen Tracks"
     )
     print("=" * 136)
-    print("Computed Offline Heuristic PID Bank (Cardano Step-Response Optimization):")
-    for alg_k, gains_v in COMPUTED_PID_BANK.items():
-        print(f"  * {alg_k:<4}: Kp = {gains_v[0]:6.2f}, Ki = {gains_v[1]:6.2f}, Kd = {gains_v[2]:6.2f}")
-    p_fuz = OPTIMIZED_ILR_PSO_FUZZY_PARAMS
-    print(
-        f"  * ILR-PSO-Fuzzy-PID (He et al. 2024): Kp0={p_fuz[0]:.2f}, Ki0={p_fuz[1]:.2f}, Kd0={p_fuz[2]:.2f} | "
-        f"u_p={p_fuz[3]:.2f}, u_i={p_fuz[4]:.2f}, u_d={p_fuz[5]:.2f}"
-    )
 
     gen_fn = lambda seed: generate_truly_random_trajectory(
         total_horizon=args.horizon, min_phase_len=25, seed=seed
     )
 
-    print(f"\n=== 1. Training RL Way 1: Surrogate-Horizon on Paper Linear ARX Model (Batch-{args.regen_every}) ===")
-    rl_way1, hist_w1, _ = train_rl_switch_strict_two_ways(
-        gen_fn,
-        rl_way="paper_linear_only",
-        traj_mode="batch_random",
-        regen_every_n_epochs=args.regen_every,
-        epochs=args.epochs,
-        lookahead_n=args.lookahead_n,
-        use_hybrid_mpc=False,
-        seed=args.seed,
-    )
-    rl_way1.eval()
+    # Instantiate the Safety Filter Shields from `safety_shield.py`
+    shield_dcbf = SafetyFilterShield(ShieldConfig(mode="cbf_opt"))
+    shield_dmps = SafetyFilterShield(ShieldConfig(mode="mps_rollout"))
+    shield_switch = SafetyFilterShield(ShieldConfig(mode="switch"))
 
-    print(f"\n=== 2. Training RL Way 2: Surrogate-Horizon on {args.emulator_steps}-Step Neural Emulator (Batch-{args.regen_every}) ===")
+    print(f"\n=== 1. Training 4-Action RL-Switch on {args.emulator_steps}-Step Neural Emulator (Batch-{args.regen_every}) ===")
     rl_way2, hist_w2, _ = train_rl_switch_strict_two_ways(
         gen_fn,
         rl_way="emulator_150_only",
@@ -301,23 +284,11 @@ def main():
         lookahead_n=args.lookahead_n,
         use_hybrid_mpc=False,
         seed=args.seed,
+        shield=None,
     )
     rl_way2.eval()
 
-    print(f"\n=== 3. Training Model-Free Clipped PPO + GAE on Nonlinear Plant (Batch-{args.regen_every}) ===")
-    rl_ppo, hist_ppo, _ = train_rl_switch_strict_two_ways(
-        gen_fn,
-        rl_way="ppo_nonlinear",
-        traj_mode="batch_random",
-        regen_every_n_epochs=args.regen_every,
-        epochs=args.epochs,
-        lookahead_n=args.lookahead_n,
-        use_hybrid_mpc=False,
-        seed=args.seed,
-    )
-    rl_ppo.eval()
-
-    print(f"\n=== 4. Training Idea A+C Hybrid RL-IPID-MPC Switch (5 Actions: GA, PSO, DE, ICA, MPC) ===")
+    print(f"\n=== 2. Training 5-Action Hybrid RL-IPID-MPC on {args.emulator_steps}-Step Neural Emulator (Batch-{args.regen_every}) ===")
     rl_hybrid, hist_hyb, _ = train_rl_switch_strict_two_ways(
         gen_fn,
         rl_way="emulator_150_only",
@@ -328,31 +299,36 @@ def main():
         lookahead_n=args.lookahead_n,
         use_hybrid_mpc=True,
         seed=args.seed,
+        shield=None,  # Keep Q-table training uncorrupted so DMPS uses clean Q-estimates!
     )
     rl_hybrid.eval()
 
     mpc_standard = PureLiuMPC(n_p=10, n_c=5, q1=140.0, q2=0.08, q3=0.45, adaptive_shift=False)
     mpc_idea_c = PureLiuMPC(n_p=10, n_c=5, q1=140.0, q2=0.08, q3=0.45, adaptive_shift=True)
-    fuzzy_std = FuzzyPIDController(mode="standard")
-    fuzzy_ilr_pso = FuzzyPIDController(mode="ilr_pso")
 
-    # ---------------- MULTI-TRAJECTORY INFERENCE BENCHMARK (N Unseen Tracks) ----------------
-    eval_specs = [
-        ("GA-PID (Fixed)", "FIXED_0", None, None, None),
-        ("PSO-PID (Fixed)", "FIXED_1", None, None, None),
-        ("DE-PID (Fixed)", "FIXED_2", None, None, None),
-        ("ICA-PID (Fixed)", "FIXED_3", None, None, None),
-        ("Fuzzy-PID (Standard Mamdani)", "FUZZY_STD", None, None, fuzzy_std),
-        ("ILR-PSO-Fuzzy-PID (He 2024)", "FUZZY_ILR_PSO", None, None, fuzzy_ilr_pso),
-        ("Pure MPC (Standard Fixed Q3)", "MPC", None, mpc_standard, None),
-        ("Adaptive MPC (Idea C: Shift-Q3)", "MPC", None, mpc_idea_c, None),
-        ("Hardcoded-Switch IPID (Havaei)", "HARDCODED", None, None, None),
-        ("RL-Switch (Model-Free PPO)", "RL_SOFT", rl_ppo, None, None),
-        ("RL-Switch Way 1 (Linear + Idea A)", "RL_SOFT", rl_way1, None, None),
-        ("RL-Switch Way 2 (150-Emu + Idea A)", "RL_SOFT", rl_way2, None, None),
-        ("Hybrid RL-IPID-MPC (Idea A + C)", "RL_HYBRID", rl_hybrid, None, None),
-    ]
-    agg = {name: [] for name, _, _, _, _ in eval_specs}
+    eval_specs = []
+    if args.full_baselines:
+        fuzzy_ilr_pso = FuzzyPIDController(mode="ilr_pso")
+        eval_specs.extend([
+            ("DE-PID (Fixed)", "FIXED_2", None, None, None, None),
+            ("ICA-PID (Fixed)", "FIXED_3", None, None, None, None),
+            ("ILR-PSO-Fuzzy-PID (He 2024)", "FUZZY_ILR_PSO", None, None, fuzzy_ilr_pso, None),
+        ])
+
+    eval_specs.extend([
+        ("Pure MPC (Standard Fixed Q3)", "MPC", None, mpc_standard, None, None),
+        ("Adaptive MPC (Idea C: Shift-Q3)", "MPC", None, mpc_idea_c, None, None),
+        ("Hardcoded-Switch IPID (Havaei)", "HARDCODED", None, None, None, None),
+        ("RL-Switch Way 2 (Unshielded)", "RL_SOFT", rl_way2, None, None, None),
+        ("Shielded RL-Switch (1-Step DCBF)", "RL_SOFT", rl_way2, None, None, shield_dcbf),
+        ("Shielded RL-Switch (DMPS Rollout)", "RL_SOFT", rl_way2, None, None, shield_dmps),
+        ("Hybrid RL-IPID-MPC (Unshielded)", "RL_HYBRID", rl_hybrid, None, None, None),
+        ("Shielded Hybrid RL-MPC (Switch MPS)", "RL_HYBRID", rl_hybrid, None, None, shield_switch),
+        ("Shielded Hybrid RL-MPC (1-Step DCBF)", "RL_HYBRID", rl_hybrid, None, None, shield_dcbf),
+        ("Shielded Hybrid RL-MPC (DMPS Rollout)", "RL_HYBRID", rl_hybrid, None, None, shield_dmps),
+    ])
+
+    agg = {name: [] for name, _, _, _, _, _ in eval_specs}
     sample_trajs = {}
     sample_schedule = None
 
@@ -362,7 +338,7 @@ def main():
         )
         if ep == 0:
             sample_schedule = sched_rand
-        for name, ctype, pol, m_ctrl, f_ctrl in eval_specs:
+        for name, ctype, pol, m_ctrl, f_ctrl, sh_ctrl in eval_specs:
             res = run_controller_benchmark(
                 name,
                 v_rand,
@@ -370,6 +346,7 @@ def main():
                 rl_policy=pol,
                 mpc_ctrl=m_ctrl,
                 fuzzy_ctrl=f_ctrl,
+                shield=sh_ctrl,
                 lookahead_n=args.lookahead_n,
                 record_traj=(ep == 0),
             )
@@ -381,11 +358,11 @@ def main():
     print(f"INFERENCE BENCHMARK ACROSS {args.eval_runs} UNSEEN RANDOM [0, {args.horizon}] TRAJECTORIES (MODES 1..6, MEAN ± STD)")
     print("-" * 154)
     print(
-        f"{'Controller Method':<35} | {'MeanErr (m/s)':>15} | {'BrakeErr':>8} | {'ShiftOS':>8} | "
+        f"{'Controller Method':<37} | {'MeanErr (m/s)':>15} | {'BrakeErr':>8} | {'ShiftOS':>8} | "
         f"{'ShiftAvg':>8} | {'StopErr':>8} | {'PaperScore':>15} | {'StepInfer':>12} | {'Status':>6}"
     )
     print("-" * 154)
-    for name, _, _, _, _ in eval_specs:
+    for name, _, _, _, _, _ in eval_specs:
         runs = agg[name]
         m_err = float(np.mean([r["Mean_Err"] for r in runs]))
         s_err = float(np.std([r["Mean_Err"] for r in runs]))
@@ -398,7 +375,7 @@ def main():
         lat_us = float(np.mean([r["Infer_Mean_us"] for r in runs]))
         status = "PASS" if all(r["Passes_Benchmark"] == "PASS" for r in runs) else "FAIL"
         print(
-            f"{name:<35} | {m_err:6.4f} ± {s_err:6.4f} | {b_err:8.4f} | {os_val:8.4f} | "
+            f"{name:<37} | {m_err:6.4f} ± {s_err:6.4f} | {b_err:8.4f} | {os_val:8.4f} | "
             f"{sa_val:8.4f} | {st_val:8.4f} | {p_score:6.4f} ± {p_std:6.4f} | {lat_us:9.2f} us | {status:>6}"
         )
     print("=" * 154)
@@ -406,12 +383,12 @@ def main():
     # ---------------- Save 6-Panel Plot ----------------
     fig, axes = plt.subplots(2, 3, figsize=(18, 9.5))
     plot_methods = [
-        "ILR-PSO-Fuzzy-PID (He 2024)",
         "Adaptive MPC (Idea C: Shift-Q3)",
-        "Hardcoded-Switch IPID (Havaei)",
-        "RL-Switch (Model-Free PPO)",
-        "RL-Switch Way 2 (150-Emu + Idea A)",
-        "Hybrid RL-IPID-MPC (Idea A + C)",
+        "RL-Switch Way 2 (Unshielded)",
+        "Shielded RL-Switch (DMPS Rollout)",
+        "Hybrid RL-IPID-MPC (Unshielded)",
+        "Shielded Hybrid RL-MPC (1-Step DCBF)",
+        "Shielded Hybrid RL-MPC (DMPS Rollout)",
     ]
     k_grid = sample_trajs[plot_methods[0]]["k"]
     v_des_ref = sample_trajs[plot_methods[0]]["v_des"]
@@ -446,33 +423,53 @@ def main():
     axes[0, 2].grid(True, alpha=0.3)
 
     map_idx = {name: i for i, name in enumerate(HYBRID_ALGORITHMS)}
-    hc_algs = [map_idx.get(a, 0) for a in sample_trajs["Hardcoded-Switch IPID (Havaei)"]["alg"]]
-    hyb_algs = [map_idx.get(a, 0) for a in sample_trajs["Hybrid RL-IPID-MPC (Idea A + C)"]["alg"]]
-    axes[1, 0].step(k_grid, hc_algs, "b:", where="mid", alpha=0.7, label="Hardcoded IPID (4-Step Chain)")
-    axes[1, 0].step(k_grid, hyb_algs, "r-", where="mid", alpha=0.85, label="Hybrid RL-IPID-MPC")
+    unsh_algs = [map_idx.get(a, 0) for a in sample_trajs["Hybrid RL-IPID-MPC (Unshielded)"]["alg"]]
+    dmps_algs = [map_idx.get(a, 0) for a in sample_trajs["Shielded Hybrid RL-MPC (DMPS Rollout)"]["alg"]]
+    axes[1, 0].step(k_grid, unsh_algs, "b:", where="mid", alpha=0.7, label="Unshielded Hybrid RL-MPC")
+    axes[1, 0].step(k_grid, dmps_algs, "r-", where="mid", alpha=0.85, label="Shielded Hybrid RL-MPC (DMPS)")
     axes[1, 0].set_yticks([0, 1, 2, 3, 4])
     axes[1, 0].set_yticklabels(list(HYBRID_ALGORITHMS))
-    axes[1, 0].set_title("4. Active Controller Selection on Unseen Track")
+    axes[1, 0].set_title("4. Active Controller Selection (Unshielded vs DMPS)")
     axes[1, 0].legend(fontsize=8)
     axes[1, 0].grid(True, alpha=0.3)
 
-    bar_specs = eval_specs[4:]
-    names_bar = ["Fuzzy", "ILR-Fuzzy", "Std MPC", "IdeaC MPC", "IPID", "RL PPO", "RL W1", "RL W2", "Hybrid RL"]
-    scores_bar = [float(np.mean([r["Paper_Score"] for r in agg[spec[0]]])) for spec in bar_specs]
+    names_bar = [
+        "Std MPC",
+        "IdeaC MPC",
+        "IPID",
+        "RL W2",
+        "W2+DCBF",
+        "W2+DMPS",
+        "Hyb RL",
+        "Hyb+Sw",
+        "Hyb+DCBF",
+        "Hyb+DMPS",
+    ]
+    bar_keys = [spec[0] for spec in eval_specs[-10:]]
+    scores_bar = [float(np.mean([r["Paper_Score"] for r in agg[k]])) for k in bar_keys]
     axes[1, 1].bar(
         names_bar,
         scores_bar,
-        color=["teal", "lightseagreen", "orange", "darkorange", "steelblue", "dodgerblue", "mediumpurple", "seagreen", "crimson"],
+        color=[
+            "orange",
+            "darkorange",
+            "steelblue",
+            "seagreen",
+            "mediumseagreen",
+            "limegreen",
+            "indianred",
+            "salmon",
+            "firebrick",
+            "crimson",
+        ],
     )
     axes[1, 1].set_title(f"5. Composite PaperScore Across {args.eval_runs} Unseen Tracks")
     axes[1, 1].set_ylabel("PaperScore (Lower = Better)")
-    axes[1, 1].tick_params(axis="x", labelsize=6.8)
+    axes[1, 1].tick_params(axis="x", labelsize=6.2)
     axes[1, 1].grid(True, axis="y", alpha=0.3)
 
-    axes[1, 2].plot(np.arange(1, len(hist_w1) + 1), -np.array(hist_w1), "b--", alpha=0.8, label="RL Way 1 (Linear Surrogate)")
-    axes[1, 2].plot(np.arange(1, len(hist_w2) + 1), -np.array(hist_w2), "g-", alpha=0.85, label="RL Way 2 (Neural Emulator)")
-    axes[1, 2].plot(np.arange(1, len(hist_ppo) + 1), -np.array(hist_ppo), "c:", linewidth=1.5, label="RL Model-Free PPO")
-    axes[1, 2].plot(np.arange(1, len(hist_hyb) + 1), -np.array(hist_hyb), "r-", linewidth=1.6, label="Hybrid RL-IPID-MPC")
+    axes[1, 2].plot(np.arange(1, len(hist_w2) + 1), -np.array(hist_w2), "g-", alpha=0.85, label="4-Action RL-Switch (Emu)")
+    axes[1, 2].plot(np.arange(1, len(hist_hyb) + 1), -np.array(hist_hyb), "r-", linewidth=1.6, label="5-Action Hybrid RL-MPC (Emu)")
     axes[1, 2].set_title(f"6. Step Tracking Cost Across {args.epochs} Epochs ({n_train_tracks} Tracks)")
     axes[1, 2].set_xlabel("Training Epoch")
     axes[1, 2].set_ylabel("Mean Step Cost (Lower = Better)")
