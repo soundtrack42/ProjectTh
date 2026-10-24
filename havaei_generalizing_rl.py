@@ -725,8 +725,8 @@ class PathAgnosticHavaeiEnv:
             else 0.0
         )
 
-        # Always keep internal_mpc synced with true velocity v_prev before querying u_mpc_cand!
-        self.internal_mpc.prev_v = float(self.v_prev)
+        # Save MPC internal state in case MPC weight is 0 after filtering
+        saved_mpc_u, saved_mpc_v = self.internal_mpc.prev_u, self.internal_mpc.prev_v
         u_mpc_cand = self.internal_mpc.select_action(
             self.v_real, ref_h, slope_iota=slope_iota, dt_step=self.dt
         )
@@ -748,13 +748,13 @@ class PathAgnosticHavaeiEnv:
         if w_mpc >= 0.999:
             return self.step_mpc(u_mpc_cand, shield_diff=shield_diff)
         elif w_mpc <= 0.02:
+            self.internal_mpc.prev_u, self.internal_mpc.prev_v = saved_mpc_u, saved_mpc_v
             w4 = w5[:4] / (np.sum(w5[:4]) + 1e-12)
+            # Call internal PID step without double-filtering
             saved_shield = self.shield
             self.shield = None
             obs, rew, term, trunc, info = self.step(w4)
             self.shield = saved_shield
-            # Bumpless transfer: sync internal_mpc.prev_u with the actual PID command executed!
-            self.internal_mpc.prev_u = float(info["u_pid"])
             if self.shield is not None and shield_diff > 0.0:
                 rew -= self.shield.cfg.intervention_penalty_weight * shield_diff
                 info["shield_intervened"] = True
@@ -784,7 +784,7 @@ class PathAgnosticHavaeiEnv:
             return self._finalize_step(
                 next_v, v_lin, u_blend, alg_name, w4, gains_norm, k_curr, x_sample, ext_f_norm, shield_diff=shield_diff
             )
-        
+
 
 # ===========================================================================
 # 5. Stabilized Neural Emulator & Cumulative Multi-Track RL Trainers
