@@ -12,7 +12,7 @@
 
 1. **Idea A — Horizon-Aware IPID Switching:**
    Upgrades the 4-algorithm heuristic PID bank (**GA, PSO, DE, ICA** tuned via Cardano's cubic root formula) of Havaei & Sandidzadeh (2022) with a 20-dimensional path-agnostic observation space encoding a 60-step spatial kinematic acceleration lookahead horizon $\mathbf{A}_{\text{ref}}$ and past history $\mathbf{A}_{\text{past}}$.
-2. **Idea C — Shift-Aware Adaptive MPC:**
+2. **Idea B — Shift-Aware Adaptive MPC:**
    Upgrades constrained linear-quadratic Model Predictive Control (Liu et al., 2025) with dynamic shift-onset weight relaxation ($Q_2, Q_3 \downarrow, Q_1 \uparrow$), 1-step actuator-lag phase-lead compensation, counter-braking anti-overshoot damping, and a terminal station docking precision boost.
 3. **Causal Neural Physics Surrogate Emulator (150-Step):**
    Replaces static 3rd-order transfer function approximations with a learned residual neural network emulator trained on true nonlinear point-mass train dynamics (Davis aerodynamic drag $F_B = Av^2 + Bv + C$, sinusoidal track grades, curve resistance, motor field-weakening, and actuator lag $\tau = 0.28$).
