@@ -1,7 +1,7 @@
 """
 Fast Focused Benchmark Suite (`benchmark_central.py`)
 Focuses directly on:
-  - Pure MPC & Adaptive MPC (Idea C)
+  - Pure MPC & Adaptive MPC (Idea B)
   - Hardcoded-Switch IPID (Havaei reference)
   - Unshielded RL vs. Shielded RL (1-Step DCBF vs. Multi-Step DMPS Rollout)
   - Unshielded Hybrid RL-MPC vs. Shielded Hybrid RL-MPC (1-Step DCBF vs. Multi-Step DMPS Rollout)
@@ -237,6 +237,7 @@ def run_controller_benchmark(
     mean_step_us = float(np.mean(lat_arr))
     passes_realtime = (ep_infer_ms <= MAX_ACCEPTABLE_EPISODE_MS) and (mean_step_us <= MAX_ACCEPTABLE_STEP_US)
 
+    int_rate = (100.0 * shield.total_interventions / max(1, shield.total_steps)) if shield is not None else 0.0
     res = {
         "Method": method_name,
         "Mean_Err": mean_err,
@@ -245,6 +246,7 @@ def run_controller_benchmark(
         "Brake_Err": brake_err,
         "Stop_Err_m": stop_err,
         "Paper_Score": paper_score,
+        "Shield_Rate_Pct": int_rate,
         "Infer_Mean_us": mean_step_us,
         "Episode_Infer_ms": ep_infer_ms,
         "Passes_Benchmark": "PASS" if passes_realtime else "FAIL",
@@ -334,7 +336,7 @@ def main():
 
     eval_specs.extend([
         ("Pure MPC (Standard Fixed Q3)", "MPC", None, mpc_standard, None, None),
-        ("Adaptive MPC (Idea C: Shift-Q3)", "MPC", None, mpc_idea_c, None, None),
+        ("Adaptive MPC (Idea B: Shift-Q3)", "MPC", None, mpc_idea_c, None, None),
         ("Hardcoded-Switch IPID (Havaei)", "HARDCODED", None, None, None, None),
         ("RL-Switch Way 2 (Unshielded)", "RL_SOFT", rl_way2, None, None, None),
         ("Shielded RL-Switch (1-Step DCBF)", "RL_SOFT", rl_way2, None, None, shield_dcbf),
@@ -400,7 +402,7 @@ def main():
     # ---------------- Save 6-Panel Plot ----------------
     fig, axes = plt.subplots(2, 3, figsize=(18, 9.5))
     plot_methods = [
-        "Adaptive MPC (Idea C: Shift-Q3)",
+        "Adaptive MPC (Idea B: Shift-Q3)",
         "RL-Switch Way 2 (Unshielded)",
         "Shielded RL-Switch (DMPS Rollout)",
         "Hybrid RL-IPID-MPC (Unshielded)",

@@ -1,7 +1,7 @@
 """
-Standalone Model Predictive Controller (MPC) with Upgraded Idea C:
+Standalone Model Predictive Controller (MPC) with Upgraded Idea B:
   - Standard Mode (`adaptive_shift=False`): Standard Liu et al. (2025) MPC with fixed Q_1, Q_2, Q_3.
-  - Idea C Mode (`adaptive_shift=True`)  :
+  - Idea B Mode (`adaptive_shift=True`)  :
       1. Shift-Aware Horizon Lead & Braking Damping: Relaxes Q_2/Q_3 at shift onset for fast
          catch-up, and applies predictive velocity-rate damping (d_v lead) as v_curr approaches
          the shifted target to eliminate actuator-lag overshoot (`ShiftOS`).
@@ -140,7 +140,7 @@ class PureLiuMPC:
         dv_curr = float(v_curr - self.prev_v)
         self.prev_v = float(v_curr)
 
-        # Standard MPC uses raw reference state; Adaptive MPC (Idea C) accounts for
+        # Standard MPC uses raw reference state; Adaptive MPC (Idea B) accounts for
         # actuator lag & momentum during profile shifts and terminal station stops.
         if self.adaptive_shift:
             # Estimate 1-step momentum carry-over from actuator lag + train inertia
@@ -201,7 +201,7 @@ class PureLiuMPC:
 
         u_opt = float(np.clip(U[0, 0], self.u_min, self.u_max))
 
-        # Idea C Phase-Lead Anti-Overshoot Braking Filter:
+        # Idea B Phase-Lead Anti-Overshoot Braking Filter:
         # When closing in rapidly on a flat step target after a jump, counter-brake early
         # to absorb the actuator lag (0.28 * u_act) and plant momentum (0.14 * dv).
         if self.adaptive_shift:

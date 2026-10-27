@@ -725,11 +725,12 @@ class PathAgnosticHavaeiEnv:
             else 0.0
         )
 
-        # Always keep internal_mpc synced with true velocity v_prev before querying u_mpc_cand!
+        # Always keep internal_mpc warm and synced with its own MPC trajectory!
         self.internal_mpc.prev_v = float(self.v_prev)
         u_mpc_cand = self.internal_mpc.select_action(
             self.v_real, ref_h, slope_iota=slope_iota, dt_step=self.dt
         )
+        self.internal_mpc.prev_u = float(u_mpc_cand)
 
         shield_diff = 0.0
         if self.shield is not None:
@@ -753,8 +754,6 @@ class PathAgnosticHavaeiEnv:
             self.shield = None
             obs, rew, term, trunc, info = self.step(w4)
             self.shield = saved_shield
-            # Bumpless transfer: sync internal_mpc.prev_u with the actual PID command executed!
-            self.internal_mpc.prev_u = float(info["u_pid"])
             if self.shield is not None and shield_diff > 0.0:
                 rew -= self.shield.cfg.intervention_penalty_weight * shield_diff
                 info["shield_intervened"] = True
@@ -776,7 +775,6 @@ class PathAgnosticHavaeiEnv:
 
             u_pid = self._compute_pid_command(pid_gains, v_target, dv_target, update_state=True)
             u_blend = float(np.clip(w_mpc * u_mpc_cand + (1.0 - w_mpc) * u_pid, -1.0, 1.0))
-            self.internal_mpc.prev_u = u_blend
 
             gains_norm = pid_gains / self.gains_scale
             next_v, v_lin = self._predict_next_velocity(old_v, u_blend, x_sample, ext_f_norm, gains_norm)
