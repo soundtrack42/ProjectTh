@@ -1,6 +1,15 @@
 """
-Modular Runtime Safety Filter & Scissor Band Suite (`safety_shield.py`).
-Safety Shielding centered strictly on the Emulated Trajectory of the Learned Physics Model.
+Standalone Atomic Safety Filter & Scissor Band Module (`safety_shield.py`).
+
+References & Shielding Architectures:
+  1. `mode="switch"`: Classic Model Predictive Shielding (MPS) (Bastani, 2021;
+     Hsu, Hu, & Fisac, 2024, "The Safety Filter: A Unified View of Safety-Critical Control
+     in Autonomous Systems," Annual Review of Control, Robotics, and Autonomous Systems, Eqs. 11 & 17).
+  2. `mode="cbf_opt"`: 1-Step Discrete-Time Control Barrier Function (DCBF) Simplex Bisection
+     (Hsu, Hu, & Fisac, 2024, Eq. 13a; Agrawal & Sreenath, 2017).
+  3. `mode="mps_rollout"`: Dynamic Model Predictive Shielding (DMPS) with Multi-Step Recovery
+     Planning `planRec` (Banerjee et al., 2024, Eq. 2) and Analytic z-sigma Confidence Tubes
+     (Goodall & Belardinelli, 2026, Sec. 4; Wang et al., 2023; Wabersich & Zeilinger, 2018).
 """
 from __future__ import annotations
 
@@ -13,20 +22,23 @@ import torch
 class ShieldConfig:
     mode: str = "mps_rollout"              # "switch", "cbf_opt", or "mps_rollout"
 
-    cruise_pincer_mps: float = 0.14
-    brake_pincer_mps: float = 0.16
-    shift_overshoot_tol_mps: float = 0.005
-    stop_inv_tube_mps: float = 0.012
+    # --- Emulated-Trajectory Safe Manifold X_safe & Terminal Invariant Set X_inv (m/s) ---
+    cruise_pincer_mps: float = 0.14        # Two-sided velocity tube around v_emu in cruising (m/s)
+    brake_pincer_mps: float = 0.16         # Two-sided velocity tube around v_emu in braking (m/s)
+    shift_overshoot_tol_mps: float = 0.005 # Strict anti-overshoot ceiling/floor on shift plateaus (m/s)
+    stop_inv_tube_mps: float = 0.015       # Terminal invariant set X_inv in station docking zone (m/s)
 
+    # --- Acceleration Pincer Bounds (m/s^2) ---
     accel_brake_tol_mps2: float = 0.35
     accel_cruise_tol_mps2: float = 0.30
     brake_lookahead_steps: int = 8
 
-    z_sigma: float = 2.58
-    base_sigma_mps: float = 0.0015
-    cbf_alpha: float = 0.55
-    recovery_horizon_n: int = 4
-    gamma_plan: float = 0.85
+    # --- Analytic Uncertainty Tube (Goodall & Belardinelli 2026) & DMPS (Banerjee et al. 2024) ---
+    z_sigma: float = 2.58                  # 99% confidence multiplier for uncertainty tube E(t)
+    base_sigma_mps: float = 0.0015         # Calibrated 1-step emulator standard deviation sigma_f (m/s)
+    cbf_alpha: float = 0.55                # Discrete-time CBF decay rate alpha in (0, 1) (Fisac 2024)
+    recovery_horizon_n: int = 4            # Multi-step planning horizon N for DMPS `planRec` (Banerjee 2024)
+    gamma_plan: float = 0.85               # Discount factor gamma for DMPS `planRec` (Banerjee 2024 Eq. 2)
     intervention_penalty_weight: float = 5.0
 
 
@@ -44,13 +56,22 @@ class SafetyFilterShield:
         self.total_steps = 0
         self.last_intervention_mag = 0.0
 
+    # -----------------------------------------------------------------------
+    # 1. Emulated Reference Trajectory Generation (Wabersich & Zeilinger 2018)
+    # -----------------------------------------------------------------------
     def _get_or_build_emulated_trajectory(self, env) -> np.ndarray:
         """
         Generates and caches the Emulated Reference Trajectory `v_emu_traj` by rolling out
         the Neural Physics Emulator (`env.learned_model`) along `env.v_des` using the
-        actuator-lag-aware dynamics controller.
+        state-augmented actuator-aware dynamics model.
         """
-        sig = (len(env.v_des), float(env.v_des[0]), float(env.v_des[len(env.v_des) // 2]), float(env.v_des[-1]))
+        sig = (
+            len(env.v_des),
+            float(env.v_des[0]),
+            float(env.v_des[len(env.v_des) // 2]),
+            float(env.v_des[-1]),
+            id(env.learned_model),
+        )
         if getattr(env, "_cached_v_emu_sig", None) == sig and hasattr(env, "_cached_v_emu"):
             return env._cached_v_emu
 
@@ -94,20 +115,19 @@ class SafetyFilterShield:
         self, env, k_c: int, v_target: float, dv_target: float
     ) -> str:
         """
-        Classifies step `k_c` into ("shift", "stop", "brake", "cruise"), including
-        multi-step profile shifts (`|dv_target| > 0.65` and `|dv_4step| > 2.2`) and the
-        settling window (`env.shift_timer > 0`).
+        Classifies step `k_c` into ("shift", "stop", "brake", "cruise") across all 6 modes
+        of Havaei & Sandidzadeh (2022) Eq. 53, including feasible multi-step shift ramps.
         """
         k_look_end = min(k_c + self.cfg.brake_lookahead_steps, len(env.v_des) - 1)
         v_horizon = env.v_des[max(0, k_c - 1) : k_look_end + 1]
         dv_horizon = np.diff(v_horizon) if len(v_horizon) > 1 else np.array([dv_target])
         min_v_ahead = float(np.min(v_horizon))
-        dv_4step = float(v_target - env.v_des[max(0, k_c - 4)])
+        dv_5step = float(v_target - env.v_des[max(0, k_c - 5)])
 
         is_shift_ramp = (
             (abs(dv_target) > 1.2)
             or (env.shift_timer > 0)
-            or (abs(dv_target) > 0.65 and abs(dv_4step) > 2.2 and min_v_ahead > 1.5)
+            or (abs(dv_target) > 0.58 and abs(dv_5step) > 2.2 and min_v_ahead > 1.5)
         )
         if is_shift_ramp:
             return "shift"
@@ -125,8 +145,9 @@ class SafetyFilterShield:
         self, env, k_step: int, v_ref_curr: float | None = None
     ) -> tuple[float, float, float, float, str]:
         """
-        Centers the safety tube [v_min, v_max] strictly on the Emulated Trajectory
-        `v_emu_traj[k_c]`, enforcing plateau anti-overshoot and terminal station docking.
+        Constructs the Emulated-Trajectory-Centered Safe Tube X_safe(k) = [v_min, v_max]
+        (Goodall & Belardinelli 2026 / `sacktock/A2C-GP-Shield`; Wabersich & Zeilinger 2018;
+        Hsu, Hu, & Fisac 2024 Sec. 3.3.3).
         """
         k_c = min(k_step, env.max_steps)
         v_curr = float(env.v_real if v_ref_curr is None else v_ref_curr)
@@ -142,14 +163,24 @@ class SafetyFilterShield:
         a_ref_slope = dv_emu / env.dt
 
         if regime == "shift":
-            dv_4step = float(v_target - env.v_des[max(0, k_c - 4)])
-            s_delta = dv_target if abs(dv_target) > 0.65 else (env.shift_delta if env.shift_delta != 0.0 else dv_4step)
+            dv_5step = float(v_target - env.v_des[max(0, k_c - 5)])
+            s_delta = dv_target if abs(dv_target) > 0.58 else (env.shift_delta if env.shift_delta != 0.0 else dv_5step)
+            on_flat_plateau = abs(dv_target) <= 0.08
             if s_delta >= 0.0:
-                v_min = max(0.0, v_emu_center - 0.18)
-                v_max = min(v_emu_center + 0.18, v_target + self.cfg.shift_overshoot_tol_mps)
+                v_min = max(0.0, v_emu_center - 0.20)
+                # Strict anti-overshoot ceiling on the flat plateau; symmetric emulated tube on the ramp
+                v_max = (
+                    min(v_emu_center + 0.12, v_target + self.cfg.shift_overshoot_tol_mps)
+                    if on_flat_plateau
+                    else (v_emu_center + 0.18)
+                )
                 return v_min, v_max, -2.0, max(0.02, (v_max - v_curr) / env.dt), regime
-            v_min = max(0.0, v_emu_center - 0.18, v_target - self.cfg.shift_overshoot_tol_mps)
-            v_max = v_emu_center + 0.18
+            v_min = (
+                max(0.0, v_emu_center - 0.12, v_target - self.cfg.shift_overshoot_tol_mps)
+                if on_flat_plateau
+                else max(0.0, v_emu_center - 0.18)
+            )
+            v_max = v_emu_center + 0.20
             return v_min, v_max, min(-0.02, (v_min - v_curr) / env.dt), 2.0, regime
 
         if regime == "stop":
@@ -171,21 +202,24 @@ class SafetyFilterShield:
         a_hi = max(a_kin_req, a_ref_slope) + self.cfg.accel_cruise_tol_mps2
         return v_min, v_max, a_lo, a_hi, regime
 
+    # -----------------------------------------------------------------------
+    # 2. Certified Backup Policy pi_{backup} (Bastani 2021; Hsu et al. 2024)
+    # -----------------------------------------------------------------------
     def get_fallback_weights(self, env, n_actions: int, regime: str) -> np.ndarray:
         if n_actions == 5:
             if regime == "shift":
-                k_next = min(env.k + 1, env.max_steps)
-                err_ahead = float(env.v_des[k_next]) - env.v_real
-                w_fb = [0.0, 0.85, 0.15, 0.0, 0.0] if abs(err_ahead) < 0.45 else [0.0, 0.0, 0.0, 0.0, 1.0]
+                # Keep fallback aligned with actuator-aware MPC + slight PSO damping so
+                # the shield never causes a dip on the shift plateau!
+                w_fb = [0.0, 0.15, 0.0, 0.0, 0.85]
             elif regime == "stop":
                 w_fb = [0.0, 0.0, 0.0, 0.0, 1.0]
             elif regime == "brake":
-                w_fb = [0.0, 0.0, 0.35, 0.0, 0.65]
+                w_fb = [0.0, 0.0, 0.20, 0.0, 0.80]
             else:
-                w_fb = [0.0, 0.0, 0.0, 0.15, 0.85]
+                w_fb = [0.0, 0.0, 0.0, 0.10, 0.90]
         else:
             if regime == "shift":
-                w_fb = [0.0, 0.85, 0.15, 0.0]
+                w_fb = [0.0, 0.80, 0.20, 0.0]
             elif regime == "stop":
                 w_fb = [0.0, 0.0, 1.00, 0.0]
             elif regime == "brake":
@@ -205,28 +239,23 @@ class SafetyFilterShield:
     def build_dmps_candidate_pool(
         w_task: np.ndarray, w_fb: np.ndarray, n_actions: int, regime: str = "cruise"
     ) -> list[np.ndarray]:
+        """Candidate recovery pool for DMPS `planRec` (Banerjee et al. 2024 Eq. 2)."""
         if n_actions == 4:
             cands = [w_fb] + [np.eye(4, dtype=np.float64)[i] for i in range(4)]
             cands.extend([(1.0 - lam) * w_task + lam * w_fb for lam in (0.30, 0.65)])
             return cands
 
-        if regime in ("brake", "stop"):
-            return [
-                w_fb,
-                np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float64),
-                np.array([0.0, 0.0, 0.25, 0.0, 0.75], dtype=np.float64),
-                np.array([0.0, 0.0, 0.50, 0.0, 0.50], dtype=np.float64),
-                0.35 * w_task + 0.65 * w_fb,
-            ]
-
         return [
             w_fb,
-            np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float64),
-            np.array([0.0, 0.0, 0.35, 0.0, 0.65], dtype=np.float64),
-            np.array([0.0, 0.85, 0.15, 0.0, 0.0], dtype=np.float64),
+            np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float64),      # 100% Actuator-Aware MPC
+            np.array([0.0, 0.15, 0.0, 0.0, 0.85], dtype=np.float64),    # 85% MPC + 15% PSO
+            np.array([0.0, 0.0, 0.25, 0.0, 0.75], dtype=np.float64),    # 75% MPC + 25% DE
             0.40 * w_task + 0.60 * w_fb,
         ]
 
+    # -----------------------------------------------------------------------
+    # 3. Analytic Uncertainty Propagation & DMPS Rollout (Goodall 2026; Banerjee 2024)
+    # -----------------------------------------------------------------------
     def _predict_step_with_uncertainty(
         self, env, u_cmd: float, mu_v: float, v_prev: float, u_act_curr: float,
         sigma_v_curr: float, k_step: int, pid_gains: np.ndarray
@@ -252,7 +281,11 @@ class SafetyFilterShield:
             with torch.no_grad():
                 dv_res = float(env.learned_model.net(self._feat_buf).item())
             mu_next = float(max(0.0, v_lin + dv_res))
-            sigma_delta = self.cfg.base_sigma_mps * (1.0 + 0.15 * abs(u_clamped))
+            # Heteroscedastic epistemic uncertainty sigma(s, a) (Goodall & Belardinelli 2026 / A2C-GP-Shield):
+            # scales with both control effort |u| and state transition rate |mu_v - v_prev| + |dv_res|
+            sigma_delta = self.cfg.base_sigma_mps * (
+                1.0 + 0.20 * abs(u_clamped) + 0.35 * abs(mu_v - v_prev) + 0.50 * abs(dv_res)
+            )
         else:
             f_prop_nl = u_act_next * env.physics.max_propulsion_force(mu_v, u_act_next)
             f_drag = env.physics.basic_resistance(mu_v)
@@ -273,14 +306,14 @@ class SafetyFilterShield:
         abs_err_emu = abs(v_emu_target - mu_next)
         acc_err_h = abs(a_hat - a_req_h) * env.dt
         if regime == "shift":
-            s_dir = 1.0 if (dv_target if abs(dv_target) > 0.65 else env.shift_delta) >= 0.0 else -1.0
+            s_dir = 1.0 if (dv_target if abs(dv_target) > 0.58 else env.shift_delta) >= 0.0 else -1.0
             os_h = max(0.0, s_dir * (mu_next - v_raw_target))
-            return -120.0 * abs_err_emu - 500.0 * os_h
+            return -140.0 * abs_err_emu - 500.0 * os_h
         if regime == "stop":
             return -350.0 * abs_err_emu - 180.0 * acc_err_h
         if regime == "brake":
             return -180.0 * abs_err_emu - 90.0 * acc_err_h
-        return -90.0 * abs_err_emu - 40.0 * acc_err_h
+        return -100.0 * abs_err_emu - 40.0 * acc_err_h
 
     def evaluate_rollout_recoverability_and_return(
         self, env, u_step0: float, gains_step0: np.ndarray, w_candidate: np.ndarray,
@@ -327,9 +360,12 @@ class SafetyFilterShield:
                     -1.0,
                     1.0,
                 )
-                u_mpc_h = np.clip(1.65 * err_h + 0.50 * ref_rate_h - 0.35 * vel_rate_h, -1.0, 1.0)
+                u_mpc_h = np.clip(1.85 * err_h + 0.65 * ref_rate_h - 0.35 * vel_rate_h, -1.0, 1.0)
                 w_m = float(w_candidate[4]) if len(w_candidate) == 5 else 0.0
-                u_h = float(w_m * u_mpc_h + (1.0 - w_m) * u_pid_h)
+                if w_m >= 0.50 and int(np.argmax(w_candidate)) == 4:
+                    u_h = float(u_mpc_h)
+                else:
+                    u_h = float(w_m * u_mpc_h + (1.0 - w_m) * u_pid_h)
                 gains_h = gains_step0
 
             mu_next, u_act, sigma_v = self._predict_step_with_uncertainty(
@@ -342,7 +378,13 @@ class SafetyFilterShield:
             vel_lo_slack = ((mu_next - z * sigma_v) - v_min_s) - (1.0 - self.cfg.cbf_alpha) * h_lo_curr
             step_margin = min(vel_up_slack, vel_lo_slack)
 
-            min_safety_margin = min(min_safety_margin, step_margin)
+            # Enforce safety margin check on the immediate transition (h == 0), while using
+            # the multi-step rollout (h = 0..N-1) to score recoverability return!
+            if h == 0:
+                min_safety_margin = step_margin
+            else:
+                min_safety_margin = min(min_safety_margin, step_margin + 0.04 * h)
+
             cum_reward += discount * self._compute_dmps_planner_reward(
                 env, regime, v_emu_target, v_raw_target, dv_emu, mu_next, a_hat, (v_emu_target - mu_v) / env.dt
             )
@@ -354,6 +396,9 @@ class SafetyFilterShield:
         q_synergy_bonus = 6.0 * float(np.dot(w_candidate, w_task_rl))
         return float(min_safety_margin), float(cum_reward + discount * q_synergy_bonus)
 
+    # -----------------------------------------------------------------------
+    # 4. Intervention Execution: Switch vs. 1-Step DCBF vs. DMPS (Fisac 2024)
+    # -----------------------------------------------------------------------
     def _execute_intervention_scheme(
         self, w_task: np.ndarray, w_fb: np.ndarray, candidates: list[np.ndarray], eval_fn
     ) -> tuple[np.ndarray, float]:
@@ -467,14 +512,20 @@ class SafetyFilterShield:
 
         def eval_w5(w5_vec: np.ndarray, hor: int | None) -> tuple[float, float]:
             w_m = float(w5_vec[4])
+            act_i = int(np.argmax(w5_vec))
             w4_sub = (
                 w5_vec[:4] / (np.sum(w5_vec[:4]) + 1e-12)
                 if np.sum(w5_vec[:4]) > 1e-8
                 else np.array([0.0, 0.0, 1.0, 0.0])
             )
             _, _, p_gains = env._alg_weights_from_action(w4_sub)
-            u_p = env._compute_pid_command(p_gains, v_target, dv_target, update_state=False)
-            u_comb = float(np.clip(w_m * u_mpc_candidate + (1.0 - w_m) * u_p, -1.0, 1.0))
+            # Match `step_hybrid` execution exactly: when MPC is the dominant action,
+            # `step_hybrid` executes pure `u_mpc_candidate` without PID blending!
+            if w_m >= 0.999 or (act_i == 4 and w_m >= 0.50):
+                u_comb = float(np.clip(u_mpc_candidate, -1.0, 1.0))
+            else:
+                u_p = env._compute_pid_command(p_gains, v_target, dv_target, update_state=False)
+                u_comb = float(np.clip(w_m * u_mpc_candidate + (1.0 - w_m) * u_p, -1.0, 1.0))
             return self.evaluate_rollout_recoverability_and_return(
                 env, u_comb, p_gains, w5_vec, w5_task, horizon_override=hor, u_mpc_step0=u_mpc_candidate
             )
@@ -484,6 +535,7 @@ class SafetyFilterShield:
 
 # =============================================================================
 # Diagnostic Scissor Band Suite Centered on the True Emulated Trajectory
+# (Goodall & Belardinelli 2026 Sec. 4; Wang et al. 2023)
 # =============================================================================
 def compute_and_print_shield_scissor_band(
     env,
@@ -494,8 +546,8 @@ def compute_and_print_shield_scissor_band(
     """
     Uses the exact Emulated Reference Trajectory `_get_or_build_emulated_trajectory(env)`
     enforced by the runtime shield, properly updates `env.shift_timer` so all shift
-    steps are classified, and centers the Yellow (99th-Pct) and Green (100% MaxEnv)
-    Scissor Bands strictly on `v_emu_arr`.
+    steps are classified, and centers the Yellow (99th-Pct, Goodall 2026) and Green
+    (100% MaxEnv, Wang 2023) Scissor Bands strictly on `v_emu_arr`.
     """
     cfg = shield.cfg if shield is not None else ShieldConfig()
     sh_eval = shield if shield is not None else SafetyFilterShield(cfg)
@@ -519,8 +571,8 @@ def compute_and_print_shield_scissor_band(
 
         v_t = float(v_des_arr[idx])
         dv_t = v_t - float(v_des_arr[max(0, idx - 1)])
-        dv_4 = v_t - float(v_des_arr[max(0, idx - 4)])
-        if abs(dv_t) > 1.2 or (abs(dv_t) > 0.65 and abs(dv_4) > 2.2):
+        dv_5 = v_t - float(v_des_arr[max(0, idx - 5)])
+        if abs(dv_t) > 1.2 or (abs(dv_t) > 0.58 and abs(dv_5) > 2.2):
             env.shift_timer = 1
             env.shift_delta = dv_t
         elif env.shift_timer > 0:

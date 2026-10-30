@@ -393,7 +393,10 @@ class PathAgnosticHavaeiEnv:
         v_seq = self.v_des[idx].copy()
         if use_real_v0:
             v_seq[0] = self.v_real
-        return (v_seq[1:] ** 2 - v_seq[:-1] ** 2) / (2.0 * self.d)
+        a_spatial = (v_seq[1:] ** 2 - v_seq[:-1] ** 2) / (2.0 * self.d)
+        a_temporal = (v_seq[1:] - v_seq[:-1]) / (2.5 * self.dt)
+        # Blend temporal and spatial acceleration so standstill departures are never invisible!
+        return 0.55 * a_spatial + 0.45 * a_temporal
 
     def compute_past_A(self, k: int | None = None) -> np.ndarray:
         if k is None:
@@ -407,11 +410,12 @@ class PathAgnosticHavaeiEnv:
             k = self.k
         a_ref = self.compute_lookahead_A(k, use_real_v0=False)
         dv_next = float(self.v_des[min(k + 1, self.max_steps)] - self.v_des[min(k, self.max_steps)])
+        dv_5 = float(self.v_des[min(k + 1, self.max_steps)] - self.v_des[max(0, k - 4)])
         v_next = float(self.v_des[min(k + 1, self.max_steps)])
 
-        if dv_next > 1.2 or a_ref[0] > 0.85 or (0 < self.shift_timer < 8 and self.shift_delta > 0):
+        if dv_next > 1.2 or (dv_next > 0.58 and dv_5 > 2.2) or (0 < self.shift_timer < 8 and self.shift_delta > 0):
             return 2
-        if dv_next < -1.2 or a_ref[0] < -0.85 or (0 < self.shift_timer < 8 and self.shift_delta < 0):
+        if dv_next < -1.2 or (dv_next < -0.58 and dv_5 < -2.2) or (0 < self.shift_timer < 8 and self.shift_delta < 0):
             return 5
         if v_next <= 3.0 and dv_next < -0.02:
             return 6
@@ -546,9 +550,9 @@ class PathAgnosticHavaeiEnv:
         v_target = float(self.v_des[k_curr])
         v_prev_target = float(self.v_des[max(0, k_curr - 1)])
         dv_now = v_target - v_prev_target
-        dv_4 = v_target - float(self.v_des[max(0, k_curr - 4)])
+        dv_5 = v_target - float(self.v_des[max(0, k_curr - 5)])
 
-        if abs(dv_now) > 1.2 or (abs(dv_now) > 0.65 and abs(dv_4) > 2.2):
+        if abs(dv_now) > 1.2 or (abs(dv_now) > 0.58 and abs(dv_5) > 2.2 and v_target > 2.0):
             self.shift_timer = 1
             self.shift_delta = dv_now
         elif self.shift_timer > 0:
@@ -981,13 +985,16 @@ def _compute_surrogate_horizon_q_costs(
 
                 step_cost = -rew
                 if is_learned and info_h.get("shift_active", False):
-                    s_sign = 1.0 if surrogate_env.shift_delta >= 0.0 else -1.0
-                    v_rate = surrogate_env.v_real - surrogate_env.v_prev
-                    margin_os = max(
-                        0.0,
-                        s_sign * (surrogate_env.v_real + 0.40 * v_rate - info_h["v_des"]),
-                    )
-                    step_cost += 180.0 * margin_os
+                    dv_step_h = float(info_h.get("dv_now", 0.0))
+                    # Only penalize velocity-rate projection when arriving on the flat plateau
+                    if abs(dv_step_h) < 0.05:
+                        s_sign = 1.0 if surrogate_env.shift_delta >= 0.0 else -1.0
+                        v_rate = surrogate_env.v_real - surrogate_env.v_prev
+                        margin_os = max(
+                            0.0,
+                            s_sign * (surrogate_env.v_real + 0.35 * v_rate - info_h["v_des"]),
+                        )
+                        step_cost += 180.0 * margin_os
 
                 if n_algs == 5 and in_stop_approach and a_idx < 4:
                     step_cost += 35.0 * abs(surrogate_env.int_err) + 25.0

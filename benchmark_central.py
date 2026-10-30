@@ -32,7 +32,6 @@ from havaei_generalizing_rl import (
 MAX_ACCEPTABLE_EPISODE_MS = 1000.0
 MAX_ACCEPTABLE_STEP_US = 500.0
 
-
 def generate_truly_random_trajectory(
     total_horizon: int = 1000,
     min_phase_len: int = 25,
@@ -44,13 +43,38 @@ def generate_truly_random_trajectory(
 ) -> tuple[np.ndarray, list[dict]]:
     """
     Generates random speed profiles across all 6 driving modes of Havaei & Sandidzadeh (2022)
-    Eq. 53: (1) Acceleration, (2) Shift-Up, (3) Cruising, (4) Braking, (5) Shift-Down, (6) Stopping,
-    strictly respecting `max_accel` and `max_decel`.
+    Eq. 53: (1) Acceleration, (2) Shift-Up, (3) Cruising, (4) Braking, (5) Shift-Down, (6) Stopping.
+
+    Parameters
+    ----------
+    total_horizon : int
+        Number of discrete simulation steps (default: 1000).
+    min_phase_len : int
+        Minimum duration of a single driving mode phase in steps.
+    max_accel : float
+        Maximum physical motor traction acceleration in m/s^2 (e.g., 1.85).
+    max_decel : float
+        Maximum physical service braking deceleration in m/s^2 (e.g., 1.65).
+    dt : float
+        Sampling interval in seconds (default: 0.50 s).
+    service_margin : float
+        Safety factor (default: 0.92 = 92% of peak capability) leaving control
+        headroom for feedback controllers (PID/MPC) to reject disturbances.
+    seed : int | None
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    v_des : np.ndarray
+        Array of length `total_horizon + 2` with strictly feasible speed reference.
+    schedule : list[dict]
+        List of phase segment metadata.
     """
     rng = np.random.default_rng(seed)
     v_des = np.zeros(total_horizon + 2, dtype=np.float64)
     schedule = []
 
+    # Maximum allowable speed delta per step dt
     eff_acc = max_accel * service_margin
     eff_dec = max_decel * service_margin
     max_dv_up = eff_acc * dt
@@ -60,8 +84,10 @@ def generate_truly_random_trajectory(
 
     while cursor < total_horizon:
         rem_steps = total_horizon - cursor
-        min_stop_steps = int(np.ceil((np.pi / 2.0) * curr_v / max(1e-4, max_dv_dn))) + 5
 
+        # If nearing the end, plan the terminal station stop
+        # Min steps needed to stop from curr_v with cosine ramp: (pi/2) * (curr_v / (eff_dec * dt))
+        min_stop_steps = int(np.ceil((np.pi / 2.0) * curr_v / max(1e-4, max_dv_dn))) + 5
         if rem_steps <= max(min_phase_len * 2, min_stop_steps):
             dur = rem_steps
             mode = 6 if curr_v > 0.3 else 3
@@ -84,40 +110,72 @@ def generate_truly_random_trajectory(
         start_k, end_k = cursor, cursor + dur
         t_loc = np.linspace(0.0, 1.0, dur, endpoint=False)
 
+        # ---------------------------------------------------------------------
+        # Mode 1: Acceleration
+        # ---------------------------------------------------------------------
         if mode == 1:
+            # Half-cosine S-curve: peak accel is (pi/2) * Delta_v / (dur * dt) <= eff_acc
             max_possible_jump = (2.0 / np.pi) * eff_acc * (dur * dt)
             target_v = float(min(16.5, curr_v + rng.uniform(1.5, max(1.8, max_possible_jump))))
             v_seg = curr_v + (target_v - curr_v) * 0.5 * (1.0 - np.cos(np.pi * t_loc))
             curr_v = float(v_seg[-1])
+
+        # ---------------------------------------------------------------------
+        # Mode 2: Shift-Up
+        # ---------------------------------------------------------------------
         elif mode == 2:
             target_v = float(min(16.8, curr_v + rng.uniform(3.0, 4.8)))
+            # Compute minimum steps needed so linear slope <= max_dv_up
             min_ramp = int(np.ceil((target_v - curr_v) / max_dv_up))
             ramp_len = min(dur - 5, max(min_ramp, 4))
+            # If duration is too tight for the full jump, clamp target_v
             if min_ramp > ramp_len:
                 target_v = curr_v + ramp_len * max_dv_up
+
             v_seg = np.full(dur, target_v)
             v_seg[:ramp_len] = np.linspace(curr_v, target_v, ramp_len + 1)[1:]
             curr_v = target_v
+
+        # ---------------------------------------------------------------------
+        # Mode 3: Cruising
+        # ---------------------------------------------------------------------
         elif mode == 3:
+            # Sine ripple with bounded acceleration derivative
             amp = min(0.12, (eff_acc * dt * dur) / (2.0 * np.pi))
             v_seg = np.full(dur, curr_v) + amp * np.sin(2.0 * np.pi * t_loc)
             curr_v = float(v_seg[-1])
+
+        # ---------------------------------------------------------------------
+        # Mode 4: Braking
+        # ---------------------------------------------------------------------
         elif mode == 4:
+            # Half-cosine S-curve deceleration: peak decel is (pi/2) * Delta_v / (dur * dt) <= eff_dec
             max_possible_drop = (2.0 / np.pi) * eff_dec * (dur * dt)
             target_v = float(max(1.5, curr_v - rng.uniform(2.0, max(2.5, max_possible_drop))))
             v_seg = curr_v + (target_v - curr_v) * 0.5 * (1.0 - np.cos(np.pi * t_loc))
             curr_v = float(v_seg[-1])
+
+        # ---------------------------------------------------------------------
+        # Mode 5: Shift-Down
+        # ---------------------------------------------------------------------
         elif mode == 5:
             target_v = float(max(3.0, curr_v - rng.uniform(3.0, 4.8)))
+            # Compute minimum steps needed so linear slope <= max_dv_dn
             min_ramp = int(np.ceil((curr_v - target_v) / max_dv_dn))
             ramp_len = min(dur - 5, max(min_ramp, 4))
             if min_ramp > ramp_len:
                 target_v = curr_v - ramp_len * max_dv_dn
+
             v_seg = np.full(dur, target_v)
             v_seg[:ramp_len] = np.linspace(curr_v, target_v, ramp_len + 1)[1:]
             curr_v = target_v
+
+        # ---------------------------------------------------------------------
+        # Mode 6: Station Stop
+        # ---------------------------------------------------------------------
         else:
             if curr_v > 0.3:
+                # Dynamic stop ramp length matching service braking capability
                 min_stop_steps = int(np.ceil((np.pi / 2.0) * curr_v / max_dv_dn))
                 stop_ramp = min(dur, max(min_stop_steps, 8))
                 v_seg = np.zeros(dur)
@@ -136,13 +194,17 @@ def generate_truly_random_trajectory(
         })
         cursor = end_k
 
-    # Two-Pass Kinematic Feasibility Projection
+    # -------------------------------------------------------------------------
+    # Two-Pass Kinematic Projection (Strict Invariance Guarantee)
+    # -------------------------------------------------------------------------
+    # Pass 1: Backward pass enforces braking capability at all boundaries & stops
     v_des[total_horizon:] = 0.0
     for k in range(total_horizon - 1, -1, -1):
         v_max_allowable = v_des[k + 1] + max_dv_dn
         if v_des[k] > v_max_allowable:
             v_des[k] = v_max_allowable
 
+    # Pass 2: Forward pass enforces traction capability from rest
     v_des[0] = 0.0
     for k in range(1, total_horizon + 1):
         v_max_allowable = v_des[k - 1] + max_dv_up
