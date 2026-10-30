@@ -4,8 +4,7 @@ Focuses directly on:
   - Pure MPC & Adaptive MPC (Idea B)
   - Hardcoded-Switch IPID (Havaei reference)
   - Unshielded RL vs. Shielded RL (1-Step DCBF vs. Multi-Step DMPS Rollout)
-  - Unshielded Hybrid RL-MPC vs. Shielded Hybrid RL-MPC (1-Step DCBF vs. Multi-Step DMPS Rollout)
-Use `--full-baselines` if you also want to run Fixed PIDs, Fuzzy-PIDs, Way 1, and PPO.
+  - Unshielded Hybrid RL-MPC vs. Shielded Hybrid RL-MPC (Switch MPS, 1-Step DCBF, Multi-Step DMPS Rollout)
 """
 from __future__ import annotations
 
@@ -14,12 +13,13 @@ import time
 import numpy as np
 import torch
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from pure_mpc_controller import PureLiuMPC
 from fuzzy_pid_controller import FuzzyPIDController
-from safety_shield import SafetyFilterShield, ShieldConfig
+from safety_shield import SafetyFilterShield, ShieldConfig, compute_and_print_shield_scissor_band
 import havaei_generalizing_rl as hrl
 from havaei_generalizing_rl import (
     HYBRID_ALGORITHMS,
@@ -36,28 +36,38 @@ MAX_ACCEPTABLE_STEP_US = 500.0
 def generate_truly_random_trajectory(
     total_horizon: int = 1000,
     min_phase_len: int = 25,
+    max_accel: float = 1.85,
+    max_decel: float = 1.65,
+    dt: float = 0.50,
+    service_margin: float = 0.92,
     seed: int | None = None,
 ) -> tuple[np.ndarray, list[dict]]:
     """
-    Randomly samples driving modes (1..6) and durations (>= min_phase_len) summing to `total_horizon`.
-    Uses C^1-smooth ramps and physically feasible 3-step shift transitions matching motor limits.
+    Generates random speed profiles across all 6 driving modes of Havaei & Sandidzadeh (2022)
+    Eq. 53: (1) Acceleration, (2) Shift-Up, (3) Cruising, (4) Braking, (5) Shift-Down, (6) Stopping,
+    strictly respecting `max_accel` and `max_decel`.
     """
     rng = np.random.default_rng(seed)
     v_des = np.zeros(total_horizon + 2, dtype=np.float64)
     schedule = []
 
-    cursor = 0
-    curr_v = 0.0
-    has_shift = False
+    eff_acc = max_accel * service_margin
+    eff_dec = max_decel * service_margin
+    max_dv_up = eff_acc * dt
+    max_dv_dn = eff_dec * dt
+
+    cursor, curr_v, has_shift = 0, 0.0, False
 
     while cursor < total_horizon:
         rem_steps = total_horizon - cursor
-        if rem_steps <= min_phase_len * 2:
+        min_stop_steps = int(np.ceil((np.pi / 2.0) * curr_v / max(1e-4, max_dv_dn))) + 5
+
+        if rem_steps <= max(min_phase_len * 2, min_stop_steps):
             dur = rem_steps
-            mode = 6 if curr_v > 0.5 else 3
+            mode = 6 if curr_v > 0.3 else 3
         else:
-            max_dur = min(60, rem_steps - min_phase_len)
-            dur = int(rng.integers(min_phase_len, max_dur + 1))
+            max_dur = min(75, rem_steps - min_phase_len)
+            dur = int(rng.integers(min_phase_len, max(min_phase_len + 1, max_dur + 1)))
 
             if (not has_shift) and (cursor >= total_horizon // 3) and (curr_v >= 4.0):
                 mode = 2 if curr_v <= 11.5 else 5
@@ -71,54 +81,74 @@ def generate_truly_random_trajectory(
         if mode in (2, 5):
             has_shift = True
 
+        start_k, end_k = cursor, cursor + dur
         t_loc = np.linspace(0.0, 1.0, dur, endpoint=False)
-        start_k = cursor
-        end_k = cursor + dur
 
         if mode == 1:
-            # Acceleration ramp
-            low_v = min(curr_v + 1.5, 15.0)
-            target_v = float(rng.uniform(low_v, 16.5))
-            v_seg = curr_v + (target_v - curr_v) * (1.0 - np.exp(-3.2 * t_loc)) / (1.0 - np.exp(-3.2))
-            curr_v = target_v
+            max_possible_jump = (2.0 / np.pi) * eff_acc * (dur * dt)
+            target_v = float(min(16.5, curr_v + rng.uniform(1.5, max(1.8, max_possible_jump))))
+            v_seg = curr_v + (target_v - curr_v) * 0.5 * (1.0 - np.cos(np.pi * t_loc))
+            curr_v = float(v_seg[-1])
         elif mode == 2:
-            # Shift Up: 3-step physical acceleration transition to eliminate vertical discontinuity
-            target_v = float(min(16.8, curr_v + rng.uniform(3.0, 5.0)))
+            target_v = float(min(16.8, curr_v + rng.uniform(3.0, 4.8)))
+            min_ramp = int(np.ceil((target_v - curr_v) / max_dv_up))
+            ramp_len = min(dur - 5, max(min_ramp, 4))
+            if min_ramp > ramp_len:
+                target_v = curr_v + ramp_len * max_dv_up
             v_seg = np.full(dur, target_v)
-            ramp_len = min(3, max(1, dur // 4))
             v_seg[:ramp_len] = np.linspace(curr_v, target_v, ramp_len + 1)[1:]
             curr_v = target_v
         elif mode == 3:
-            # Cruising with track ripple
-            v_seg = np.full(dur, curr_v) + 0.12 * np.sin(2.0 * np.pi * t_loc)
+            amp = min(0.12, (eff_acc * dt * dur) / (2.0 * np.pi))
+            v_seg = np.full(dur, curr_v) + amp * np.sin(2.0 * np.pi * t_loc)
+            curr_v = float(v_seg[-1])
         elif mode == 4:
-            # C^1-smooth deceleration ramp (zero jerk kink at entry and exit)
-            target_v = float(rng.uniform(max(1.0, curr_v - 6.0), max(1.5, curr_v - 2.5)))
+            max_possible_drop = (2.0 / np.pi) * eff_dec * (dur * dt)
+            target_v = float(max(1.5, curr_v - rng.uniform(2.0, max(2.5, max_possible_drop))))
             v_seg = curr_v + (target_v - curr_v) * 0.5 * (1.0 - np.cos(np.pi * t_loc))
-            curr_v = target_v
+            curr_v = float(v_seg[-1])
         elif mode == 5:
-            # Shift Down: 3-step physical braking transition
-            target_v = float(max(3.0, curr_v - rng.uniform(3.5, 5.0)))
+            target_v = float(max(3.0, curr_v - rng.uniform(3.0, 4.8)))
+            min_ramp = int(np.ceil((curr_v - target_v) / max_dv_dn))
+            ramp_len = min(dur - 5, max(min_ramp, 4))
+            if min_ramp > ramp_len:
+                target_v = curr_v - ramp_len * max_dv_dn
             v_seg = np.full(dur, target_v)
-            ramp_len = min(3, max(1, dur // 4))
             v_seg[:ramp_len] = np.linspace(curr_v, target_v, ramp_len + 1)[1:]
             curr_v = target_v
         else:
-            # Mode 6: C^1-smooth cosine S-curve stopping profile (differentiable at start and at v = 0)
-            if curr_v > 0.5:
-                stop_ramp = min(max(dur // 2, 14), 20)
+            if curr_v > 0.3:
+                min_stop_steps = int(np.ceil((np.pi / 2.0) * curr_v / max_dv_dn))
+                stop_ramp = min(dur, max(min_stop_steps, 8))
                 v_seg = np.zeros(dur)
-                t_stop = np.linspace(0.0, 1.0, stop_ramp)
-                v_seg[:stop_ramp] = curr_v * 0.5 * (1.0 + np.cos(np.pi * t_stop))
+                v_seg[:stop_ramp] = curr_v * 0.5 * (1.0 + np.cos(np.pi * np.linspace(0.0, 1.0, stop_ramp)))
             else:
                 v_seg = np.zeros(dur)
             curr_v = 0.0
 
         v_des[start_k:end_k] = v_seg
-        schedule.append({"mode": mode, "start": start_k, "end": end_k - 1, "dur": dur, "v_target": float(curr_v)})
+        schedule.append({
+            "mode": mode,
+            "start": start_k,
+            "end": end_k - 1,
+            "dur": dur,
+            "v_target": float(curr_v),
+        })
         cursor = end_k
 
+    # Two-Pass Kinematic Feasibility Projection
+    v_des[total_horizon:] = 0.0
+    for k in range(total_horizon - 1, -1, -1):
+        v_max_allowable = v_des[k + 1] + max_dv_dn
+        if v_des[k] > v_max_allowable:
+            v_des[k] = v_max_allowable
+
     v_des[0] = 0.0
+    for k in range(1, total_horizon + 1):
+        v_max_allowable = v_des[k - 1] + max_dv_up
+        if v_des[k] > v_max_allowable:
+            v_des[k] = v_max_allowable
+
     v_des[total_horizon:] = 0.0
     return v_des, schedule
 
@@ -152,6 +182,7 @@ def run_controller_benchmark(
         fuzzy_ctrl.reset()
 
     k_log, v_log, v_des_log, err_log, os_log, shift_err_log, brake_err_log, alg_log = [], [], [], [], [], [], [], []
+    int_log = []
     step_latencies_us = []
 
     while not done:
@@ -165,7 +196,11 @@ def run_controller_benchmark(
             slope_iota = env.physics.grade_resistance(x_sample) / (env.physics.M * env.physics.g)
             curve_iota = env.physics.curve_resistance(x_sample) / (env.physics.M * env.physics.g)
             u_opt = mpc_ctrl.select_action(
-                env.v_real, ref_h, slope_iota=slope_iota + curve_iota, dt_step=env.dt
+                env.v_real,
+                ref_h,
+                slope_iota=slope_iota + curve_iota,
+                dt_step=env.dt,
+                u_act_prev=env.u_act,
             )
             t1 = time.perf_counter()
             obs, _, term, trunc, info = env.step_mpc(u_opt)
@@ -207,7 +242,6 @@ def run_controller_benchmark(
         done = term or trunc
         step_latencies_us.append((t1 - t0) * 1e6)
 
-        # 100% genuine computation: Record every single step without skipping
         err_log.append(info["abs_err"])
         os_log.append(info["overshoot"])
 
@@ -221,6 +255,7 @@ def run_controller_benchmark(
             v_log.append(info["v_real"])
             v_des_log.append(info["v_des"])
             alg_log.append(info["alg"])
+            int_log.append(bool(info.get("shield_intervened", False)))
 
     err_arr = np.array(err_log)
     os_arr = np.array(os_log)
@@ -258,6 +293,7 @@ def run_controller_benchmark(
             "v_des": np.array(v_des_log),
             "err": err_arr,
             "alg": alg_log,
+            "shield_intervened": np.array(int_log, dtype=bool),
         }
     return res
 
@@ -270,6 +306,8 @@ def main():
     ap.add_argument("--regen-every", type=int, default=40, help="Regenerate random trajectory every N epochs")
     ap.add_argument("--emulator-steps", type=int, default=150, help="Steps for Neural Trajectory Emulator")
     ap.add_argument("--eval-runs", type=int, default=25, help="Number of unseen random trajectories for evaluation")
+    ap.add_argument("--max-accel", type=float, default=1.85, help="Max traction acceleration (m/s^2)")
+    ap.add_argument("--max-decel", type=float, default=1.65, help="Max service braking deceleration (m/s^2)")
     ap.add_argument("--full-baselines", action="store_true", help="Include Fixed PIDs, Fuzzy-PIDs, Way 1, and PPO")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--plot", type=str, default="final_paper_benchmark.png")
@@ -284,10 +322,13 @@ def main():
     print("=" * 136)
 
     gen_fn = lambda seed: generate_truly_random_trajectory(
-        total_horizon=args.horizon, min_phase_len=25, seed=seed
+        total_horizon=args.horizon,
+        min_phase_len=25,
+        max_accel=args.max_accel,
+        max_decel=args.max_decel,
+        seed=seed,
     )
 
-    # Instantiate the Safety Filter Shields from `safety_shield.py`
     shield_dcbf = SafetyFilterShield(ShieldConfig(mode="cbf_opt"))
     shield_dmps = SafetyFilterShield(ShieldConfig(mode="mps_rollout"))
     shield_switch = SafetyFilterShield(ShieldConfig(mode="switch"))
@@ -322,8 +363,14 @@ def main():
     )
     rl_hybrid.eval()
 
-    mpc_standard = PureLiuMPC(n_p=10, n_c=5, q1=140.0, q2=0.08, q3=0.45, adaptive_shift=False)
-    mpc_idea_c = PureLiuMPC(n_p=10, n_c=5, q1=140.0, q2=0.08, q3=0.45, adaptive_shift=True)
+    mpc_standard = PureLiuMPC(
+        n_p=10, n_c=5, q1=160.0, q2=0.05, q3=0.35, adaptive_shift=False,
+        max_traction_accel=args.max_accel, max_braking_decel=args.max_decel
+    )
+    mpc_idea_c = PureLiuMPC(
+        n_p=10, n_c=5, q1=160.0, q2=0.05, q3=0.35, adaptive_shift=True,
+        max_traction_accel=args.max_accel, max_braking_decel=args.max_decel
+    )
 
     eval_specs = []
     if args.full_baselines:
@@ -353,7 +400,11 @@ def main():
 
     for ep in range(args.eval_runs):
         v_rand, sched_rand = generate_truly_random_trajectory(
-            total_horizon=args.horizon, min_phase_len=25, seed=80000 + ep
+            total_horizon=args.horizon,
+            min_phase_len=25,
+            max_accel=args.max_accel,
+            max_decel=args.max_decel,
+            seed=80000 + ep,
         )
         if ep == 0:
             sample_schedule = sched_rand
@@ -399,6 +450,25 @@ def main():
         )
     print("=" * 154)
 
+    # -------------------------------------------------------------------------
+    # Diagnostic Scissor Bands Centered Strictly on the Neural Emulator Rollout
+    # -------------------------------------------------------------------------
+    v_des_ref = sample_trajs["Shielded Hybrid RL-MPC (DMPS Rollout)"]["v_des"]
+    v_des_full_diag = np.concatenate([[0.0], v_des_ref, [v_des_ref[-1]]])
+
+    env_diag = PathAgnosticHavaeiEnv(
+        v_des_profile=v_des_full_diag,
+        plant_mode="linear_learned",
+        learned_linear_model=hrl.LAST_TRAINED_EMULATOR,
+        lookahead_n=args.lookahead_n,
+    )
+    band_info = compute_and_print_shield_scissor_band(
+        env_diag,
+        sample_trajs["Shielded Hybrid RL-MPC (DMPS Rollout)"],
+        shield=shield_dmps,
+        learned_policy=rl_hybrid,
+    )
+
     # ---------------- Save 6-Panel Plot ----------------
     fig, axes = plt.subplots(2, 3, figsize=(18, 9.5))
     plot_methods = [
@@ -410,15 +480,24 @@ def main():
         "Shielded Hybrid RL-MPC (DMPS Rollout)",
     ]
     k_grid = sample_trajs[plot_methods[0]]["k"]
-    v_des_ref = sample_trajs[plot_methods[0]]["v_des"]
 
+    axes[0, 0].fill_between(
+        k_grid, band_info["scissor_lo"], band_info["scissor_hi"],
+        color="gold", alpha=0.35, label="99th-Percentile Scissor (Goodall 2026)"
+    )
+    int_mask = band_info["intervened"]
+    if np.any(int_mask):
+        axes[0, 0].scatter(
+            k_grid[int_mask], sample_trajs["Shielded Hybrid RL-MPC (DMPS Rollout)"]["v"][int_mask],
+            color="red", s=10, zorder=5, label="Shield Intervention"
+        )
     axes[0, 0].plot(k_grid, v_des_ref, "k--", linewidth=2.0, label="Target Profile")
     for m_name in plot_methods:
         axes[0, 0].plot(k_grid, sample_trajs[m_name]["v"], linewidth=1.3, label=m_name)
     axes[0, 0].set_title(f"1. Unseen Sample Trajectory [0, {args.horizon}] Tracking")
     axes[0, 0].set_xlabel("Distance Sample")
     axes[0, 0].set_ylabel("Speed (m/s)")
-    axes[0, 0].legend(fontsize=7)
+    axes[0, 0].legend(fontsize=6.5)
     axes[0, 0].grid(True, alpha=0.3)
 
     for m_name in plot_methods:
@@ -430,15 +509,23 @@ def main():
     axes[0, 1].grid(True, alpha=0.3)
 
     shift_seg = next((s for s in sample_schedule if s["mode"] in (2, 5)), sample_schedule[1])
-    z0 = max(0, shift_seg["start"] - 5)
-    z1 = min(len(k_grid), shift_seg["start"] + 15)
+    z0 = max(0, shift_seg["start"] - 4)
+    z1 = min(len(k_grid), shift_seg["start"] + 16)
     sl = slice(z0, z1)
+    axes[0, 2].fill_between(
+        k_grid[sl], band_info["v_min"][sl], band_info["v_max"][sl],
+        color="mediumseagreen", alpha=0.22, label="100% Max-Error Envelope (Wang 2023)"
+    )
+    axes[0, 2].fill_between(
+        k_grid[sl], band_info["scissor_lo"][sl], band_info["scissor_hi"][sl],
+        color="gold", alpha=0.45, label="99th-Percentile Scissor (Goodall 2026)"
+    )
     axes[0, 2].plot(k_grid[sl], v_des_ref[sl], "k--", linewidth=2.2, label="Target Shift")
     for m_name in plot_methods:
         axes[0, 2].plot(k_grid[sl], sample_trajs[m_name]["v"][sl], marker="o", markersize=3, label=m_name)
     axes[0, 2].set_title("3. Zoom on Unseen Profile Shift Transition")
     axes[0, 2].set_xlabel("Distance Sample")
-    axes[0, 2].legend(fontsize=7)
+    axes[0, 2].legend(fontsize=6.5)
     axes[0, 2].grid(True, alpha=0.3)
 
     map_idx = {name: i for i, name in enumerate(HYBRID_ALGORITHMS)}
@@ -454,7 +541,7 @@ def main():
 
     names_bar = [
         "Std MPC",
-        "IdeaC MPC",
+        "IdeaB MPC",
         "IPID",
         "RL W2",
         "W2+DCBF",
@@ -497,7 +584,60 @@ def main():
 
     fig.tight_layout()
     fig.savefig(args.plot, dpi=150)
+    plt.close(fig)
     print(f"\nSaved 6-panel multi-trajectory benchmark plot to: {args.plot}")
+
+    # ---------------- Save Dedicated 4-Panel Shielded Hybrid Zoom Plot ----------------
+    zoom_plot_path = args.plot.replace(".png", "_shielded_zoom.png")
+    fig_z, axes_z = plt.subplots(2, 2, figsize=(16, 10))
+    shielded_3 = [
+        ("Shielded Hybrid RL-MPC (Switch MPS)", "royalblue", "--"),
+        ("Shielded Hybrid RL-MPC (1-Step DCBF)", "purple", "-."),
+        ("Shielded Hybrid RL-MPC (DMPS Rollout)", "crimson", "-"),
+    ]
+
+    def plot_scissor_panel(ax, sl_idx, title_str):
+        ax.fill_between(
+            k_grid[sl_idx], band_info["v_min"][sl_idx], band_info["v_max"][sl_idx],
+            color="mediumseagreen", alpha=0.22, label="100% Max-Error & Safe Envelope (Wang 2023)"
+        )
+        ax.fill_between(
+            k_grid[sl_idx], band_info["scissor_lo"][sl_idx], band_info["scissor_hi"][sl_idx],
+            color="gold", alpha=0.48, label="99th-Percentile Scissor (Goodall 2026)"
+        )
+        ax.plot(k_grid[sl_idx], v_des_ref[sl_idx], "k--", linewidth=1.8, label="Target Profile v_des")
+        for s_name, col, ls in shielded_3:
+            ax.plot(k_grid[sl_idx], sample_trajs[s_name]["v"][sl_idx], color=col, linestyle=ls, linewidth=1.6, label=s_name)
+        int_sl = band_info["intervened"][sl_idx]
+        if np.any(int_sl):
+            ax.scatter(
+                k_grid[sl_idx][int_sl],
+                sample_trajs["Shielded Hybrid RL-MPC (DMPS Rollout)"]["v"][sl_idx][int_sl],
+                color="red", s=16, zorder=6, label="DMPS Shield Intervention"
+            )
+        ax.set_title(title_str, fontweight="bold")
+        ax.set_xlabel("Distance Sample k")
+        ax.set_ylabel("Speed (m/s)")
+        ax.legend(fontsize=7.5)
+        ax.grid(True, alpha=0.3)
+
+    plot_scissor_panel(axes_z[0, 0], slice(0, len(k_grid)), f"1. Full Trajectory [0, {args.horizon}]: 3 Shielded Hybrid RL-MPC Methods Only")
+
+    cruise_seg = next((s for s in sample_schedule if s["mode"] == 3), sample_schedule[0])
+    c0, c1 = max(0, cruise_seg["start"]), min(len(k_grid), cruise_seg["end"])
+    plot_scissor_panel(axes_z[0, 1], slice(c0, c1), f"2. Zoom on Cruising Mode [{c0}, {c1}]: 99th-Pct (Yellow) & Max-Err (Green)")
+
+    plot_scissor_panel(axes_z[1, 0], sl, f"3. Zoom on Profile Shift [{z0}, {z1}]: Concentric Scissor Bands")
+
+    stop_seg = next((s for s in reversed(sample_schedule) if s["mode"] == 6), sample_schedule[-1])
+    st0 = max(0, stop_seg["start"] - 5)
+    st1 = min(len(k_grid), stop_seg["end"] + 1)
+    plot_scissor_panel(axes_z[1, 1], slice(st0, st1), f"4. Zoom on Braking & Station Stop [{st0}, {st1}]: Terminal Docking X_inv")
+
+    fig_z.tight_layout()
+    fig_z.savefig(zoom_plot_path, dpi=150)
+    plt.close(fig_z)
+    print(f"Saved dedicated 4-panel Shielded Hybrid Zoom plot to: {zoom_plot_path}")
 
 
 if __name__ == "__main__":

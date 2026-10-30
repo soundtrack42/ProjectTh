@@ -13,6 +13,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 
+torch.set_num_threads(1)
+
 from pure_mpc_controller import PureLiuMPC
 from safety_shield import SafetyFilterShield, ShieldConfig
 
@@ -309,11 +311,13 @@ class PathAgnosticHavaeiEnv:
         self.internal_mpc = PureLiuMPC(
             n_p=10,
             n_c=5,
-            q1=140.0,
-            q2=0.08,
-            q3=0.45,
+            q1=160.0,
+            q2=0.05,
+            q3=0.35,
             adaptive_shift=True,
             mass_kg=self.physics.M,
+            max_traction_accel=self.physics.max_traction_accel,
+            max_braking_decel=self.physics.max_braking_decel,
         )
 
         self.pid_bank = copy.deepcopy(COMPUTED_PID_BANK)
@@ -405,9 +409,9 @@ class PathAgnosticHavaeiEnv:
         dv_next = float(self.v_des[min(k + 1, self.max_steps)] - self.v_des[min(k, self.max_steps)])
         v_next = float(self.v_des[min(k + 1, self.max_steps)])
 
-        if dv_next > 1.5 or a_ref[0] > 1.0 or (0 < self.shift_timer < 8 and self.shift_delta > 0):
+        if dv_next > 1.2 or a_ref[0] > 0.85 or (0 < self.shift_timer < 8 and self.shift_delta > 0):
             return 2
-        if dv_next < -1.5 or a_ref[0] < -1.0 or (0 < self.shift_timer < 8 and self.shift_delta < 0):
+        if dv_next < -1.2 or a_ref[0] < -0.85 or (0 < self.shift_timer < 8 and self.shift_delta < 0):
             return 5
         if v_next <= 3.0 and dv_next < -0.02:
             return 6
@@ -433,16 +437,18 @@ class PathAgnosticHavaeiEnv:
         v_next = float(self.v_des[k_next])
         x_sample = k_next * self.d
 
-        jump_onset = 1.0 if (abs(dv_next) > 1.5 or abs(a_ref[0]) > 1.0) else 0.0
+        jump_onset = 1.0 if (abs(dv_next) > 1.2 or abs(a_ref[0]) > 0.85) else 0.0
         settle_tail = (
             float(np.exp(-0.25 * (self.shift_timer + 1)))
             if (jump_onset == 0.0 and 0 < self.shift_timer < 8)
             else 0.0
         )
         dv_real_norm = float(np.tanh((self.v_real - self.v_prev) / 1.5))
+        k_stop_12 = min(k_next + 12, self.max_steps)
+        min_v_12 = float(np.min(self.v_des[k_next : k_stop_12 + 1]))
         stop_prox = (
-            float(np.exp(-v_next / 2.8))
-            if (jump_onset == 0.0 and (dv_next < -0.02 or v_next <= 0.5))
+            float(np.exp(-min_v_12 / 2.8))
+            if (jump_onset == 0.0 and (dv_next < -0.015 or v_next <= 0.5))
             else 0.0
         )
 
@@ -495,8 +501,11 @@ class PathAgnosticHavaeiEnv:
         if update_state:
             self.int_err = new_int_err
 
-        if abs(dv_target) > 1.5:
+        if abs(dv_target) > 1.2 or self.shift_timer > 0:
             d_term = 0.20 * ref_rate - 1.35 * vel_rate
+        elif dv_target < -0.02:
+            # Slope-aligned braking derivative so -vel_rate never opposes braking
+            d_term = 1.10 * ref_rate - 0.90 * vel_rate
         else:
             d_term = 0.55 * ref_rate - 1.10 * vel_rate
 
@@ -537,8 +546,9 @@ class PathAgnosticHavaeiEnv:
         v_target = float(self.v_des[k_curr])
         v_prev_target = float(self.v_des[max(0, k_curr - 1)])
         dv_now = v_target - v_prev_target
+        dv_4 = v_target - float(self.v_des[max(0, k_curr - 4)])
 
-        if abs(dv_now) > 1.5:
+        if abs(dv_now) > 1.2 or (abs(dv_now) > 0.65 and abs(dv_4) > 2.2):
             self.shift_timer = 1
             self.shift_delta = dv_now
         elif self.shift_timer > 0:
@@ -582,8 +592,6 @@ class PathAgnosticHavaeiEnv:
             reward = -45.0 * abs_err
             step_w = 1.5
 
-        # Filter-Aware RL penalty (Section 3.5.3 of Hsu, Hu, & Fisac, 2024):
-        # Penalizes the task policy when it forces the safety shield to intervene.
         if self.shield is not None and shield_diff > 0.0:
             reward -= self.shield.cfg.intervention_penalty_weight * shield_diff
 
@@ -716,7 +724,8 @@ class PathAgnosticHavaeiEnv:
 
     def step_hybrid(self, action: int | np.ndarray):
         k_curr_pre = self.k
-        x_sample_next = min(k_curr_pre + 1, self.max_steps) * self.d
+        k_next_pre = min(k_curr_pre + 1, self.max_steps)
+        x_sample_next = k_next_pre * self.d
         ref_h = self.v_des[k_curr_pre + 1 : min(k_curr_pre + 1 + self.internal_mpc.n_p, len(self.v_des))]
         slope_iota = (
             (self.physics.grade_resistance(x_sample_next) + self.physics.curve_resistance(x_sample_next))
@@ -725,10 +734,13 @@ class PathAgnosticHavaeiEnv:
             else 0.0
         )
 
-        # Always keep internal_mpc warm and synced with its own MPC trajectory!
         self.internal_mpc.prev_v = float(self.v_prev)
         u_mpc_cand = self.internal_mpc.select_action(
-            self.v_real, ref_h, slope_iota=slope_iota, dt_step=self.dt
+            self.v_real,
+            ref_h,
+            slope_iota=slope_iota,
+            dt_step=self.dt,
+            u_act_prev=self.u_act,
         )
         self.internal_mpc.prev_u = float(u_mpc_cand)
 
@@ -746,7 +758,7 @@ class PathAgnosticHavaeiEnv:
             act_idx = int(np.argmax(w5))
 
         w_mpc = float(w5[4])
-        if w_mpc >= 0.999:
+        if w_mpc >= 0.999 or (act_idx == 4 and w_mpc >= 0.50):
             return self.step_mpc(u_mpc_cand, shield_diff=shield_diff)
         elif w_mpc <= 0.02:
             w4 = w5[:4] / (np.sum(w5[:4]) + 1e-12)
@@ -932,6 +944,17 @@ def _compute_surrogate_horizon_q_costs(
         obs_buffer.append(surrogate_env.get_observation())
         saved_state = surrogate_env.get_internal_state()
 
+        k_curr = surrogate_env.k
+        k_12 = min(k_curr + 12, surrogate_env.max_steps)
+        v_win_12 = surrogate_env.v_des[max(0, k_curr) : k_12 + 1]
+        dv_win_12 = np.diff(v_win_12) if len(v_win_12) > 1 else np.array([0.0])
+        in_stop_approach = (
+            (surrogate_env.shift_timer == 0)
+            and (float(np.min(v_win_12)) <= 3.1)
+            and (float(np.min(dv_win_12)) < -0.02)
+            and (float(surrogate_env.v_des[min(k_curr + 1, surrogate_env.max_steps)] - surrogate_env.v_des[k_curr]) < -0.015)
+        )
+
         costs_a = np.zeros(n_algs, dtype=np.float32)
         for a_idx in range(n_algs):
             surrogate_env.set_internal_state(saved_state)
@@ -965,6 +988,9 @@ def _compute_surrogate_horizon_q_costs(
                         s_sign * (surrogate_env.v_real + 0.40 * v_rate - info_h["v_des"]),
                     )
                     step_cost += 180.0 * margin_os
+
+                if n_algs == 5 and in_stop_approach and a_idx < 4:
+                    step_cost += 35.0 * abs(surrogate_env.int_err) + 25.0
 
                 cum_cost += discount * step_cost
                 discount *= 0.72
