@@ -258,7 +258,7 @@ class SafetyFilterShield:
     # -----------------------------------------------------------------------
     def _predict_step_with_uncertainty(
         self, env, u_cmd: float, mu_v: float, v_prev: float, u_act_curr: float,
-        sigma_v_curr: float, k_step: int, pid_gains: np.ndarray
+        sigma_v_curr: float, k_step: int
     ) -> tuple[float, float, float]:
         u_clamped = float(np.clip(u_cmd, -1.0, 1.0))
         u_act_next = 0.72 * u_clamped + 0.28 * u_act_curr
@@ -576,7 +576,7 @@ def compute_and_print_shield_scissor_band(
             env.shift_timer = 1
             env.shift_delta = dv_t
         elif env.shift_timer > 0:
-            env.shift_timer = (env.shift_timer + 1) if env.shift_timer < 6 else 0
+            env.shift_timer = (env.shift_timer + 1) if env.shift_timer < 6 else 0       # works but strange this 5 times in shift no matter what
 
         reg_k = sh_eval.classify_driving_regime(env, k_c, v_t, dv_t)
         regimes.append(reg_k)
@@ -611,7 +611,7 @@ def compute_and_print_shield_scissor_band(
         r99 = max(
             loc_max * 0.90,
             0.60 * min(cfg.z_sigma * loc_rms, 1.15 * reg_p99[reg_k]) + 0.40 * reg_p99[reg_k],
-            0.030,
+            0.030,  #min band
         )
         r99 = float(np.clip(r99, 0.030, 0.18))
         if v_des_arr[idx] <= 1e-3 and v_emu_arr[idx] <= 0.02:
