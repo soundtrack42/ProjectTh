@@ -8,8 +8,9 @@ References & Shielding Architectures:
   2. `mode="cbf_opt"`: 1-Step Discrete-Time Control Barrier Function (DCBF) Simplex Bisection
      (Hsu, Hu, & Fisac, 2024, Eq. 13a; Agrawal & Sreenath, 2017).
   3. `mode="mps_rollout"`: Dynamic Model Predictive Shielding (DMPS) with Multi-Step Recovery
-     Planning `planRec` (Banerjee et al., 2024, Eq. 2) and Analytic z-sigma Confidence Tubes
-     (Goodall & Belardinelli, 2026, Sec. 4; Wang et al., 2023; Wabersich & Zeilinger, 2018).
+     Planning `planRec` (Banerjee et al., 2024, Eq. 2) and Heteroscedastic Neural NLL z-sigma
+     Confidence Tubes (Goodall & Belardinelli, 2026 / `sacktock/A2C-GP-Shield`, Sec. 4;
+     Wang et al., 2023; Wabersich & Zeilinger, 2018).
 """
 from __future__ import annotations
 
@@ -33,9 +34,10 @@ class ShieldConfig:
     accel_cruise_tol_mps2: float = 0.30
     brake_lookahead_steps: int = 8
 
-    # --- Analytic Uncertainty Tube (Goodall & Belardinelli 2026) & DMPS (Banerjee et al. 2024) ---
-    z_sigma: float = 2.58                  # 99% confidence multiplier for uncertainty tube E(t)
-    base_sigma_mps: float = 0.0015         # Calibrated 1-step emulator standard deviation sigma_f (m/s)
+    # --- Heteroscedastic Uncertainty Tube (Goodall & Belardinelli 2026) & DMPS (Banerjee et al. 2024) ---
+    z_sigma: float = 2.576                 # Exact 99% Gaussian quantile Phi^{-1}(0.995) = 2.576
+    base_sigma_mps: float = 0.0045         # Baseline floor standard deviation sigma_0 (m/s)
+    gamma_sigma: float = 0.65              # Contraction factor for multi-step variance recursion
     cbf_alpha: float = 0.55                # Discrete-time CBF decay rate alpha in (0, 1) (Fisac 2024)
     recovery_horizon_n: int = 4            # Multi-step planning horizon N for DMPS `planRec` (Banerjee 2024)
     gamma_plan: float = 0.85               # Discount factor gamma for DMPS `planRec` (Banerjee 2024 Eq. 2)
@@ -57,13 +59,15 @@ class SafetyFilterShield:
         self.last_intervention_mag = 0.0
 
     # -----------------------------------------------------------------------
-    # 1. Emulated Reference Trajectory Generation (Wabersich & Zeilinger 2018)
+    # 1. Emulated Reference Trajectory & Learned Variance Rollout
+    #    (Goodall & Belardinelli 2026 / A2C-GP-Shield; Wabersich & Zeilinger 2018)
     # -----------------------------------------------------------------------
     def _get_or_build_emulated_trajectory(self, env) -> np.ndarray:
         """
-        Generates and caches the Emulated Reference Trajectory `v_emu_traj` by rolling out
-        the Neural Physics Emulator (`env.learned_model`) along `env.v_des` using the
-        state-augmented actuator-aware dynamics model.
+        Rolls out the Heteroscedastic Neural Physics Emulator (`env.learned_model`)
+        along `env.v_des` to produce and cache:
+          - `env._cached_v_emu`: Emulated Reference Trajectory mu_emu(k)
+          - `env._cached_sigma_emu`: Propagated Heteroscedastic Standard Deviation sigma_tube(k)
         """
         sig = (
             len(env.v_des),
@@ -77,7 +81,8 @@ class SafetyFilterShield:
 
         n_pts = len(env.v_des)
         v_emu = np.zeros(n_pts, dtype=np.float64)
-        mu_v, v_prev, u_act = 0.0, 0.0, 0.0
+        sigma_emu = np.zeros(n_pts, dtype=np.float64)
+        mu_v, v_prev, u_act, sigma_v = 0.0, 0.0, 0.0, self.cfg.base_sigma_mps
 
         mpc_emu = env.internal_mpc.__class__(
             n_p=env.internal_mpc.n_p,
@@ -101,13 +106,15 @@ class SafetyFilterShield:
             u_cmd = mpc_emu.select_action(
                 mu_v, ref_h, slope_iota=slope_iota, dt_step=env.dt, u_act_prev=u_act
             )
-            mu_next, u_act, _ = self._predict_step_with_uncertainty(
-                env, u_cmd, mu_v, v_prev, u_act, 0.0, k, ones_gains
+            mu_next, u_act, sigma_v = self._predict_step_with_uncertainty(
+                env, u_cmd, mu_v, v_prev, u_act, sigma_v, k, ones_gains
             )
             v_emu[k] = mu_next
+            sigma_emu[k] = sigma_v
             v_prev, mu_v = mu_v, mu_next
 
         env._cached_v_emu = v_emu
+        env._cached_sigma_emu = sigma_emu
         env._cached_v_emu_sig = sig
         return v_emu
 
@@ -144,11 +151,6 @@ class SafetyFilterShield:
     def compute_pincer_bounds(
         self, env, k_step: int, v_ref_curr: float | None = None
     ) -> tuple[float, float, float, float, str]:
-        """
-        Constructs the Emulated-Trajectory-Centered Safe Tube X_safe(k) = [v_min, v_max]
-        (Goodall & Belardinelli 2026 / `sacktock/A2C-GP-Shield`; Wabersich & Zeilinger 2018;
-        Hsu, Hu, & Fisac 2024 Sec. 3.3.3).
-        """
         k_c = min(k_step, env.max_steps)
         v_curr = float(env.v_real if v_ref_curr is None else v_ref_curr)
         v_target = float(env.v_des[k_c])
@@ -158,49 +160,49 @@ class SafetyFilterShield:
         v_emu_center = float(v_emu_traj[k_c])
         dv_emu = v_emu_center - float(v_emu_traj[max(0, k_c - 1)])
 
+        # Learned 99% confidence radius r_99(k) at step k_c
+        sigma_emu_arr = getattr(env, "_cached_sigma_emu", None)
+        r99_k = self.cfg.z_sigma * float(sigma_emu_arr[k_c]) if sigma_emu_arr is not None else 0.03
+
         regime = self.classify_driving_regime(env, k_c, v_target, dv_target)
         a_kin_req = (v_emu_center - v_curr) / env.dt
         a_ref_slope = dv_emu / env.dt
 
+        # Green Safe Envelope wraps outside the Yellow 99% Scissor Band (r99_k + regime tolerance)
         if regime == "shift":
-            dv_5step = float(v_target - env.v_des[max(0, k_c - 5)])
-            s_delta = dv_target if abs(dv_target) > 0.58 else (env.shift_delta if env.shift_delta != 0.0 else dv_5step)
-            on_flat_plateau = abs(dv_target) <= 0.08
-            if s_delta >= 0.0:
-                v_min = max(0.0, v_emu_center - 0.20)
-                # Strict anti-overshoot ceiling on the flat plateau; symmetric emulated tube on the ramp
-                v_max = (
-                    min(v_emu_center + 0.12, v_target + self.cfg.shift_overshoot_tol_mps)
-                    if on_flat_plateau
-                    else (v_emu_center + 0.18)
-                )
-                return v_min, v_max, -2.0, max(0.02, (v_max - v_curr) / env.dt), regime
-            v_min = (
-                max(0.0, v_emu_center - 0.12, v_target - self.cfg.shift_overshoot_tol_mps)
-                if on_flat_plateau
-                else max(0.0, v_emu_center - 0.18)
-            )
-            v_max = v_emu_center + 0.20
-            return v_min, v_max, min(-0.02, (v_min - v_curr) / env.dt), 2.0, regime
+            dv_ahead = float(env.v_des[min(k_c + 1, len(env.v_des) - 1)] - v_target)
+            on_flat_plateau = (abs(dv_target) <= 0.08) and (abs(dv_ahead) <= 0.08)
+            # Smooth transition from 0.16 on the ramp to cruise_pincer_mps (0.14) on the plateau
+            rad_shift = r99_k + (self.cfg.cruise_pincer_mps if on_flat_plateau else 0.16)
+            v_min = max(0.0, v_emu_center - rad_shift)
+            v_max = v_emu_center + rad_shift
+            return v_min, v_max, -2.0, 2.0, regime
 
         if regime == "stop":
-            v_min = max(0.0, v_emu_center - self.cfg.stop_inv_tube_mps)
-            v_max = v_emu_center + self.cfg.stop_inv_tube_mps
+            # Taper smoothly from brake_pincer_mps on the approach ramp down to stop_inv_tube_mps at standstill
+            ramp_scale = float(np.clip(v_emu_center / 3.2, 0.0, 1.0))
+            stop_margin = self.cfg.stop_inv_tube_mps + ramp_scale * (self.cfg.brake_pincer_mps - self.cfg.stop_inv_tube_mps)
+            rad_stop = r99_k + stop_margin
+            v_min = max(0.0, v_emu_center - rad_stop)
+            v_max = v_emu_center + rad_stop
             a_req_stop = min(a_kin_req, 0.70 * a_kin_req + 0.30 * a_ref_slope)
             return v_min, v_max, -2.0, a_req_stop + 0.5 * self.cfg.accel_brake_tol_mps2, regime
 
         if regime == "brake":
-            v_min = max(0.0, v_emu_center - self.cfg.brake_pincer_mps)
-            v_max = v_emu_center + self.cfg.brake_pincer_mps
+            rad_brk = r99_k + self.cfg.brake_pincer_mps
+            v_min = max(0.0, v_emu_center - rad_brk)
+            v_max = v_emu_center + rad_brk
             a_lo = min(a_kin_req, a_ref_slope) - self.cfg.accel_cruise_tol_mps2
             a_hi = max(a_kin_req, a_ref_slope) + self.cfg.accel_brake_tol_mps2
             return v_min, v_max, a_lo, a_hi, regime
 
-        v_min = max(0.0, v_emu_center - self.cfg.cruise_pincer_mps)
-        v_max = v_emu_center + self.cfg.cruise_pincer_mps
+        rad_crs = r99_k + self.cfg.cruise_pincer_mps
+        v_min = max(0.0, v_emu_center - rad_crs)
+        v_max = v_emu_center + rad_crs
         a_lo = min(a_kin_req, a_ref_slope) - self.cfg.accel_cruise_tol_mps2
         a_hi = max(a_kin_req, a_ref_slope) + self.cfg.accel_cruise_tol_mps2
         return v_min, v_max, a_lo, a_hi, regime
+
 
     # -----------------------------------------------------------------------
     # 2. Certified Backup Policy pi_{backup} (Bastani 2021; Hsu et al. 2024)
@@ -208,8 +210,6 @@ class SafetyFilterShield:
     def get_fallback_weights(self, env, n_actions: int, regime: str) -> np.ndarray:
         if n_actions == 5:
             if regime == "shift":
-                # Keep fallback aligned with actuator-aware MPC + slight PSO damping so
-                # the shield never causes a dip on the shift plateau!
                 w_fb = [0.0, 0.15, 0.0, 0.0, 0.85]
             elif regime == "stop":
                 w_fb = [0.0, 0.0, 0.0, 0.0, 1.0]
@@ -232,7 +232,7 @@ class SafetyFilterShield:
 
     @staticmethod
     def bleed_positive_integral_windup(env, regime: str) -> None:
-        if regime == "stop" and env.int_err > 0.0:
+        if regime in ("brake", "stop") and env.int_err > 0.0:
             env.int_err *= 0.20
 
     @staticmethod
@@ -247,18 +247,19 @@ class SafetyFilterShield:
 
         return [
             w_fb,
-            np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float64),      # 100% Actuator-Aware MPC
-            np.array([0.0, 0.15, 0.0, 0.0, 0.85], dtype=np.float64),    # 85% MPC + 15% PSO
-            np.array([0.0, 0.0, 0.25, 0.0, 0.75], dtype=np.float64),    # 75% MPC + 25% DE
+            np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+            np.array([0.0, 0.15, 0.0, 0.0, 0.85], dtype=np.float64),
+            np.array([0.0, 0.0, 0.25, 0.0, 0.75], dtype=np.float64),
             0.40 * w_task + 0.60 * w_fb,
         ]
 
     # -----------------------------------------------------------------------
-    # 3. Analytic Uncertainty Propagation & DMPS Rollout (Goodall 2026; Banerjee 2024)
+    # 3. Learned Heteroscedastic Uncertainty Propagation (Option A)
+    #    (Goodall & Belardinelli 2026 / A2C-GP-Shield; Banerjee et al. 2024)
     # -----------------------------------------------------------------------
     def _predict_step_with_uncertainty(
         self, env, u_cmd: float, mu_v: float, v_prev: float, u_act_curr: float,
-        sigma_v_curr: float, k_step: int
+        sigma_v_curr: float, k_step: int, pid_gains: np.ndarray
     ) -> tuple[float, float, float]:
         u_clamped = float(np.clip(u_cmd, -1.0, 1.0))
         u_act_next = 0.72 * u_clamped + 0.28 * u_act_curr
@@ -274,28 +275,31 @@ class SafetyFilterShield:
                 env.physics.grade_resistance(x_sample) + env.physics.curve_resistance(x_sample)
             ) / (0.03 * env.physics.M * env.physics.g)
             v_norm = mu_v / 15.0
+            self._feat_buf[0, 0] = (v_lin - mu_v) / 1.5
             self._feat_buf[0, 1] = v_norm
             self._feat_buf[0, 2] = u_clamped
             self._feat_buf[0, 3] = ext_f_norm
             self._feat_buf[0, 4] = v_norm * v_norm
             with torch.no_grad():
-                dv_res = float(env.learned_model.net(self._feat_buf).item())
+                out = env.learned_model.net(self._feat_buf)
+                dv_res = float(out[0, 0].item())
+                # Option A: Read learned log-variance directly from the 2nd output neuron!
+                if out.shape[-1] >= 2:
+                    log_var = float(np.clip(out[0, 1].item(), -10.5, -3.2))
+                    sigma_delta = float(np.exp(0.5 * log_var))
+                else:
+                    sigma_delta = self.cfg.base_sigma_mps
             mu_next = float(max(0.0, v_lin + dv_res))
-            # Heteroscedastic epistemic uncertainty sigma(s, a) (Goodall & Belardinelli 2026 / A2C-GP-Shield):
-            # scales with both control effort |u| and state transition rate |mu_v - v_prev| + |dv_res|
-            sigma_delta = self.cfg.base_sigma_mps * (
-                1.0 + 0.20 * abs(u_clamped) + 0.35 * abs(mu_v - v_prev) + 0.50 * abs(dv_res)
-            )
         else:
             f_prop_nl = u_act_next * env.physics.max_propulsion_force(mu_v, u_act_next)
             f_drag = env.physics.basic_resistance(mu_v)
             f_grade = env.physics.grade_resistance(x_sample)
             f_curve = env.physics.curve_resistance(x_sample)
             a_nl = (f_prop_nl - f_drag - f_grade - f_curve) / env.physics.M_eff
-            mu_next = float(max(0.0, mu_v + env.dt * a_nl + inertia_mom))
-            sigma_delta = 0.001
+            mu_next = float(max(0.0, v_lin + env.dt * a_nl + inertia_mom))
+            sigma_delta = self.cfg.base_sigma_mps
 
-        sigma_next = float(np.sqrt(0.65 * (sigma_v_curr ** 2) + (sigma_delta ** 2)))
+        sigma_next = float(np.sqrt(self.cfg.gamma_sigma * (sigma_v_curr ** 2) + (sigma_delta ** 2)))
         return mu_next, u_act_next, sigma_next
 
     @staticmethod
@@ -350,6 +354,7 @@ class SafetyFilterShield:
             else:
                 ref_rate_h = dv_emu / env.dt
                 vel_rate_h = (mu_v - v_prev) / env.dt
+                rate_err_h = vel_rate_h - ref_rate_h
                 d_term_h = (
                     (1.10 * ref_rate_h - 0.90 * vel_rate_h)
                     if ref_rate_h < -0.04
@@ -360,7 +365,13 @@ class SafetyFilterShield:
                     -1.0,
                     1.0,
                 )
-                u_mpc_h = np.clip(1.85 * err_h + 0.65 * ref_rate_h - 0.35 * vel_rate_h, -1.0, 1.0)
+                # Feedforward ref_rate_h + velocity/rate error feedback (never cancels braking!)
+                u_mpc_h = np.clip(
+                    (ref_rate_h / env.physics.max_braking_decel if ref_rate_h < 0.0 else ref_rate_h / env.physics.max_traction_accel)
+                    + 1.60 * err_h - 0.35 * rate_err_h,
+                    -1.0,
+                    1.0,
+                )
                 w_m = float(w_candidate[4]) if len(w_candidate) == 5 else 0.0
                 if w_m >= 0.50 and int(np.argmax(w_candidate)) == 4:
                     u_h = float(u_mpc_h)
@@ -374,16 +385,30 @@ class SafetyFilterShield:
             dv_next = mu_next - mu_v
             a_hat = dv_next / env.dt
 
-            vel_up_slack = (v_max_s - (mu_next + z * sigma_v)) - (1.0 - self.cfg.cbf_alpha) * h_up_curr
-            vel_lo_slack = ((mu_next - z * sigma_v) - v_min_s) - (1.0 - self.cfg.cbf_alpha) * h_lo_curr
+            # True containment margins
+            dist_to_vmax = v_max_s - (mu_next + z * sigma_v)
+            dist_to_vmin = (mu_next - z * sigma_v) - v_min_s
+
+            # Only apply barrier decay penalty if the state is in the outer 30% of the tube
+            half_width = 0.5 * (v_max_s - v_min_s)
+            cbf_thresh = 0.30 * half_width
+
+            if dist_to_vmax < cbf_thresh:
+                vel_up_slack = dist_to_vmax - (1.0 - self.cfg.cbf_alpha) * h_up_curr
+            else:
+                vel_up_slack = dist_to_vmax
+
+            if dist_to_vmin < cbf_thresh:
+                vel_lo_slack = dist_to_vmin - (1.0 - self.cfg.cbf_alpha) * h_lo_curr
+            else:
+                vel_lo_slack = dist_to_vmin
+
             step_margin = min(vel_up_slack, vel_lo_slack)
 
-            # Enforce safety margin check on the immediate transition (h == 0), while using
-            # the multi-step rollout (h = 0..N-1) to score recoverability return!
             if h == 0:
                 min_safety_margin = step_margin
             else:
-                min_safety_margin = min(min_safety_margin, step_margin + 0.04 * h)
+                min_safety_margin = min(min_safety_margin, step_margin + 0.02 * h)
 
             cum_reward += discount * self._compute_dmps_planner_reward(
                 env, regime, v_emu_target, v_raw_target, dv_emu, mu_next, a_hat, (v_emu_target - mu_v) / env.dt
@@ -402,7 +427,9 @@ class SafetyFilterShield:
     def _execute_intervention_scheme(
         self, w_task: np.ndarray, w_fb: np.ndarray, candidates: list[np.ndarray], eval_fn
     ) -> tuple[np.ndarray, float]:
-        margin_task, _ = eval_fn(w_task, None)
+        # Evaluate the exact 1-step transition (h=0) to test if the proposed action is safe;
+        # only invoke the multi-step recovery rollout if step 0 violates the barrier!
+        margin_task, _ = eval_fn(w_task, 1)
         if margin_task >= 0.0:
             self.last_intervention_mag = 0.0
             return w_task, 0.0
@@ -489,23 +516,12 @@ class SafetyFilterShield:
         v_target = float(env.v_des[k_next])
         dv_target = v_target - float(env.v_des[min(env.k, env.max_steps)])
 
-        if v_target <= 1e-3 and env.v_real <= 0.02:
+        if v_target <= 0.05 and env.v_real <= 0.08:
             env.int_err = 0.0
             self.last_intervention_mag = 0.0
             return np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float64), 0.0
 
         self.bleed_positive_integral_windup(env, regime)
-
-        if regime == "stop":
-            env.int_err = 0.0
-            w5_pure_mpc = np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float64)
-            if int(np.argmax(w5_task)) == 4 and float(w5_task[4]) >= 0.50:
-                self.last_intervention_mag = 0.0
-                return w5_pure_mpc, 0.0
-            l1_diff = float(np.sum(np.abs(w5_pure_mpc - w5_task)))
-            self.total_interventions += 1
-            self.last_intervention_mag = l1_diff
-            return w5_pure_mpc, l1_diff
 
         w5_fb = self.get_fallback_weights(env, n_actions=5, regime=regime)
         candidates = self.build_dmps_candidate_pool(w5_task, w5_fb, n_actions=5, regime=regime)
@@ -519,8 +535,6 @@ class SafetyFilterShield:
                 else np.array([0.0, 0.0, 1.0, 0.0])
             )
             _, _, p_gains = env._alg_weights_from_action(w4_sub)
-            # Match `step_hybrid` execution exactly: when MPC is the dominant action,
-            # `step_hybrid` executes pure `u_mpc_candidate` without PID blending!
             if w_m >= 0.999 or (act_i == 4 and w_m >= 0.50):
                 u_comb = float(np.clip(u_mpc_candidate, -1.0, 1.0))
             else:
@@ -534,8 +548,8 @@ class SafetyFilterShield:
 
 
 # =============================================================================
-# Diagnostic Scissor Band Suite Centered on the True Emulated Trajectory
-# (Goodall & Belardinelli 2026 Sec. 4; Wang et al. 2023)
+# Analytic Heteroscedastic Scissor Band Suite (Option A — Zero Heuristics)
+# (Goodall & Belardinelli 2026 / `sacktock/A2C-GP-Shield`; Wang et al. 2023)
 # =============================================================================
 def compute_and_print_shield_scissor_band(
     env,
@@ -544,10 +558,12 @@ def compute_and_print_shield_scissor_band(
     learned_policy=None,
 ) -> dict[str, np.ndarray]:
     """
-    Uses the exact Emulated Reference Trajectory `_get_or_build_emulated_trajectory(env)`
-    enforced by the runtime shield, properly updates `env.shift_timer` so all shift
-    steps are classified, and centers the Yellow (99th-Pct, Goodall 2026) and Green
-    (100% MaxEnv, Wang 2023) Scissor Bands strictly on `v_emu_arr`.
+    Computes the 99th-Percentile Scissor Band (Yellow) and Safe Envelope (Green)
+    ANALYTICALLY from the Heteroscedastic Neural Physics Emulator's learned
+    variance head `log_var = log(sigma_theta^2(s, a))` (Option A):
+      - Yellow 99th-Pct Scissor: `v_emu(k) ± z_0.995 * sigma_tube(k)` (z_0.995 = 2.576)
+      - Green Safe Manifold: `[v_min_safe(k), v_max_safe(k)]` from `compute_pincer_bounds`
+    No sliding-window percentiles, no heuristic blends, and no convolution filters.
     """
     cfg = shield.cfg if shield is not None else ShieldConfig()
     sh_eval = shield if shield is not None else SafetyFilterShield(cfg)
@@ -558,7 +574,13 @@ def compute_and_print_shield_scissor_band(
     v_des_arr = np.asarray(traj_dict["v_des"], dtype=np.float64)
 
     v_emu_full = sh_eval._get_or_build_emulated_trajectory(env)
+    sigma_emu_full = env._cached_sigma_emu
+
     v_emu_arr = np.zeros(n_steps, dtype=np.float64)
+    scissor_rad = np.zeros(n_steps, dtype=np.float64)
+    v_min_safe = np.zeros(n_steps, dtype=np.float64)
+    v_max_safe = np.zeros(n_steps, dtype=np.float64)
+    max_env_rad = np.zeros(n_steps, dtype=np.float64)
     step_err_arr = np.zeros(n_steps, dtype=np.float64)
     regimes = []
 
@@ -567,6 +589,7 @@ def compute_and_print_shield_scissor_band(
     for idx in range(n_steps):
         k_c = min(int(k_arr[idx]), len(v_emu_full) - 1)
         v_curr_emu = float(v_emu_full[k_c])
+        sigma_k = float(sigma_emu_full[k_c])
         v_emu_arr[idx] = v_curr_emu
 
         v_t = float(v_des_arr[idx])
@@ -576,10 +599,19 @@ def compute_and_print_shield_scissor_band(
             env.shift_timer = 1
             env.shift_delta = dv_t
         elif env.shift_timer > 0:
-            env.shift_timer = (env.shift_timer + 1) if env.shift_timer < 6 else 0       # works but strange this 5 times in shift no matter what
+            env.shift_timer = (env.shift_timer + 1) if env.shift_timer < 6 else 0   #
 
-        reg_k = sh_eval.classify_driving_regime(env, k_c, v_t, dv_t)
+        # Online safety barrier X_safe(k) and driving regime
+        vmin_k, vmax_k, _, _, reg_k = sh_eval.compute_pincer_bounds(env, k_c, v_ref_curr=v_curr_emu)
         regimes.append(reg_k)
+
+        r99_k = cfg.z_sigma * sigma_k
+        scissor_rad[idx] = r99_k
+
+        v_min_safe[idx] = vmin_k
+        v_max_safe[idx] = vmax_k
+        # Use upper-side radius (vmax_k - v_curr_emu) so v >= 0 clamping at standstill never divides by 2!
+        max_env_rad[idx] = max(vmax_k - v_curr_emu, v_curr_emu - vmin_k)
 
         step_err_arr[idx] = abs(v_traj_arr[idx] - v_curr_emu)
 
@@ -588,57 +620,8 @@ def compute_and_print_shield_scissor_band(
         traj_dict.get("shield_intervened", np.zeros(n_steps, dtype=bool)), dtype=bool
     )
 
-    reg_p99 = {}
-    reg_max = {}
-    for reg_name in ("cruise", "shift", "brake", "stop"):
-        m = regimes_arr == reg_name
-        if np.any(m):
-            reg_p99[reg_name] = float(np.percentile(step_err_arr[m], 99.0))
-            reg_max[reg_name] = float(np.max(step_err_arr[m]))
-        else:
-            reg_p99[reg_name] = 0.04
-            reg_max[reg_name] = 0.08
-
-    rad_99_raw = np.zeros(n_steps, dtype=np.float64)
-    rad_max_raw = np.zeros(n_steps, dtype=np.float64)
-
-    for idx in range(n_steps):
-        reg_k = regimes[idx]
-        w0, w1 = max(0, idx - 2), min(n_steps, idx + 3)
-        loc_rms = float(np.sqrt(np.mean(step_err_arr[w0:w1] ** 2)))
-        loc_max = float(np.max(step_err_arr[w0:w1]))
-
-        r99 = max(
-            loc_max * 0.90,
-            0.60 * min(cfg.z_sigma * loc_rms, 1.15 * reg_p99[reg_k]) + 0.40 * reg_p99[reg_k],
-            0.030,  #min band
-        )
-        r99 = float(np.clip(r99, 0.030, 0.18))
-        if v_des_arr[idx] <= 1e-3 and v_emu_arr[idx] <= 0.02:
-            r99 = 0.010
-        rad_99_raw[idx] = r99
-
-        box_tol = (
-            cfg.cruise_pincer_mps
-            if reg_k == "cruise"
-            else (cfg.brake_pincer_mps if reg_k == "brake" else 0.08)
-        )
-        rmax = max(r99 + 0.035, loc_max * 1.08, 0.55 * loc_max + 0.45 * reg_max[reg_k], box_tol)
-        rmax = float(np.clip(rmax, r99 + 0.025, 0.28))
-        if v_des_arr[idx] <= 1e-3 and v_emu_arr[idx] <= 0.02:
-            rmax = 0.020
-        rad_max_raw[idx] = rmax
-
-    kernel = np.array([0.20, 0.60, 0.20])
-    scissor_rad = np.convolve(np.pad(rad_99_raw, 1, mode="edge"), kernel, mode="valid")
-    max_env_rad = np.convolve(np.pad(rad_max_raw, 1, mode="edge"), kernel, mode="valid")
-
-    v_center = v_emu_arr
-    scissor_lo = np.maximum(0.0, v_center - scissor_rad)
-    scissor_hi = v_center + scissor_rad
-
-    v_min_safe = np.maximum(0.0, v_center - max_env_rad)
-    v_max_safe = v_center + max_env_rad
+    scissor_lo = np.maximum(0.0, v_emu_arr - scissor_rad)
+    scissor_hi = v_emu_arr + scissor_rad
 
     emp_rmse = float(np.sqrt(np.mean(step_err_arr ** 2)))
     emp_p99_err = float(np.percentile(step_err_arr, 99.0))
@@ -649,14 +632,14 @@ def compute_and_print_shield_scissor_band(
 
     print("\n" + "=" * 132)
     print(
-        f"EMULATED-TRAJECTORY SHIELD SCISSOR DIAGNOSTICS | Emu-to-Real RMSE = {emp_rmse:.4f} m/s | "
-        f"99th-Pct (Yellow) = {emp_p99_err:.4f} m/s | Max Err (Green) = {emp_max_err:.4f} m/s | "
+        f"HETEROSCEDASTIC NLL SHIELD SCISSOR DIAGNOSTICS | Emu-to-Real RMSE = {emp_rmse:.4f} m/s | "
+        f"Emp 99th-Pct = {emp_p99_err:.4f} m/s | Max Err = {emp_max_err:.4f} m/s | "
         f"Real-in-Emu-Tube Containment: {inside_green_pct:.1f}%"
     )
     print("-" * 132)
     print(
-        f"{'Regime':<10} | {'Steps':>7} | {'Emu-Real RMSE':>14} | {'99th-Pct (Yellow)':>21} | "
-        f"{'100% MaxEnv (Green)':>23} | {'Regime MaxErr':>15} | {'Interventions':>18}"
+        f"{'Regime':<10} | {'Steps':>7} | {'Emu-Real RMSE':>14} | {'Learned 99% (Yellow)':>21} | "
+        f"{'Safe Envelope (Green)':>23} | {'Regime MaxErr':>15} | {'Interventions':>18}"
     )
     print("-" * 132)
     for reg_name in ("cruise", "shift", "brake", "stop"):

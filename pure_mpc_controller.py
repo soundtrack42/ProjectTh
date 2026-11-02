@@ -100,7 +100,8 @@ class PureLiuMPC:
         """Nonlinear discrete forward step including Davis drag, slope, and longitudinal inertia (Eq. 10)."""
         u_clamped = float(np.clip(u, self.u_min, self.u_max))
         gamma_xi = self._gamma_a_xi(v, u_clamped)
-        h_omega = -(self.a_a + self.b_a * v + self.c_a * (v ** 2)) if v > 1e-4 else 0.0
+        # Include static breakaway resistance a_a when throttling from rest (v=0, u>0)
+        h_omega = -(self.a_a + self.b_a * v + self.c_a * (v ** 2)) if (v > 1e-4 or u_clamped > 1e-3) else 0.0
         accel = (u_clamped * gamma_xi + h_omega - self.g * slope_iota) / (1.0 + self.gamma)
         inertia_mom = 0.14 * dv_prev
         return float(max(0.0, v + self.dt * accel + inertia_mom))
@@ -226,9 +227,8 @@ class PureLiuMPC:
         dv_01 = float(ref[min(1, len(ref) - 1)] - ref[0])
 
         if self.adaptive_shift:
-            # Causal Pre-Shift Guard: when current plateau is flat, only allow 1-step pre-charging
-            # so MPC never climbs 3 steps early before a shift or braking corner!
-            if abs(dv_01) < 0.025 and abs(float(ref[0]) - v_curr) < 0.15:
+         # Only guard flat plateaus at speed (v_curr > 0.5); allow 2-step pre-charge from rest!
+            if v_curr > 0.5 and abs(dv_01) < 0.025 and abs(float(ref[0]) - v_curr) < 0.15:
                 X_ref[2:, 0] = float(ref[1])
 
             z0 = np.array([[float(v_curr)], [u_act_curr]], dtype=np.float64)

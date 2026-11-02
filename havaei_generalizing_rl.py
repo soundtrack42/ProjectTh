@@ -181,6 +181,12 @@ class NonlinearTrainPhysics:
 # 3. Stabilized Causal Physics Emulator & RL Policy Network
 # ===========================================================================
 class LearnedLinearizationModel(nn.Module):
+    """
+    Heteroscedastic Neural Physics Emulator (Wang et al., 2023; Goodall & Belardinelli, 2026 / A2C-GP-Shield).
+    Outputs both:
+      - `out[..., 0]`: nonlinear velocity residual mean `dv_residual`
+      - `out[..., 1]`: state- and action-dependent log-variance `log_var = log(sigma^2(s, a))`
+    """
     def __init__(self, hidden_dim: int = 64):
         super().__init__()
         self.net = nn.Sequential(
@@ -188,10 +194,28 @@ class LearnedLinearizationModel(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, 2),
         )
         nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
+        with torch.no_grad():
+            self.net[-1].bias[0] = 0.0    # Zero initial mean residual
+            self.net[-1].bias[1] = -9.0   # Initial std sigma_0 = exp(-4.5) ~ 0.011 m/s
+
+    def _build_features(
+        self,
+        v_curr: torch.Tensor,
+        v_lin_next: torch.Tensor,
+        u_cmd: torch.Tensor,
+        ext_force: torch.Tensor,
+        gains_norm: torch.Tensor,
+    ) -> torch.Tensor:
+        v_norm = v_curr / 15.0
+        dv_norm = (v_lin_next - v_curr) / 1.5
+        u_norm = torch.clamp(u_cmd, -1.0, 1.0)
+        quad_norm = v_norm ** 2
+        zeros_3 = torch.zeros_like(gains_norm)
+        base = torch.stack([dv_norm, v_norm, u_norm, ext_force, quad_norm], dim=-1)
+        return torch.cat([base, zeros_3], dim=-1)
 
     def forward(
         self,
@@ -202,17 +226,29 @@ class LearnedLinearizationModel(nn.Module):
         ext_force: torch.Tensor,
         gains_norm: torch.Tensor,
     ) -> torch.Tensor:
-        v_norm = v_curr / 15.0
-        u_norm = torch.clamp(u_cmd, -1.0, 1.0)
-        quad_norm = v_norm ** 2
-        zeros_1 = torch.zeros_like(v_norm)
-        zeros_3 = torch.zeros_like(gains_norm)
-
-        base = torch.stack([zeros_1, v_norm, u_norm, ext_force, quad_norm], dim=-1)
-        feats = torch.cat([base, zeros_3], dim=-1)
-        dv_residual = self.net(feats).squeeze(-1)
+        feats = self._build_features(v_curr, v_lin_next, u_cmd, ext_force, gains_norm)
+        out = self.net(feats)
+        dv_residual = out[..., 0]
         return torch.clamp(v_lin_next + dv_residual, min=0.0)
 
+    def forward_with_uncertainty(
+        self,
+        x_m: torch.Tensor,
+        v_curr: torch.Tensor,
+        v_lin_next: torch.Tensor,
+        u_cmd: torch.Tensor,
+        ext_force: torch.Tensor,
+        gains_norm: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (mu_next, sigma_step, log_var) for Gaussian NLL training and shielding."""
+        feats = self._build_features(v_curr, v_lin_next, u_cmd, ext_force, gains_norm)
+        out = self.net(feats)
+        dv_residual = out[..., 0]
+        log_var = torch.clamp(out[..., 1], min=-10.5, max=-3.2)
+        sigma_step = torch.exp(0.5 * log_var)
+        mu_next = torch.clamp(v_lin_next + dv_residual, min=0.0)
+        return mu_next, sigma_step, log_var
+    
 
 class TwoPhaseRLSwitchPolicy(nn.Module):
     def __init__(self, obs_dim: int = 20, n_algs: int = 4, hidden_dim: int = 96):
@@ -491,7 +527,7 @@ class PathAgnosticHavaeiEnv:
         dv_target: float,
         update_state: bool = True,
     ) -> float:
-        if v_target <= 1e-4 and abs(dv_target) <= 1e-4 and self.v_real < 0.04:
+        if v_target <= 0.05 and self.v_real <= 0.15:
             if update_state:
                 self.int_err = 0.0
             return 0.0
@@ -501,7 +537,15 @@ class PathAgnosticHavaeiEnv:
         vel_rate = (self.v_real - self.v_prev) / self.dt
         ref_rate = dv_target / self.dt
 
-        new_int_err = float(np.clip(self.int_err + err_now * self.dt, -3.5, 3.5))
+        # Bleed integral windup on error sign-flip or flat plateau arrival (fixes k~600 hump)
+        if (self.int_err * err_now) < 0.0:
+            int_decay = 0.20  # Sign flip (overshoot): flush 80% of stale history immediately
+        elif abs(dv_target) < 0.03 and abs(err_now) < 0.25:
+            int_decay = 0.55  # Settled on a flat plateau: bleed out ramp integration
+        else:
+            int_decay = 0.92  # Active tracking: standard leaky integrator
+
+        new_int_err = float(np.clip(int_decay * self.int_err + err_now * self.dt, -3.5, 3.5))
         if update_state:
             self.int_err = new_int_err
 
@@ -515,6 +559,7 @@ class PathAgnosticHavaeiEnv:
 
         u_raw = kp * err_now + ki * new_int_err + kd * d_term
         return float(np.clip(u_raw / self.u_scale, -1.0, 1.0))
+
 
     def _integrate_plant_physics(self, u_cmd: float, x_sample: float) -> tuple[float, float]:
         u_clamped = float(np.clip(u_cmd, -1.0, 1.0))
@@ -816,6 +861,11 @@ def learn_150_step_emulator_for_trajectory(
     verbose: bool = False,
     return_curve: bool = False,
 ):
+    """
+    Trains the Heteroscedastic Neural Physics Emulator for 150 gradient steps per batch
+    using Asymmetric MSE for the mean head and Gaussian Negative Log-Likelihood (NLL)
+    for the variance head (Goodall & Belardinelli, 2026; Seitzer et al., 2022).
+    """
     global _EMULATOR_REPLAY_BUFFER, LAST_TRAINED_EMULATOR
     env_nl = PathAgnosticHavaeiEnv(v_des_profile=v_des, plant_mode="nonlinear")
     x_list, vc_list, vlin_list, u_list, ext_list, g_list, vnext_list = [], [], [], [], [], [], []
@@ -899,12 +949,18 @@ def learn_150_step_emulator_for_trajectory(
         for pg in optimizer.param_groups:
             pg["lr"] = eff_lr * lr_mult
 
-        pred = emulator(x_t, vc_t, vlin_t, u_t, ext_t, g_t)
-        diff = pred - target_t
+        pred_mu, sigma_step, log_var = emulator.forward_with_uncertainty(x_t, vc_t, vlin_t, u_t, ext_t, g_t)
+        diff = pred_mu - target_t
 
         under_pred_in_shift = (s_dir_t * diff) < 0.0
         asym_weight = torch.where(under_pred_in_shift, 3.0, 1.0)
-        loss = torch.mean(asym_weight * (diff ** 2))
+        mse_loss = torch.mean(asym_weight * (diff ** 2))
+
+        # Variance scales with transition rate |target_t - vc_t| and vanishes at standstill
+        dyn_var_floor = (0.0085 + 0.0150 * torch.abs(target_t - vc_t) + 0.0060 * torch.abs(u_t)) ** 2
+        res_sq_detached = diff.detach() ** 2 + dyn_var_floor
+        nll_var_loss = 0.5 * torch.mean(log_var + res_sq_detached / (torch.exp(log_var) + 1e-8))
+        loss = mse_loss + 0.25 * nll_var_loss
 
         with torch.no_grad():
             pred_cur = emulator(
@@ -927,7 +983,7 @@ def learn_150_step_emulator_for_trajectory(
     LAST_TRAINED_EMULATOR = emulator
 
     if verbose:
-        print(f"    [Physics Surrogate Emulator ({step_budget} steps)] Fit RMSE: {best_rmse:.5f} m/s")
+        print(f"    [Heteroscedastic Physics Emulator ({step_budget} steps)] Fit RMSE: {best_rmse:.5f} m/s")
     if return_curve:
         return emulator, loss_curve
     return emulator
@@ -985,19 +1041,12 @@ def _compute_surrogate_horizon_q_costs(
 
                 step_cost = -rew
                 if is_learned and info_h.get("shift_active", False):
-                    dv_step_h = float(info_h.get("dv_now", 0.0))
-                    # Only penalize velocity-rate projection when arriving on the flat plateau
-                    if abs(dv_step_h) < 0.05:
-                        s_sign = 1.0 if surrogate_env.shift_delta >= 0.0 else -1.0
-                        v_rate = surrogate_env.v_real - surrogate_env.v_prev
-                        margin_os = max(
-                            0.0,
-                            s_sign * (surrogate_env.v_real + 0.35 * v_rate - info_h["v_des"]),
-                        )
-                        step_cost += 180.0 * margin_os
+                    s_sign = 1.0 if surrogate_env.shift_delta >= 0.0 else -1.0
+                    margin_os = max(0.0, s_sign * (surrogate_env.v_real - info_h["v_des"]))
+                    step_cost += 180.0 * margin_os
 
-                if n_algs == 5 and in_stop_approach and a_idx < 4:
-                    step_cost += 35.0 * abs(surrogate_env.int_err) + 25.0
+                if n_algs == 5 and a_idx < 4:
+                  step_cost += 25.0 * abs(surrogate_env.int_err) + (25.0 if in_stop_approach else 4.5)
 
                 cum_cost += discount * step_cost
                 discount *= 0.72
