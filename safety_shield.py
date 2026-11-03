@@ -39,7 +39,7 @@ class ShieldConfig:
     base_sigma_mps: float = 0.0045         # Baseline floor standard deviation sigma_0 (m/s)
     gamma_sigma: float = 0.65              # Contraction factor for multi-step variance recursion
     cbf_alpha: float = 0.55                # Discrete-time CBF decay rate alpha in (0, 1) (Fisac 2024)
-    recovery_horizon_n: int = 4            # Multi-step planning horizon N for DMPS `planRec` (Banerjee 2024)
+    recovery_horizon_n: int = 3            # Multi-step planning horizon N for DMPS `planRec` (Banerjee 2024)
     gamma_plan: float = 0.85               # Discount factor gamma for DMPS `planRec` (Banerjee 2024 Eq. 2)
     intervention_penalty_weight: float = 5.0
 
@@ -299,6 +299,12 @@ class SafetyFilterShield:
             mu_next = float(max(0.0, v_lin + env.dt * a_nl + inertia_mom))
             sigma_delta = self.cfg.base_sigma_mps
 
+        # Account for online moving-average disturbance estimate when rolling out from current state
+        if sigma_v_curr == 0.0:
+            d_est = float(getattr(env, "d_hat", 0.0))
+            if abs(d_est) > 1e-5:
+                mu_next = float(max(0.0, mu_next + env.dt * d_est))
+
         sigma_next = float(np.sqrt(self.cfg.gamma_sigma * (sigma_v_curr ** 2) + (sigma_delta ** 2)))
         return mu_next, u_act_next, sigma_next
 
@@ -334,6 +340,9 @@ class SafetyFilterShield:
         )
         v_emu_traj = self._get_or_build_emulated_trajectory(env)
 
+        # Read the persistent disturbance force currently acting on the train
+        d_persistent = float(getattr(env, "d_hat", 0.0))
+
         for h in range(horizon):
             k_step = min(k_0 + 1 + h, env.max_steps)
             v_min_s, v_max_s, a_min_s, a_max_s, regime = self.compute_pincer_bounds(env, k_step, v_ref_curr=mu_v)
@@ -355,27 +364,18 @@ class SafetyFilterShield:
                 ref_rate_h = dv_emu / env.dt
                 vel_rate_h = (mu_v - v_prev) / env.dt
                 rate_err_h = vel_rate_h - ref_rate_h
-                d_term_h = (
-                    (1.10 * ref_rate_h - 0.90 * vel_rate_h)
-                    if ref_rate_h < -0.04
-                    else (0.55 * ref_rate_h - 1.10 * vel_rate_h)
+                # Counteract persistent drag force across the lookahead horizon
+                u_feedforward = (ref_rate_h - d_persistent) / (
+                    env.physics.max_braking_decel if ref_rate_h < 0.0 else env.physics.max_traction_accel
                 )
-                u_pid_h = np.clip(
-                    (gains_step0[0] * err_h + gains_step0[1] * int_err + gains_step0[2] * d_term_h) / env.u_scale,
-                    -1.0,
-                    1.0,
-                )
-                # Feedforward ref_rate_h + velocity/rate error feedback (never cancels braking!)
-                u_mpc_h = np.clip(
-                    (ref_rate_h / env.physics.max_braking_decel if ref_rate_h < 0.0 else ref_rate_h / env.physics.max_traction_accel)
-                    + 1.60 * err_h - 0.35 * rate_err_h,
-                    -1.0,
-                    1.0,
-                )
+                u_mpc_h = np.clip(u_feedforward + 1.60 * err_h - 0.35 * rate_err_h, -1.0, 1.0)
                 w_m = float(w_candidate[4]) if len(w_candidate) == 5 else 0.0
                 if w_m >= 0.50 and int(np.argmax(w_candidate)) == 4:
                     u_h = float(u_mpc_h)
                 else:
+                    u_pid_h = np.clip(
+                        (gains_step0[0] * err_h + gains_step0[1] * int_err) / env.u_scale, -1.0, 1.0
+                    )
                     u_h = float(w_m * u_mpc_h + (1.0 - w_m) * u_pid_h)
                 gains_h = gains_step0
 
@@ -479,6 +479,92 @@ class SafetyFilterShield:
             return w
         w = np.asarray(action, dtype=np.float64).copy()
         return w / (np.sum(w) + 1e-12)
+
+    def filter_mpc_command(
+        self, env, u_mpc_candidate: float
+    ) -> tuple[float, float]:
+        """
+        Direct safety shield over standalone MPC command u_mpc_candidate in [-1, 1].
+        Preserves true Switch, 1-Step DCBF, and DMPS Rollout architectures.
+        """
+        self.total_steps += 1
+        u_task = float(np.clip(u_mpc_candidate, -1.0, 1.0))
+        k_next = min(env.k + 1, env.max_steps)
+        v_target = float(env.v_des[k_next])
+
+        if v_target <= 0.05 and env.v_real <= 0.08:
+            env.int_err = 0.0
+            self.last_intervention_mag = 0.0
+            return 0.0, 0.0
+
+        v_min_s, v_max_s, _, _, regime = self.compute_pincer_bounds(env, k_next)
+        self.bleed_positive_integral_windup(env, regime)
+
+        # 1. Fast 1-step barrier check under current command (avoids double pincer_bounds call)
+        ones_gains = np.ones(3, dtype=np.float64) * env.gains_scale
+        mu_next, _, sigma_v = self._predict_step_with_uncertainty(
+            env, u_task, float(env.v_real), float(env.v_prev),
+            float(env.u_act), 0.0, k_next, ones_gains
+        )
+        z = self.cfg.z_sigma
+        if (v_max_s - (mu_next + z * sigma_v)) >= 0.0 and ((mu_next - z * sigma_v) - v_min_s) >= 0.0:
+            self.last_intervention_mag = 0.0
+            return u_task, 0.0
+
+        # 2. Genuine breach predicted: compute physical tube-centering backup command u_fb
+        self.total_interventions += 1
+        v_emu_traj = self._get_or_build_emulated_trajectory(env)
+        v_emu_next = float(v_emu_traj[k_next])
+        d_est = float(getattr(env, "d_hat", 0.0))
+
+        a_req = (v_emu_next - float(env.v_real)) / env.dt - d_est
+        scale_a = env.physics.max_traction_accel if a_req >= 0.0 else env.physics.max_braking_decel
+        u_fb = float(np.clip((a_req / (0.72 * scale_a)) - (0.28 / 0.72) * float(env.u_act), -1.0, 1.0))
+
+        w5_pure_mpc = np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+
+        def eval_u(u_val: float, hor: int | None) -> tuple[float, float]:
+            u_c = float(np.clip(u_val, -1.0, 1.0))
+            return self.evaluate_rollout_recoverability_and_return(
+                env, u_c, ones_gains, w5_pure_mpc, w5_pure_mpc,
+                horizon_override=hor, u_mpc_step0=u_c
+            )
+
+        # 3. Architecture-Specific Interventions:
+        if self.cfg.mode == "switch":
+            diff = abs(u_fb - u_task)
+            self.last_intervention_mag = diff
+            return u_fb, diff
+
+        if self.cfg.mode == "cbf_opt":
+            lo, hi = 0.0, 1.0
+            for _ in range(4):
+                mid = 0.5 * (lo + hi)
+                u_mid = (1.0 - mid) * u_task + mid * u_fb
+                if eval_u(u_mid, 1)[0] >= 0.0:
+                    hi = mid
+                else:
+                    lo = mid
+            u_safe = float(np.clip((1.0 - hi) * u_task + hi * u_fb, -1.0, 1.0))
+            diff = abs(u_safe - u_task)
+            self.last_intervention_mag = diff
+            return u_safe, diff
+
+        # mode == "mps_rollout": Multi-step DMPS candidate planning over recovery horizon N=2
+        best_u, best_ret = u_fb, -float("inf")
+        best_safe_u, best_safe_ret = None, -float("inf")
+        for lam in (0.33, 0.67, 1.0):
+            u_cand = float(np.clip((1.0 - lam) * u_task + lam * u_fb, -1.0, 1.0))
+            m_c, ret_c = eval_u(u_cand, self.cfg.recovery_horizon_n)
+            if m_c >= 0.0 and ret_c > best_safe_ret:
+                best_safe_ret, best_safe_u = ret_c, u_cand
+            if ret_c > best_ret:
+                best_ret, best_u = ret_c, u_cand
+
+        u_safe = best_safe_u if best_safe_u is not None else best_u
+        diff = abs(u_safe - u_task)
+        self.last_intervention_mag = diff
+        return u_safe, diff
 
     def filter_pid_weights(self, env, action: int | np.ndarray) -> tuple[np.ndarray, float]:
         self.total_steps += 1

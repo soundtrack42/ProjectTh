@@ -321,6 +321,48 @@ class HardcodedSwitchController:
         return w
 
 
+def generate_wind_disturbance_profile(
+    total_horizon: int = 1000,
+    min_burst_steps: int = 20,
+    max_burst_steps: int = 55,
+    seed: int | None = None,
+) -> np.ndarray:
+    """
+    Generates an unstable wind/external acceleration disturbance profile (m/s^2)
+    with 1-2 gusts lasting >= 15 steps, exhibiting realistic moving-average turbulence.
+    """
+    rng = np.random.default_rng(seed)
+    dist = np.zeros(total_horizon + 2, dtype=np.float64)
+    n_bursts = int(rng.integers(1, 3))
+
+    for b_idx in range(n_bursts):
+        dur = int(rng.integers(min_burst_steps, max_burst_steps + 1))
+        lo_k = 40 + b_idx * (total_horizon // 2)
+        hi_k = max(lo_k + 1, min(total_horizon - dur - 60, (b_idx + 1) * (total_horizon // 2) - dur))
+        start_k = int(rng.integers(lo_k, hi_k + 1))
+
+        # Base headwind (-) or tailwind (+) acceleration in m/s^2
+        sign = -1.0 if rng.random() < 0.65 else 1.0
+        base_mag = sign * float(rng.uniform(0.18, 0.36))
+
+        # Unstable turbulent fluctuations (AR(1) / moving-average correlated wind noise)
+        raw_noise = rng.normal(0.0, 0.12, size=dur)
+        turb = np.zeros(dur, dtype=np.float64)
+        for i in range(dur):
+            turb[i] = (0.65 * turb[i - 1] + 0.35 * raw_noise[i]) if i > 0 else raw_noise[i]
+
+        # Smooth 4-step attack/decay envelope
+        env_win = np.ones(dur, dtype=np.float64)
+        ramp = min(4, dur // 4)
+        if ramp > 0:
+            env_win[:ramp] = np.linspace(0.2, 1.0, ramp)
+            env_win[-ramp:] = np.linspace(1.0, 0.2, ramp)
+
+        dist[start_k : start_k + dur] = (base_mag + turb) * env_win
+
+    return dist
+
+
 # ===========================================================================
 # 4. Unified Closed-Loop PID + MPC + Nonlinear Train Environment
 # ===========================================================================
@@ -334,6 +376,7 @@ class PathAgnosticHavaeiEnv:
         past_n: int = 4,
         sample_dist_d: float = 8.33,
         shield: SafetyFilterShield | None = None,
+        disturbance_profile: np.ndarray | None = None,
     ):
         assert plant_mode in ("nonlinear", "linear_paper", "linear_learned")
         self.plant_mode = plant_mode
@@ -345,8 +388,8 @@ class PathAgnosticHavaeiEnv:
         self.shield = shield
         self.physics = NonlinearTrainPhysics(sample_dist_d=sample_dist_d)
         self.internal_mpc = PureLiuMPC(
-            n_p=10,
-            n_c=5,
+            n_p=5,
+            n_c=3,
             q1=160.0,
             q2=0.05,
             q3=0.35,
@@ -362,17 +405,21 @@ class PathAgnosticHavaeiEnv:
 
         if v_des_profile is None:
             v_des_profile = np.zeros(112, dtype=np.float64)
-        self.set_trajectory(v_des_profile)
+        self.set_trajectory(v_des_profile, disturbance_profile=disturbance_profile)
         self.reset()
 
     @property
     def obs_dim(self) -> int:
         return 20
 
-    def set_trajectory(self, v_des_profile: np.ndarray):
+    def set_trajectory(self, v_des_profile: np.ndarray, disturbance_profile: np.ndarray | None = None):
         self.v_des = np.asarray(v_des_profile, dtype=np.float64).copy()
         self.max_steps = len(self.v_des) - 2
         self.x_ref_profile = np.cumsum(self.v_des * self.dt)
+        if disturbance_profile is not None:
+            self.disturbance_profile = np.asarray(disturbance_profile, dtype=np.float64).copy()
+        else:
+            self.disturbance_profile = np.zeros_like(self.v_des)
 
     def reset(self):
         self.k = 0
@@ -382,6 +429,7 @@ class PathAgnosticHavaeiEnv:
         self.int_err = 0.0
         self.prev_err = 0.0
         self.u_act = 0.0
+        self.d_hat = 0.0
         self.shift_timer = 0
         self.shift_delta = 0.0
         self.stop_drift = 0.0
@@ -399,6 +447,7 @@ class PathAgnosticHavaeiEnv:
             self.int_err,
             self.prev_err,
             self.u_act,
+            self.d_hat,
             self.shift_timer,
             self.shift_delta,
             self.stop_drift,
@@ -415,6 +464,7 @@ class PathAgnosticHavaeiEnv:
             self.int_err,
             self.prev_err,
             self.u_act,
+            self.d_hat,
             self.shift_timer,
             self.shift_delta,
             self.stop_drift,
@@ -575,8 +625,26 @@ class PathAgnosticHavaeiEnv:
         f_grade = self.physics.grade_resistance(x_sample)
         f_curve = self.physics.curve_resistance(x_sample)
 
-        a_nl = (f_prop_nl - f_drag - f_grade - f_curve) / self.physics.M_eff
-        v_nonlinear = float(max(0.0, self.v_real + self.dt * a_nl + inertia_momentum))
+        a_nl_nom = (f_prop_nl - f_drag - f_grade - f_curve) / self.physics.M_eff
+
+        # External unstable wind disturbance (active when moving or throttling)
+        k_idx = min(self.k, len(self.disturbance_profile) - 1)
+        d_ext = float(self.disturbance_profile[k_idx]) if (self.v_real > 1e-3 or u_clamped > 1e-3) else 0.0
+
+        v_nonlinear = float(max(0.0, self.v_real + self.dt * (a_nl_nom + d_ext) + inertia_momentum))
+
+        # Online Moving-Average Disturbance Observer (DOB):
+        # Reconstructs physical wind/resistance mismatch and boosts gain near the safety tube edge
+        if self.v_real > 1e-3 or v_nonlinear > 1e-3:
+            a_meas = ((v_nonlinear - self.v_real) - inertia_momentum) / self.dt
+            d_raw = a_meas - a_nl_nom
+            v_target_now = float(self.v_des[min(self.k, self.max_steps)])
+            near_edge = abs(v_target_now - v_nonlinear) > 0.045
+            beta_obs = 0.60 if near_edge else 0.35
+            self.d_hat = float((1.0 - beta_obs) * self.d_hat + beta_obs * d_raw)
+        else:
+            self.d_hat = 0.0
+
         return v_nonlinear, v_linear
 
     def _finalize_step(
@@ -741,7 +809,10 @@ class PathAgnosticHavaeiEnv:
             next_v, v_lin, u_cmd, alg_name, np.zeros(4, dtype=np.float64), gains_norm, k_curr, x_sample, ext_f_norm
         )
 
-    def step_mpc(self, u_mpc: float, shield_diff: float = 0.0):
+    def step_mpc(self, u_mpc: float, shield_diff: float = 0.0, apply_shield: bool = True):
+        if apply_shield and self.shield is not None:
+            u_mpc, shield_diff = self.shield.filter_mpc_command(self, u_mpc)
+
         self.k += 1
         k_curr = min(self.k, self.max_steps)
         x_sample = k_curr * self.d
@@ -790,6 +861,7 @@ class PathAgnosticHavaeiEnv:
             slope_iota=slope_iota,
             dt_step=self.dt,
             u_act_prev=self.u_act,
+            disturbance_accel=self.d_hat,
         )
         self.internal_mpc.prev_u = float(u_mpc_cand)
 
@@ -808,7 +880,7 @@ class PathAgnosticHavaeiEnv:
 
         w_mpc = float(w5[4])
         if w_mpc >= 0.999 or (act_idx == 4 and w_mpc >= 0.50):
-            return self.step_mpc(u_mpc_cand, shield_diff=shield_diff)
+            return self.step_mpc(u_mpc_cand, shield_diff=shield_diff, apply_shield=False)
         elif w_mpc <= 0.02:
             w4 = w5[:4] / (np.sum(w5[:4]) + 1e-12)
             saved_shield = self.shield
@@ -1237,12 +1309,24 @@ def train_rl_switch_strict_two_ways(
     optimizer = optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=lr * 0.10)
 
+    # Initial trajectory: 1 clean version + 1 wind-disturbed version
+    env.set_trajectory(current_v_des, disturbance_profile=None)
     obs_np, q_costs_np = _compute_surrogate_horizon_q_costs(env, n_algs=n_algs, rollout_horizon=6)
-    obs_pool = [torch.as_tensor(obs_np, dtype=torch.float32)]
-    q_costs_pool = [torch.as_tensor(q_costs_np, dtype=torch.float32)]
+    d_prof_init = generate_wind_disturbance_profile(len(current_v_des) - 2, seed=seed + 777)
+    env.set_trajectory(current_v_des, disturbance_profile=d_prof_init)
+    obs_dist, q_costs_dist = _compute_surrogate_horizon_q_costs(env, n_algs=n_algs, rollout_horizon=6)
 
-    obs_b = obs_pool[0]
-    q_costs_b = q_costs_pool[0]
+    obs_pool = [
+        torch.as_tensor(obs_np, dtype=torch.float32),
+        torch.as_tensor(obs_dist, dtype=torch.float32),
+    ]
+    q_costs_pool = [
+        torch.as_tensor(q_costs_np, dtype=torch.float32),
+        torch.as_tensor(q_costs_dist, dtype=torch.float32),
+    ]
+
+    obs_b = torch.cat(obs_pool, dim=0)
+    q_costs_b = torch.cat(q_costs_pool, dim=0)
 
     history = []
     best_regret = float("inf")
@@ -1260,10 +1344,17 @@ def train_rl_switch_strict_two_ways(
                     verbose=False,
                 )
                 env.learned_model = emulator_model
-            env.set_trajectory(current_v_des)
+            # Add both clean version and unstable wind-disturbed version of the new trajectory
+            env.set_trajectory(current_v_des, disturbance_profile=None)
             obs_np, q_costs_np = _compute_surrogate_horizon_q_costs(env, n_algs=n_algs, rollout_horizon=6)
             obs_pool.append(torch.as_tensor(obs_np, dtype=torch.float32))
             q_costs_pool.append(torch.as_tensor(q_costs_np, dtype=torch.float32))
+
+            d_prof_batch = generate_wind_disturbance_profile(len(current_v_des) - 2, seed=seed * 1000 + batch_idx + 777)
+            env.set_trajectory(current_v_des, disturbance_profile=d_prof_batch)
+            obs_dist, q_costs_dist = _compute_surrogate_horizon_q_costs(env, n_algs=n_algs, rollout_horizon=6)
+            obs_pool.append(torch.as_tensor(obs_dist, dtype=torch.float32))
+            q_costs_pool.append(torch.as_tensor(q_costs_dist, dtype=torch.float32))
 
             obs_b = torch.cat(obs_pool, dim=0)
             q_costs_b = torch.cat(q_costs_pool, dim=0)

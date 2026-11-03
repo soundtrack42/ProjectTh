@@ -225,6 +225,7 @@ def run_controller_benchmark(
     shield: SafetyFilterShield | None = None,
     lookahead_n: int = 60,
     record_traj: bool = False,
+    disturbance_profile: np.ndarray | None = None,
 ) -> dict:
     env = PathAgnosticHavaeiEnv(
         v_des_profile=v_des,
@@ -232,8 +233,11 @@ def run_controller_benchmark(
         learned_linear_model=hrl.LAST_TRAINED_EMULATOR,
         lookahead_n=lookahead_n,
         shield=shield,
+        disturbance_profile=disturbance_profile,
     )
     obs = env.reset()
+    if shield is not None:
+        shield._get_or_build_emulated_trajectory(env)
     done = False
 
     hc = HardcodedSwitchController(use_transient_chain=True)
@@ -253,19 +257,23 @@ def run_controller_benchmark(
         if controller_type == "MPC":
             assert mpc_ctrl is not None
             k_curr = env.k
-            x_sample = (k_curr + 1) * env.d
+            x_sample = min(k_curr + 1, env.max_steps) * env.d
             ref_h = env.v_des[k_curr + 1 : min(k_curr + 1 + mpc_ctrl.n_p, len(env.v_des))]
-            slope_iota = env.physics.grade_resistance(x_sample) / (env.physics.M * env.physics.g)
-            curve_iota = env.physics.curve_resistance(x_sample) / (env.physics.M * env.physics.g)
+            slope_iota = (env.physics.grade_resistance(x_sample) + env.physics.curve_resistance(x_sample)) / (env.physics.M * env.physics.g)
+            mpc_ctrl.prev_v = float(env.v_prev)
             u_opt = mpc_ctrl.select_action(
                 env.v_real,
                 ref_h,
-                slope_iota=slope_iota + curve_iota,
+                slope_iota=slope_iota,
                 dt_step=env.dt,
                 u_act_prev=env.u_act,
+                disturbance_accel=env.d_hat,
             )
+            shield_diff = 0.0
+            if shield is not None:
+                u_opt, shield_diff = shield.filter_mpc_command(env, u_opt)
             t1 = time.perf_counter()
-            obs, _, term, trunc, info = env.step_mpc(u_opt)
+            obs, _, term, trunc, info = env.step_mpc(u_opt, shield_diff=shield_diff, apply_shield=False)
 
         elif controller_type in ("FUZZY_STD", "FUZZY_ILR_PSO"):
             if fuzzy_ctrl is None:
@@ -430,7 +438,7 @@ def main():
         max_traction_accel=args.max_accel, max_braking_decel=args.max_decel
     )
     mpc_idea_c = PureLiuMPC(
-        n_p=10, n_c=5, q1=160.0, q2=0.05, q3=0.35, adaptive_shift=True,
+        n_p=5, n_c=3, q1=160.0, q2=0.05, q3=0.35, adaptive_shift=True,
         max_traction_accel=args.max_accel, max_braking_decel=args.max_decel
     )
 
@@ -454,6 +462,9 @@ def main():
         ("Shielded Hybrid RL-MPC (Switch MPS)", "RL_HYBRID", rl_hybrid, None, None, shield_switch),
         ("Shielded Hybrid RL-MPC (1-Step DCBF)", "RL_HYBRID", rl_hybrid, None, None, shield_dcbf),
         ("Shielded Hybrid RL-MPC (DMPS Rollout)", "RL_HYBRID", rl_hybrid, None, None, shield_dmps),
+        ("Shielded Adaptive MPC (Switch MPS)", "MPC", None, mpc_idea_c, None, shield_switch),
+        ("Shielded Adaptive MPC (1-Step DCBF)", "MPC", None, mpc_idea_c, None, shield_dcbf),
+        ("Shielded Adaptive MPC (DMPS Rollout)", "MPC", None, mpc_idea_c, None, shield_dmps),
     ])
 
     agg = {name: [] for name, _, _, _, _, _ in eval_specs}
@@ -468,6 +479,17 @@ def main():
             max_decel=args.max_decel,
             seed=80000 + ep,
         )
+
+        # Seeded random generator per episode: 50% chance to inject an unstable disturbance
+        ep_rng = np.random.default_rng(90000 + ep)
+        if ep_rng.random() < 0.50:
+            d_rand = hrl.generate_wind_disturbance_profile(
+                total_horizon=args.horizon,
+                seed=90000 + ep,
+            )
+        else:
+            d_rand = None
+
         if ep == 0:
             sample_schedule = sched_rand
         for name, ctype, pol, m_ctrl, f_ctrl, sh_ctrl in eval_specs:
@@ -481,6 +503,7 @@ def main():
                 shield=sh_ctrl,
                 lookahead_n=args.lookahead_n,
                 record_traj=(ep == 0),
+                disturbance_profile=d_rand,
             )
             agg[name].append(res)
             if ep == 0:
@@ -534,11 +557,10 @@ def main():
     # ---------------- Save 6-Panel Plot ----------------
     fig, axes = plt.subplots(2, 3, figsize=(18, 9.5))
     plot_methods = [
+        "Pure MPC (Standard Fixed Q3)",
         "Adaptive MPC (Idea B: Shift-Q3)",
-        "RL-Switch Way 2 (Unshielded)",
-        "Shielded RL-Switch (DMPS Rollout)",
+        "Shielded Adaptive MPC (DMPS Rollout)",
         "Hybrid RL-IPID-MPC (Unshielded)",
-        "Shielded Hybrid RL-MPC (1-Step DCBF)",
         "Shielded Hybrid RL-MPC (DMPS Rollout)",
     ]
     k_grid = sample_trajs[plot_methods[0]]["k"]
@@ -571,8 +593,8 @@ def main():
     axes[0, 1].grid(True, alpha=0.3)
 
     shift_seg = next((s for s in sample_schedule if s["mode"] in (2, 5)), sample_schedule[1])
-    z0 = max(0, shift_seg["start"] - 4)
-    z1 = min(len(k_grid), shift_seg["start"] + 16)
+    z0 = max(0, 530)
+    z1 = min(len(k_grid), 570)
     sl = slice(z0, z1)
     axes[0, 2].fill_between(
         k_grid[sl], band_info["v_min"][sl], band_info["v_max"][sl],
@@ -606,14 +628,23 @@ def main():
         "IdeaB MPC",
         "IPID",
         "RL W2",
-        "W2+DCBF",
-        "W2+DMPS",
         "Hyb RL",
-        "Hyb+Sw",
-        "Hyb+DCBF",
         "Hyb+DMPS",
+        "MPC+Sw",
+        "MPC+DCBF",
+        "MPC+DMPS",
     ]
-    bar_keys = [spec[0] for spec in eval_specs[-10:]]
+    bar_keys = [
+        "Pure MPC (Standard Fixed Q3)",
+        "Adaptive MPC (Idea B: Shift-Q3)",
+        "Hardcoded-Switch IPID (Havaei)",
+        "RL-Switch Way 2 (Unshielded)",
+        "Hybrid RL-IPID-MPC (Unshielded)",
+        "Shielded Hybrid RL-MPC (DMPS Rollout)",
+        "Shielded Adaptive MPC (Switch MPS)",
+        "Shielded Adaptive MPC (1-Step DCBF)",
+        "Shielded Adaptive MPC (DMPS Rollout)",
+    ]
     scores_bar = [float(np.mean([r["Paper_Score"] for r in agg[k]])) for k in bar_keys]
     axes[1, 1].bar(
         names_bar,
@@ -653,8 +684,8 @@ def main():
     zoom_plot_path = args.plot.replace(".png", "_shielded_zoom.png")
     fig_z, axes_z = plt.subplots(2, 2, figsize=(16, 10))
     shielded_3 = [
-        ("Shielded Hybrid RL-MPC (Switch MPS)", "royalblue", "--"),
-        ("Shielded Hybrid RL-MPC (1-Step DCBF)", "purple", "-."),
+        ("Adaptive MPC (Idea B: Shift-Q3)", "darkorange", "--"),
+        ("Shielded Adaptive MPC (DMPS Rollout)", "royalblue", "-."),
         ("Shielded Hybrid RL-MPC (DMPS Rollout)", "crimson", "-"),
     ]
 

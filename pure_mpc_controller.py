@@ -19,8 +19,8 @@ import numpy as np
 class PureLiuMPC:
     def __init__(
         self,
-        n_p: int = 10,
-        n_c: int = 5,
+        n_p: int = 5,           # 0.28^5 is 0.0017, so 5-step horizon is sufficient for actuator lag decay
+        n_c: int = 3,
         q1: float = 160.0,
         q2: float = 0.05,
         q3: float = 0.35,
@@ -207,6 +207,7 @@ class PureLiuMPC:
         slope_iota: float = 0.0,
         dt_step: float | None = None,
         u_act_prev: float | None = None,
+        disturbance_accel: float = 0.0,
     ) -> float:
         ref = np.asarray(v_ref_horizon, dtype=np.float64).flatten()
         if len(ref) == 0:
@@ -225,24 +226,27 @@ class PureLiuMPC:
 
         X_ref = ref.reshape(self.n_p, 1).copy()
         dv_01 = float(ref[min(1, len(ref) - 1)] - ref[0])
+        dv_12 = float(ref[min(2, len(ref) - 1)] - ref[min(1, len(ref) - 1)])
 
         if self.adaptive_shift:
-         # Only guard flat plateaus at speed (v_curr > 0.5); allow 2-step pre-charge from rest!
-            if v_curr > 0.5 and abs(dv_01) < 0.025 and abs(float(ref[0]) - v_curr) < 0.15:
+            # Only guard flat plateaus when ref[2] is ALSO flat (allow 2-step pre-charge for steep shifts!)
+            if v_curr > 0.5 and abs(dv_01) < 0.025 and abs(dv_12) < 0.30 and abs(float(ref[0]) - v_curr) < 0.15:
                 X_ref[2:, 0] = float(ref[1])
 
             z0 = np.array([[float(v_curr)], [u_act_curr]], dtype=np.float64)
             A, B, r_k = self.linearize_step(v_curr, u_act_curr, slope_iota=slope_iota, dv_prev=dv_curr)
+            # Inject moving-average estimated external disturbance (wind/adhesion) into MPC affine offset
+            r_k += self.dt * float(disturbance_accel)
             F, Phi, Psi = self.build_augmented_prediction_matrices(A, B)
             E_0 = F @ z0 + Psi * r_k - X_ref
 
             err_0 = abs(float(ref[0]) - float(v_curr))
-            is_shift = err_0 > 0.65 or abs(dv_01) > 0.55
+            is_shift = err_0 > 0.35 or abs(dv_01) > 0.28 or abs(dv_12) > 0.45
             is_stopping_ramp = (float(np.min(ref)) <= 3.5 and dv_01 < -0.02) or (float(ref[0]) <= 3.2)
 
             if is_shift:
-                q1_vec = (self.q1 * 4.5) * self.prox_weights
-                q2_eff, q3_eff = 1e-5, 0.008
+                q1_vec = (self.q1 * 5.5) * self.prox_weights
+                q2_eff, q3_eff = 1e-5, 0.003
             elif is_stopping_ramp:
                 q1_vec = (self.q1 * 5.0) * self.stop_weights
                 q2_eff, q3_eff = 1e-5, 0.015
