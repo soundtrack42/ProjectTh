@@ -267,7 +267,7 @@ def run_controller_benchmark(
                 slope_iota=slope_iota,
                 dt_step=env.dt,
                 u_act_prev=env.u_act,
-                disturbance_accel=env.d_hat,
+                disturbance_accel=0.35 * env.d_hat,
             )
             shield_diff = 0.0
             if shield is not None:
@@ -480,9 +480,10 @@ def main():
             seed=80000 + ep,
         )
 
-        # Seeded random generator per episode: 50% chance to inject an unstable disturbance
+        # Seeded random generator per episode: ep == 0 always gets a storm disturbance for plotting,
+        # and remaining episodes have a 60% chance of heavy storm gusts
         ep_rng = np.random.default_rng(90000 + ep)
-        if ep_rng.random() < 0.50:
+        if ep == 0 or ep_rng.random() < 0.60:
             d_rand = hrl.generate_wind_disturbance_profile(
                 total_horizon=args.horizon,
                 seed=90000 + ep,

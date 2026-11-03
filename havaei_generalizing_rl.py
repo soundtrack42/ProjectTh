@@ -323,40 +323,41 @@ class HardcodedSwitchController:
 
 def generate_wind_disturbance_profile(
     total_horizon: int = 1000,
-    min_burst_steps: int = 20,
-    max_burst_steps: int = 55,
+    min_burst_steps: int = 25,
+    max_burst_steps: int = 60,
     seed: int | None = None,
 ) -> np.ndarray:
     """
-    Generates an unstable wind/external acceleration disturbance profile (m/s^2)
-    with 1-2 gusts lasting >= 15 steps, exhibiting realistic moving-average turbulence.
+    Generates a heavy storm-force wind & rail-adhesion disturbance profile (m/s^2)
+    (~75-90 km/h gusts, 0.55-0.85 m/s^2) that pushes unshielded acceleration/speed
+    to the Scissor bound so safety shielding interventions are clearly visible.
     """
     rng = np.random.default_rng(seed)
     dist = np.zeros(total_horizon + 2, dtype=np.float64)
-    n_bursts = int(rng.integers(1, 3))
+    n_bursts = int(rng.integers(2, 4))
+    seg_len = (total_horizon - 100) // n_bursts
 
     for b_idx in range(n_bursts):
         dur = int(rng.integers(min_burst_steps, max_burst_steps + 1))
-        lo_k = 40 + b_idx * (total_horizon // 2)
-        hi_k = max(lo_k + 1, min(total_horizon - dur - 60, (b_idx + 1) * (total_horizon // 2) - dur))
+        lo_k = 35 + b_idx * seg_len
+        hi_k = max(lo_k + 1, min(total_horizon - dur - 50, lo_k + seg_len - dur))
         start_k = int(rng.integers(lo_k, hi_k + 1))
 
-        # Base headwind (-) or tailwind (+) acceleration in m/s^2
-        sign = -1.0 if rng.random() < 0.65 else 1.0
-        base_mag = sign * float(rng.uniform(0.18, 0.36))
+        # Strong storm headwind (-) or tailwind (+) acceleration in m/s^2
+        sign = -1.0 if (b_idx % 2 == 0) else 1.0
+        base_mag = sign * float(rng.uniform(0.55, 0.85))
 
-        # Unstable turbulent fluctuations (AR(1) / moving-average correlated wind noise)
-        raw_noise = rng.normal(0.0, 0.12, size=dur)
+        # Unstable turbulent wind shear (AR(1) correlated gusts)
+        raw_noise = rng.normal(0.0, 0.22, size=dur)
         turb = np.zeros(dur, dtype=np.float64)
         for i in range(dur):
-            turb[i] = (0.65 * turb[i - 1] + 0.35 * raw_noise[i]) if i > 0 else raw_noise[i]
+            turb[i] = (0.60 * turb[i - 1] + 0.40 * raw_noise[i]) if i > 0 else raw_noise[i]
 
-        # Smooth 4-step attack/decay envelope
         env_win = np.ones(dur, dtype=np.float64)
-        ramp = min(4, dur // 4)
+        ramp = min(3, dur // 5)
         if ramp > 0:
-            env_win[:ramp] = np.linspace(0.2, 1.0, ramp)
-            env_win[-ramp:] = np.linspace(1.0, 0.2, ramp)
+            env_win[:ramp] = np.linspace(0.3, 1.0, ramp)
+            env_win[-ramp:] = np.linspace(1.0, 0.3, ramp)
 
         dist[start_k : start_k + dur] = (base_mag + turb) * env_win
 
@@ -430,6 +431,7 @@ class PathAgnosticHavaeiEnv:
         self.prev_err = 0.0
         self.u_act = 0.0
         self.d_hat = 0.0
+        self.d_raw = 0.0
         self.shift_timer = 0
         self.shift_delta = 0.0
         self.stop_drift = 0.0
@@ -633,16 +635,15 @@ class PathAgnosticHavaeiEnv:
 
         v_nonlinear = float(max(0.0, self.v_real + self.dt * (a_nl_nom + d_ext) + inertia_momentum))
 
-        # Online Moving-Average Disturbance Observer (DOB):
-        # Reconstructs physical wind/resistance mismatch and boosts gain near the safety tube edge
+        # Online Moving-Average Disturbance Observer:
+        # `d_hat` is comfort-filtered (slow); `d_raw` is fast accelerometer mismatch for the emergency Shield
         if self.v_real > 1e-3 or v_nonlinear > 1e-3:
             a_meas = ((v_nonlinear - self.v_real) - inertia_momentum) / self.dt
             d_raw = a_meas - a_nl_nom
-            v_target_now = float(self.v_des[min(self.k, self.max_steps)])
-            near_edge = abs(v_target_now - v_nonlinear) > 0.045
-            beta_obs = 0.60 if near_edge else 0.35
-            self.d_hat = float((1.0 - beta_obs) * self.d_hat + beta_obs * d_raw)
+            self.d_raw = float(0.30 * self.d_raw + 0.70 * d_raw)
+            self.d_hat = float(0.82 * self.d_hat + 0.18 * d_raw)
         else:
+            self.d_raw = 0.0
             self.d_hat = 0.0
 
         return v_nonlinear, v_linear
@@ -861,13 +862,15 @@ class PathAgnosticHavaeiEnv:
             slope_iota=slope_iota,
             dt_step=self.dt,
             u_act_prev=self.u_act,
-            disturbance_accel=self.d_hat,
+            disturbance_accel=0.35 * self.d_hat,
         )
         self.internal_mpc.prev_u = float(u_mpc_cand)
 
         shield_diff = 0.0
         if self.shield is not None:
             action, shield_diff = self.shield.filter_hybrid_weights(self, action, u_mpc_cand)
+            u_mpc_cand, mpc_sh_diff = self.shield.filter_mpc_command(self, u_mpc_cand)
+            shield_diff = max(shield_diff, mpc_sh_diff)
 
         if isinstance(action, (int, np.integer)):
             act_idx = int(action)

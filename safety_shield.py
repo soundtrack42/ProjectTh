@@ -299,9 +299,9 @@ class SafetyFilterShield:
             mu_next = float(max(0.0, v_lin + env.dt * a_nl + inertia_mom))
             sigma_delta = self.cfg.base_sigma_mps
 
-        # Account for online moving-average disturbance estimate when rolling out from current state
+        # Include real-time disturbance measurement when predicting next step online
         if sigma_v_curr == 0.0:
-            d_est = float(getattr(env, "d_hat", 0.0))
+            d_est = float(getattr(env, "d_raw", getattr(env, "d_hat", 0.0)))
             if abs(d_est) > 1e-5:
                 mu_next = float(max(0.0, mu_next + env.dt * d_est))
 
@@ -340,8 +340,9 @@ class SafetyFilterShield:
         )
         v_emu_traj = self._get_or_build_emulated_trajectory(env)
 
-        # Read the persistent disturbance force currently acting on the train
-        d_persistent = float(getattr(env, "d_hat", 0.0))
+        # Read full instantaneous disturbance acting on the train
+        d_persistent = float(getattr(env, "d_raw", getattr(env, "d_hat", 0.0)))
+        sigma_emu_arr = getattr(env, "_cached_sigma_emu", None)
 
         for h in range(horizon):
             k_step = min(k_0 + 1 + h, env.max_steps)
@@ -351,9 +352,10 @@ class SafetyFilterShield:
             v_emu_prev = float(v_emu_traj[max(0, k_step - 1)])
             dv_emu = v_emu_target - v_emu_prev
 
-            half_band = 0.5 * (v_max_s - v_min_s)
-            h_up_curr = max(0.0, (v_emu_prev + half_band) - mu_v)
-            h_lo_curr = max(0.0, mu_v - max(0.0, v_emu_prev - half_band))
+            # Yellow 99th-Percentile Scissor Bounds around v_emu_target
+            r99_k = self.cfg.z_sigma * float(sigma_emu_arr[k_step]) if sigma_emu_arr is not None else 0.05
+            scis_lo = max(0.0, v_emu_target - r99_k)
+            scis_hi = v_emu_target + r99_k
 
             err_h = v_emu_target - mu_v
             int_err = float(np.clip(int_err + err_h * env.dt, -3.5, 3.5))
@@ -364,9 +366,8 @@ class SafetyFilterShield:
                 ref_rate_h = dv_emu / env.dt
                 vel_rate_h = (mu_v - v_prev) / env.dt
                 rate_err_h = vel_rate_h - ref_rate_h
-                # Counteract persistent drag force across the lookahead horizon
                 u_feedforward = (ref_rate_h - d_persistent) / (
-                    env.physics.max_braking_decel if ref_rate_h < 0.0 else env.physics.max_traction_accel
+                    env.physics.max_braking_decel if (ref_rate_h - d_persistent) < 0.0 else env.physics.max_traction_accel
                 )
                 u_mpc_h = np.clip(u_feedforward + 1.60 * err_h - 0.35 * rate_err_h, -1.0, 1.0)
                 w_m = float(w_candidate[4]) if len(w_candidate) == 5 else 0.0
@@ -385,25 +386,10 @@ class SafetyFilterShield:
             dv_next = mu_next - mu_v
             a_hat = dv_next / env.dt
 
-            # True containment margins
-            dist_to_vmax = v_max_s - (mu_next + z * sigma_v)
-            dist_to_vmin = (mu_next - z * sigma_v) - v_min_s
-
-            # Only apply barrier decay penalty if the state is in the outer 30% of the tube
-            half_width = 0.5 * (v_max_s - v_min_s)
-            cbf_thresh = 0.30 * half_width
-
-            if dist_to_vmax < cbf_thresh:
-                vel_up_slack = dist_to_vmax - (1.0 - self.cfg.cbf_alpha) * h_up_curr
-            else:
-                vel_up_slack = dist_to_vmax
-
-            if dist_to_vmin < cbf_thresh:
-                vel_lo_slack = dist_to_vmin - (1.0 - self.cfg.cbf_alpha) * h_lo_curr
-            else:
-                vel_lo_slack = dist_to_vmin
-
-            step_margin = min(vel_up_slack, vel_lo_slack)
+            # Trigger shield intervention when trajectory approaches the Yellow Scissor Bound!
+            dist_to_scis_hi = scis_hi - (mu_next + 0.35 * z * sigma_v)
+            dist_to_scis_lo = (mu_next - 0.35 * z * sigma_v) - scis_lo
+            step_margin = min(dist_to_scis_hi, dist_to_scis_lo)
 
             if h == 0:
                 min_safety_margin = step_margin
@@ -480,12 +466,36 @@ class SafetyFilterShield:
         w = np.asarray(action, dtype=np.float64).copy()
         return w / (np.sum(w) + 1e-12)
 
+    def _compute_full_physics_backup_u(self, env, k_next: int) -> float:
+        """Computes exact tube-centering command u_fb compensating Davis drag, slope, and storm gust d_raw."""
+        v_emu_traj = self._get_or_build_emulated_trajectory(env)
+        v_emu_next = float(v_emu_traj[k_next])
+        v_curr = float(env.v_real)
+        d_full = float(getattr(env, "d_raw", getattr(env, "d_hat", 0.0)))
+        inertia_mom = 0.14 * (v_curr - float(env.v_prev))
+
+        # Target physical acceleration needed to land directly on v_emu_next
+        a_target = ((v_emu_next - v_curr - inertia_mom) / env.dt) - d_full
+        x_s = k_next * env.d
+        f_resist = (
+            env.physics.basic_resistance(v_curr)
+            + env.physics.grade_resistance(x_s)
+            + env.physics.curve_resistance(x_s)
+        )
+        a_resist = f_resist / env.physics.M_eff
+        a_motor_req = a_target + a_resist
+
+        f_max = env.physics.max_propulsion_force(v_curr, 1.0 if a_motor_req >= 0.0 else -1.0)
+        scale_a = f_max / env.physics.M_eff
+        u_act_req = a_motor_req / max(1e-4, scale_a)
+        return float(np.clip((u_act_req - 0.28 * float(env.u_act)) / 0.72, -1.0, 1.0))
+
     def filter_mpc_command(
         self, env, u_mpc_candidate: float
     ) -> tuple[float, float]:
         """
         Direct safety shield over standalone MPC command u_mpc_candidate in [-1, 1].
-        Preserves true Switch, 1-Step DCBF, and DMPS Rollout architectures.
+        Triggers when heavy gusts push predicted speed outside the Yellow Scissor Band.
         """
         self.total_steps += 1
         u_task = float(np.clip(u_mpc_candidate, -1.0, 1.0))
@@ -497,29 +507,35 @@ class SafetyFilterShield:
             self.last_intervention_mag = 0.0
             return 0.0, 0.0
 
-        v_min_s, v_max_s, _, _, regime = self.compute_pincer_bounds(env, k_next)
+        _, _, _, _, regime = self.compute_pincer_bounds(env, k_next)
         self.bleed_positive_integral_windup(env, regime)
 
-        # 1. Fast 1-step barrier check under current command (avoids double pincer_bounds call)
+        v_emu_traj = self._get_or_build_emulated_trajectory(env)
+        v_emu_next = float(v_emu_traj[k_next])
+        sigma_emu_arr = getattr(env, "_cached_sigma_emu", None)
+        r99_k = self.cfg.z_sigma * float(sigma_emu_arr[k_next]) if sigma_emu_arr is not None else 0.05
+        scis_lo = max(0.0, v_emu_next - r99_k)
+        scis_hi = v_emu_next + r99_k
+
+        # 1. Fast 1-step check against the Yellow Scissor Bound
         ones_gains = np.ones(3, dtype=np.float64) * env.gains_scale
         mu_next, _, sigma_v = self._predict_step_with_uncertainty(
             env, u_task, float(env.v_real), float(env.v_prev),
             float(env.u_act), 0.0, k_next, ones_gains
         )
         z = self.cfg.z_sigma
-        if (v_max_s - (mu_next + z * sigma_v)) >= 0.0 and ((mu_next - z * sigma_v) - v_min_s) >= 0.0:
+        if (scis_hi - (mu_next + 0.35 * z * sigma_v)) >= 0.0 and ((mu_next - 0.35 * z * sigma_v) - scis_lo) >= 0.0:
             self.last_intervention_mag = 0.0
             return u_task, 0.0
 
-        # 2. Genuine breach predicted: compute physical tube-centering backup command u_fb
+        # 2. Scissor bound breached by gust: compute full physics + disturbance backup command u_fb
         self.total_interventions += 1
-        v_emu_traj = self._get_or_build_emulated_trajectory(env)
-        v_emu_next = float(v_emu_traj[k_next])
-        d_est = float(getattr(env, "d_hat", 0.0))
+        u_fb = self._compute_full_physics_backup_u(env, k_next)
 
-        a_req = (v_emu_next - float(env.v_real)) / env.dt - d_est
-        scale_a = env.physics.max_traction_accel if a_req >= 0.0 else env.physics.max_braking_decel
-        u_fb = float(np.clip((a_req / (0.72 * scale_a)) - (0.28 / 0.72) * float(env.u_act), -1.0, 1.0))
+        if self.cfg.mode == "switch":
+            diff = abs(u_fb - u_task)
+            self.last_intervention_mag = diff
+            return u_fb, diff
 
         w5_pure_mpc = np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float64)
 
@@ -529,12 +545,6 @@ class SafetyFilterShield:
                 env, u_c, ones_gains, w5_pure_mpc, w5_pure_mpc,
                 horizon_override=hor, u_mpc_step0=u_c
             )
-
-        # 3. Architecture-Specific Interventions:
-        if self.cfg.mode == "switch":
-            diff = abs(u_fb - u_task)
-            self.last_intervention_mag = diff
-            return u_fb, diff
 
         if self.cfg.mode == "cbf_opt":
             lo, hi = 0.0, 1.0
@@ -550,10 +560,9 @@ class SafetyFilterShield:
             self.last_intervention_mag = diff
             return u_safe, diff
 
-        # mode == "mps_rollout": Multi-step DMPS candidate planning over recovery horizon N=2
         best_u, best_ret = u_fb, -float("inf")
         best_safe_u, best_safe_ret = None, -float("inf")
-        for lam in (0.33, 0.67, 1.0):
+        for lam in (0.35, 0.70, 1.0):
             u_cand = float(np.clip((1.0 - lam) * u_task + lam * u_fb, -1.0, 1.0))
             m_c, ret_c = eval_u(u_cand, self.cfg.recovery_horizon_n)
             if m_c >= 0.0 and ret_c > best_safe_ret:

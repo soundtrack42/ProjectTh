@@ -226,22 +226,30 @@ class PureLiuMPC:
 
         X_ref = ref.reshape(self.n_p, 1).copy()
         dv_01 = float(ref[min(1, len(ref) - 1)] - ref[0])
-        dv_12 = float(ref[min(2, len(ref) - 1)] - ref[min(1, len(ref) - 1)])
 
         if self.adaptive_shift:
-            # Only guard flat plateaus when ref[2] is ALSO flat (allow 2-step pre-charge for steep shifts!)
-            if v_curr > 0.5 and abs(dv_01) < 0.025 and abs(dv_12) < 0.30 and abs(float(ref[0]) - v_curr) < 0.15:
+            # 1. Standstill guard: never creep before the scheduled departure step!
+            if float(ref[0]) <= 1e-3 and v_curr <= 1e-3:
+                self.prev_u = 0.0
+                self.u_act = 0.28 * u_act_curr
+                return 0.0
+
+            # 2. Strict causal plateau guard: if step k+1 (ref[0]) is still flat,
+            # clamp lookahead so MPC never anticipates an upcoming shift 1 step early!
+            if abs(float(ref[0]) - v_curr) < 0.025 and abs(dv_01) > 0.025:
+                X_ref[1:, 0] = float(ref[0])
+            elif abs(dv_01) < 0.025 and abs(float(ref[0]) - v_curr) < 0.15:
                 X_ref[2:, 0] = float(ref[1])
 
             z0 = np.array([[float(v_curr)], [u_act_curr]], dtype=np.float64)
             A, B, r_k = self.linearize_step(v_curr, u_act_curr, slope_iota=slope_iota, dv_prev=dv_curr)
-            # Inject moving-average estimated external disturbance (wind/adhesion) into MPC affine offset
+            # Inject moving-average estimated external disturbance into MPC affine offset
             r_k += self.dt * float(disturbance_accel)
             F, Phi, Psi = self.build_augmented_prediction_matrices(A, B)
             E_0 = F @ z0 + Psi * r_k - X_ref
 
             err_0 = abs(float(ref[0]) - float(v_curr))
-            is_shift = err_0 > 0.35 or abs(dv_01) > 0.28 or abs(dv_12) > 0.45
+            is_shift = err_0 > 0.35 or abs(dv_01) > 0.28
             is_stopping_ramp = (float(np.min(ref)) <= 3.5 and dv_01 < -0.02) or (float(ref[0]) <= 3.2)
 
             if is_shift:
