@@ -636,12 +636,16 @@ class PathAgnosticHavaeiEnv:
         v_nonlinear = float(max(0.0, self.v_real + self.dt * (a_nl_nom + d_ext) + inertia_momentum))
 
         # Online Moving-Average Disturbance Observer:
-        # `d_hat` is comfort-filtered (slow); `d_raw` is fast accelerometer mismatch for the emergency Shield
+        # Flush immediately when the gust ends (|d_step| < 0.02) so no post-disturbance tail remains!
         if self.v_real > 1e-3 or v_nonlinear > 1e-3:
             a_meas = ((v_nonlinear - self.v_real) - inertia_momentum) / self.dt
-            d_raw = a_meas - a_nl_nom
-            self.d_raw = float(0.30 * self.d_raw + 0.70 * d_raw)
-            self.d_hat = float(0.82 * self.d_hat + 0.18 * d_raw)
+            d_step = a_meas - a_nl_nom
+            if abs(d_step) < 0.02:
+                self.d_raw = 0.0
+                self.d_hat *= 0.20
+            else:
+                self.d_raw = float(0.25 * self.d_raw + 0.75 * d_step)
+                self.d_hat = float(0.80 * self.d_hat + 0.20 * d_step)
         else:
             self.d_raw = 0.0
             self.d_hat = 0.0
@@ -716,6 +720,9 @@ class PathAgnosticHavaeiEnv:
         if terminated:
             reward -= 250.0 * self.stop_drift + 180.0 * self.v_real
 
+        k_dist = min(k_curr, len(self.disturbance_profile) - 1)
+        wind_now = float(self.disturbance_profile[k_dist]) if self.v_real > 1e-3 else 0.0
+
         info = {
             "k": k_curr,
             "x_pos": x_sample,
@@ -737,6 +744,8 @@ class PathAgnosticHavaeiEnv:
             "stopping_error": self.stop_drift,
             "shield_intervened": shield_diff > 1e-5,
             "shield_diff": shield_diff,
+            "wind_accel": wind_now,
+            "wind_hat": float(self.d_hat),
         }
         return self.get_observation(), float(reward), terminated, False, info
 
@@ -866,12 +875,9 @@ class PathAgnosticHavaeiEnv:
         )
         self.internal_mpc.prev_u = float(u_mpc_cand)
 
-        shield_diff = 0.0
-        if self.shield is not None:
-            action, shield_diff = self.shield.filter_hybrid_weights(self, action, u_mpc_cand)
-            u_mpc_cand, mpc_sh_diff = self.shield.filter_mpc_command(self, u_mpc_cand)
-            shield_diff = max(shield_diff, mpc_sh_diff)
-
+        # -------------------------------------------------------------------
+        # 1. Action Normalization & Single-Pass Shielding
+        # -------------------------------------------------------------------
         if isinstance(action, (int, np.integer)):
             act_idx = int(action)
             w5 = np.zeros(5, dtype=np.float64)
@@ -882,19 +888,46 @@ class PathAgnosticHavaeiEnv:
             act_idx = int(np.argmax(w5))
 
         w_mpc = float(w5[4])
+        shield_diff = 0.0
+
+        if self.shield is not None:
+            # If MPC dominates, filter the scalar control directly
+            if w_mpc >= 0.999 or (act_idx == 4 and w_mpc >= 0.50):
+                u_mpc_cand, shield_diff = self.shield.filter_mpc_command(self, u_mpc_cand)
+            # Otherwise, filter the 5D simplex allocation
+            else:
+                action, shield_diff = self.shield.filter_hybrid_weights(self, action, u_mpc_cand)
+                w5 = self.shield._to_simplex_weights(action, n_actions=5)
+                act_idx = int(np.argmax(w5))
+                w_mpc = float(w5[4])
+
+        # -------------------------------------------------------------------
+        # 2. Branch A: Pure / Dominant MPC Route
+        # -------------------------------------------------------------------
         if w_mpc >= 0.999 or (act_idx == 4 and w_mpc >= 0.50):
+            # Pass apply_shield=False because the command was already shielded above
             return self.step_mpc(u_mpc_cand, shield_diff=shield_diff, apply_shield=False)
+
+        # -------------------------------------------------------------------
+        # 3. Branch B: Pure PID Route (MPC weight effectively zero)
+        # -------------------------------------------------------------------
         elif w_mpc <= 0.02:
             w4 = w5[:4] / (np.sum(w5[:4]) + 1e-12)
+            # Temporarily unhook self.shield to avoid double-filtering inside self.step()
             saved_shield = self.shield
             self.shield = None
             obs, rew, term, trunc, info = self.step(w4)
             self.shield = saved_shield
+
             if self.shield is not None and shield_diff > 0.0:
                 rew -= self.shield.cfg.intervention_penalty_weight * shield_diff
                 info["shield_intervened"] = True
                 info["shield_diff"] = shield_diff
             return obs, rew, term, trunc, info
+
+        # -------------------------------------------------------------------
+        # 4. Branch C: Soft Blended Route (MPC + PID Combination)
+        # -------------------------------------------------------------------
         else:
             w4 = w5[:4] / (np.sum(w5[:4]) + 1e-12)
             _, _, pid_gains = self._alg_weights_from_action(w4)
@@ -909,14 +942,25 @@ class PathAgnosticHavaeiEnv:
                 self.physics.grade_resistance(x_sample) + self.physics.curve_resistance(x_sample)
             ) / (0.03 * self.physics.M * self.physics.g)
 
+            # Compute PID output and blend with the MPC candidate command
             u_pid = self._compute_pid_command(pid_gains, v_target, dv_target, update_state=True)
             u_blend = float(np.clip(w_mpc * u_mpc_cand + (1.0 - w_mpc) * u_pid, -1.0, 1.0))
 
             gains_norm = pid_gains / self.gains_scale
             next_v, v_lin = self._predict_next_velocity(old_v, u_blend, x_sample, ext_f_norm, gains_norm)
             alg_name = HYBRID_ALGORITHMS[act_idx]
+
             return self._finalize_step(
-                next_v, v_lin, u_blend, alg_name, w4, gains_norm, k_curr, x_sample, ext_f_norm, shield_diff=shield_diff
+                next_v,
+                v_lin,
+                u_blend,
+                alg_name,
+                w4,
+                gains_norm,
+                k_curr,
+                x_sample,
+                ext_f_norm,
+                shield_diff=shield_diff,
             )
 
 

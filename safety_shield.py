@@ -386,10 +386,17 @@ class SafetyFilterShield:
             dv_next = mu_next - mu_v
             a_hat = dv_next / env.dt
 
-            # Trigger shield intervention when trajectory approaches the Yellow Scissor Bound!
-            dist_to_scis_hi = scis_hi - (mu_next + 0.35 * z * sigma_v)
-            dist_to_scis_lo = (mu_next - 0.35 * z * sigma_v) - scis_lo
-            step_margin = min(dist_to_scis_hi, dist_to_scis_lo)
+            # Guard Yellow Scissor Bound during active wind gusts; guard Green Safe Envelope when calm
+            if abs(d_persistent) > 0.05:
+                hi_bound, lo_bound = scis_hi, scis_lo
+                sig_mult = 0.35
+            else:
+                hi_bound, lo_bound = v_max_s, v_min_s
+                sig_mult = 1.0
+
+            dist_to_hi = hi_bound - (mu_next + sig_mult * z * sigma_v)
+            dist_to_lo = (mu_next - sig_mult * z * sigma_v) - lo_bound
+            step_margin = min(dist_to_hi, dist_to_lo)
 
             if h == 0:
                 min_safety_margin = step_margin
@@ -507,7 +514,7 @@ class SafetyFilterShield:
             self.last_intervention_mag = 0.0
             return 0.0, 0.0
 
-        _, _, _, _, regime = self.compute_pincer_bounds(env, k_next)
+        v_min_s, v_max_s, _, _, regime = self.compute_pincer_bounds(env, k_next)
         self.bleed_positive_integral_windup(env, regime)
 
         v_emu_traj = self._get_or_build_emulated_trajectory(env)
@@ -517,14 +524,24 @@ class SafetyFilterShield:
         scis_lo = max(0.0, v_emu_next - r99_k)
         scis_hi = v_emu_next + r99_k
 
-        # 1. Fast 1-step check against the Yellow Scissor Bound
+        # Active disturbance indicator: tighten to Yellow Scissor Band during gusts,
+        # and relax to Green Safe Envelope as soon as the gust ends!
+        d_now = float(getattr(env, "d_raw", 0.0))
+        if abs(d_now) > 0.05:
+            hi_bound, lo_bound = scis_hi, scis_lo
+            sig_mult = 0.35
+        else:
+            hi_bound, lo_bound = v_max_s, v_min_s
+            sig_mult = 1.0
+
+        # 1. Fast 1-step barrier check
         ones_gains = np.ones(3, dtype=np.float64) * env.gains_scale
         mu_next, _, sigma_v = self._predict_step_with_uncertainty(
             env, u_task, float(env.v_real), float(env.v_prev),
             float(env.u_act), 0.0, k_next, ones_gains
         )
         z = self.cfg.z_sigma
-        if (scis_hi - (mu_next + 0.35 * z * sigma_v)) >= 0.0 and ((mu_next - 0.35 * z * sigma_v) - scis_lo) >= 0.0:
+        if (hi_bound - (mu_next + sig_mult * z * sigma_v)) >= 0.0 and ((mu_next - sig_mult * z * sigma_v) - lo_bound) >= 0.0:
             self.last_intervention_mag = 0.0
             return u_task, 0.0
 

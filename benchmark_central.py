@@ -248,7 +248,7 @@ def run_controller_benchmark(
         fuzzy_ctrl.reset()
 
     k_log, v_log, v_des_log, err_log, os_log, shift_err_log, brake_err_log, alg_log = [], [], [], [], [], [], [], []
-    int_log = []
+    int_log, wind_log, wind_hat_log = [], [], []
     step_latencies_us = []
 
     while not done:
@@ -320,12 +320,15 @@ def run_controller_benchmark(
         if info.get("braking_active", False):
             brake_err_log.append(info["abs_err"])
 
+        alg_log.append(info["alg"])
+
         if record_traj:
             k_log.append(info["k"])
             v_log.append(info["v_real"])
             v_des_log.append(info["v_des"])
-            alg_log.append(info["alg"])
             int_log.append(bool(info.get("shield_intervened", False)))
+            wind_log.append(float(info.get("wind_accel", 0.0)))
+            wind_hat_log.append(float(info.get("wind_hat", 0.0)))
 
     err_arr = np.array(err_log)
     os_arr = np.array(os_log)
@@ -343,6 +346,7 @@ def run_controller_benchmark(
     passes_realtime = (ep_infer_ms <= MAX_ACCEPTABLE_EPISODE_MS) and (mean_step_us <= MAX_ACCEPTABLE_STEP_US)
 
     int_rate = (100.0 * shield.total_interventions / max(1, shield.total_steps)) if shield is not None else 0.0
+    alg_counts = {a: int(alg_log.count(a)) for a in HYBRID_ALGORITHMS}
     res = {
         "Method": method_name,
         "Mean_Err": mean_err,
@@ -355,6 +359,9 @@ def run_controller_benchmark(
         "Infer_Mean_us": mean_step_us,
         "Episode_Infer_ms": ep_infer_ms,
         "Passes_Benchmark": "PASS" if passes_realtime else "FAIL",
+        "alg_counts": alg_counts,
+        "total_steps": len(alg_log),
+        "is_disturbed": (disturbance_profile is not None),
     }
     if record_traj:
         res["traj"] = {
@@ -364,6 +371,8 @@ def run_controller_benchmark(
             "err": err_arr,
             "alg": alg_log,
             "shield_intervened": np.array(int_log, dtype=bool),
+            "wind": np.array(wind_log, dtype=np.float64),
+            "wind_hat": np.array(wind_hat_log, dtype=np.float64),
         }
     return res
 
@@ -555,6 +564,24 @@ def main():
         learned_policy=rl_hybrid,
     )
 
+    # ---------------- Wind Power & Shield Rejection Diagnostic ----------------
+    wind_arr = sample_trajs["Shielded Adaptive MPC (DMPS Rollout)"]["wind"]
+    gust_mask = np.abs(wind_arr) > 0.05
+    calm_mask = ~gust_mask
+    peak_wind_accel = float(np.max(np.abs(wind_arr))) if np.any(gust_mask) else 0.0
+    # Equivalent aerodynamic wind speed (km/h) from Davis quadratic drag A*v_wind^2 = M_eff * a_wind
+    equiv_wind_kmh = 3.6 * float(np.sqrt(peak_wind_accel * 85000.0 * 1.08 / 14.5))
+    unsh_gust_err = float(np.max(sample_trajs["Adaptive MPC (Idea B: Shift-Q3)"]["err"][gust_mask])) if np.any(gust_mask) else 0.0
+    sh_gust_err = float(np.max(sample_trajs["Shielded Adaptive MPC (DMPS Rollout)"]["err"][gust_mask])) if np.any(gust_mask) else 0.0
+    int_in_gust = int(np.sum(band_info["intervened"][gust_mask]))
+    int_in_calm = int(np.sum(band_info["intervened"][calm_mask]))
+    print(
+        f"WIND DISTURBANCE FEEDBACK | Peak Gust: {peak_wind_accel:.2f} m/s^2 (~{equiv_wind_kmh:.1f} km/h) | "
+        f"Max Gust Drift: Unshielded = {unsh_gust_err:.4f} m/s vs Shielded = {sh_gust_err:.4f} m/s "
+        f"(-{100.0 * (unsh_gust_err - sh_gust_err) / max(1e-6, unsh_gust_err):.1f}%) | "
+        f"Interventions: {int_in_gust} in Gusts, {int_in_calm} in Calm"
+    )
+
     # ---------------- Save 6-Panel Plot ----------------
     fig, axes = plt.subplots(2, 3, figsize=(18, 9.5))
     plot_methods = [
@@ -566,6 +593,11 @@ def main():
     ]
     k_grid = sample_trajs[plot_methods[0]]["k"]
 
+    # Shade active wind gust intervals in Panel 1
+    axes[0, 0].fill_between(
+        k_grid, 0.0, 18.0, where=gust_mask,
+        color="deepskyblue", alpha=0.14, label=f"Storm Wind Gust (Peak ~{equiv_wind_kmh:.0f} km/h)"
+    )
     axes[0, 0].fill_between(
         k_grid, band_info["scissor_lo"], band_info["scissor_hi"],
         color="gold", alpha=0.35, label="99th-Percentile Scissor (Goodall 2026)"
@@ -574,28 +606,39 @@ def main():
     if np.any(int_mask):
         axes[0, 0].scatter(
             k_grid[int_mask], sample_trajs["Shielded Hybrid RL-MPC (DMPS Rollout)"]["v"][int_mask],
-            color="red", s=10, zorder=5, label="Shield Intervention"
+            color="red", s=12, zorder=5, label="Shield Intervention (Active in Gust)"
         )
     axes[0, 0].plot(k_grid, v_des_ref, "k--", linewidth=2.0, label="Target Profile")
     for m_name in plot_methods:
         axes[0, 0].plot(k_grid, sample_trajs[m_name]["v"], linewidth=1.3, label=m_name)
-    axes[0, 0].set_title(f"1. Unseen Sample Trajectory [0, {args.horizon}] Tracking")
+    axes[0, 0].set_ylim(-0.5, 17.8)
+    axes[0, 0].set_title(f"1. Unseen Sample Trajectory [0, {args.horizon}] Tracking & Wind Zones")
     axes[0, 0].set_xlabel("Distance Sample")
     axes[0, 0].set_ylabel("Speed (m/s)")
-    axes[0, 0].legend(fontsize=6.5)
+    axes[0, 0].legend(fontsize=6.2, loc="upper left")
     axes[0, 0].grid(True, alpha=0.3)
+
+    # Panel 2: Instantaneous Tracking Error + Twin-Axis Wind Power Indicator
+    ax_wind = axes[0, 1].twinx()
+    ax_wind.fill_between(
+        k_grid, 0.0, np.abs(wind_arr),
+        color="deepskyblue", alpha=0.22, label="Wind Gust Power |d_wind| (m/s²)"
+    )
+    ax_wind.set_ylabel("Wind Power |d_wind| (m/s²)", color="steelblue", fontsize=8.5)
+    ax_wind.tick_params(axis="y", labelcolor="steelblue", labelsize=8)
+    ax_wind.set_ylim(0.0, max(1.2, peak_wind_accel * 1.35))
 
     for m_name in plot_methods:
         axes[0, 1].plot(k_grid, sample_trajs[m_name]["err"], linewidth=1.2, label=m_name)
-    axes[0, 1].set_title("2. Instantaneous Tracking Error |v - v_des|")
+    axes[0, 1].set_title("2. Tracking Error |v - v_des| vs. Wind Gust Power Indicator")
     axes[0, 1].set_xlabel("Distance Sample")
     axes[0, 1].set_ylabel("Error (m/s)")
-    axes[0, 1].legend(fontsize=7)
+    axes[0, 1].legend(fontsize=6.5, loc="upper left")
     axes[0, 1].grid(True, alpha=0.3)
 
     shift_seg = next((s for s in sample_schedule if s["mode"] in (2, 5)), sample_schedule[1])
-    z0 = max(0, 530)
-    z1 = min(len(k_grid), 570)
+    z0 = max(0, shift_seg["start"] - 4)
+    z1 = min(len(k_grid), shift_seg["start"] + 16)
     sl = slice(z0, z1)
     axes[0, 2].fill_between(
         k_grid[sl], band_info["v_min"][sl], band_info["v_max"][sl],
@@ -655,11 +698,10 @@ def main():
             "darkorange",
             "steelblue",
             "seagreen",
-            "mediumseagreen",
             "limegreen",
-            "indianred",
+            "mediumseagreen",
             "salmon",
-            "firebrick",
+            "indianred",
             "crimson",
         ],
     )
@@ -681,7 +723,7 @@ def main():
     plt.close(fig)
     print(f"\nSaved 6-panel multi-trajectory benchmark plot to: {args.plot}")
 
-    # ---------------- Save Dedicated 4-Panel Shielded Hybrid Zoom Plot ----------------
+    # ---------------- Save Dedicated 4-Panel Shielded Zoom & Wind Feedback Plot ----------------
     zoom_plot_path = args.plot.replace(".png", "_shielded_zoom.png")
     fig_z, axes_z = plt.subplots(2, 2, figsize=(16, 10))
     shielded_3 = [
@@ -690,7 +732,7 @@ def main():
         ("Shielded Hybrid RL-MPC (DMPS Rollout)", "crimson", "-"),
     ]
 
-    def plot_scissor_panel(ax, sl_idx, title_str):
+    def plot_scissor_panel(ax, sl_idx, title_str, show_wind: bool = False):
         ax.fill_between(
             k_grid[sl_idx], band_info["v_min"][sl_idx], band_info["v_max"][sl_idx],
             color="mediumseagreen", alpha=0.22, label="100% Max-Error & Safe Envelope (Wang 2023)"
@@ -707,31 +749,100 @@ def main():
             ax.scatter(
                 k_grid[sl_idx][int_sl],
                 sample_trajs["Shielded Hybrid RL-MPC (DMPS Rollout)"]["v"][sl_idx][int_sl],
-                color="red", s=16, zorder=6, label="DMPS Shield Intervention"
+                color="red", s=18, zorder=6, label="Active Shield Intervention"
             )
+        if show_wind:
+            ax_w = ax.twinx()
+            w_sl = wind_arr[sl_idx]
+            wh_sl = sample_trajs["Shielded Adaptive MPC (DMPS Rollout)"]["wind_hat"][sl_idx]
+            ax_w.fill_between(k_grid[sl_idx], 0.0, w_sl, color="deepskyblue", alpha=0.20, label="True Wind d_ext (m/s²)")
+            ax_w.plot(k_grid[sl_idx], wh_sl, color="teal", linestyle=":", linewidth=1.4, label="Observer d_hat (m/s²)")
+            ax_w.set_ylabel("Wind Accel (m/s²)", color="teal", fontsize=8.5)
+            ax_w.tick_params(axis="y", labelcolor="teal", labelsize=8)
+            ax_w.set_ylim(-1.3, 1.3)
+            ax_w.legend(fontsize=6.8, loc="lower right")
+
         ax.set_title(title_str, fontweight="bold")
         ax.set_xlabel("Distance Sample k")
         ax.set_ylabel("Speed (m/s)")
-        ax.legend(fontsize=7.5)
+        ax.legend(fontsize=7.0, loc="upper left")
         ax.grid(True, alpha=0.3)
 
-    plot_scissor_panel(axes_z[0, 0], slice(0, len(k_grid)), f"1. Full Trajectory [0, {args.horizon}]: 3 Shielded Hybrid RL-MPC Methods Only")
+    plot_scissor_panel(axes_z[0, 0], slice(0, len(k_grid)), f"1. Full Trajectory [0, {args.horizon}]: Unshielded vs Shielded MPC/RL")
 
-    cruise_seg = next((s for s in sample_schedule if s["mode"] == 3), sample_schedule[0])
-    c0, c1 = max(0, cruise_seg["start"]), min(len(k_grid), cruise_seg["end"])
-    plot_scissor_panel(axes_z[0, 1], slice(c0, c1), f"2. Zoom on Cruising Mode [{c0}, {c1}]: 99th-Pct (Yellow) & Max-Err (Green)")
+    # Find first and last wind gust windows for high-resolution zoomed wind feedback
+    gust_indices = np.where(gust_mask)[0]
+    if len(gust_indices) > 0:
+        g1_start = max(0, int(gust_indices[0]) - 12)
+        g1_end = min(len(k_grid), int(gust_indices[0]) + 65)
+        g2_start = max(0, int(gust_indices[-1]) - 55)
+        g2_end = min(len(k_grid), int(gust_indices[-1]) + 15)
+    else:
+        cruise_seg = next((s for s in sample_schedule if s["mode"] == 3), sample_schedule[0])
+        g1_start, g1_end = max(0, cruise_seg["start"]), min(len(k_grid), cruise_seg["end"])
+        g2_start, g2_end = max(0, len(k_grid) - 70), len(k_grid)
 
-    plot_scissor_panel(axes_z[1, 0], sl, f"3. Zoom on Profile Shift [{z0}, {z1}]: Concentric Scissor Bands")
+    plot_scissor_panel(
+        axes_z[0, 1], slice(g1_start, g1_end),
+        f"2. Zoom on Storm Gust #1 [{g1_start}, {g1_end}]: Speed vs Wind Power Indicator",
+        show_wind=True,
+    )
 
-    stop_seg = next((s for s in reversed(sample_schedule) if s["mode"] == 6), sample_schedule[-1])
-    st0 = max(0, stop_seg["start"] - 5)
-    st1 = min(len(k_grid), stop_seg["end"] + 1)
-    plot_scissor_panel(axes_z[1, 1], slice(st0, st1), f"4. Zoom on Braking & Station Stop [{st0}, {st1}]: Terminal Docking X_inv")
+    plot_scissor_panel(axes_z[1, 0], sl, f"3. Zoom on Profile Shift [{z0}, {z1}]: Causal Guard & Scissor Bands")
+
+    plot_scissor_panel(
+        axes_z[1, 1], slice(g2_start, g2_end),
+        f"4. Zoom on Storm Gust #2 [{g2_start}, {g2_end}]: Active Shielding & Instant Cut-Off",
+        show_wind=True,
+    )
 
     fig_z.tight_layout()
     fig_z.savefig(zoom_plot_path, dpi=150)
     plt.close(fig_z)
     print(f"Saved dedicated 4-panel Shielded Hybrid Zoom plot to: {zoom_plot_path}")
+
+
+    # -------------------------------------------------------------------------
+    # Algorithm Selection Breakdown: Undisturbed vs. Disturbed vs. Combined
+    # -------------------------------------------------------------------------
+    hybrid_check_methods = [
+        name for name, ctype, _, _, _, _ in eval_specs if ctype in ("RL_HYBRID", "RL_SOFT")
+    ]
+    print("\n" + "=" * 132)
+    print("HYBRID RL ALGORITHM USAGE STATS (% AND STEP COUNTS): UNDISTURBED vs. DISTURBED vs. COMBINED")
+    print("=" * 132)
+
+    for subset_label, filter_fn in [
+        ("1. UNDISTURBED TRAJECTORIES ONLY (Clean)", lambda r: not r["is_disturbed"]),
+        ("2. DISTURBED TRAJECTORIES ONLY (Storm Wind)", lambda r: r["is_disturbed"]),
+        ("3. ALL TRAJECTORIES COMBINED (Clean + Disturbed)", lambda r: True),
+    ]:
+        sample_runs = [r for r in agg[hybrid_check_methods[0]] if filter_fn(r)]
+        n_tracks_sub = len(sample_runs)
+        print(f"\n--- {subset_label} ({n_tracks_sub} Tracks) ---")
+        print(
+            f"{'Controller Method':<37} | {'GA':>14} | {'PSO':>14} | {'DE':>14} | "
+            f"{'ICA':>14} | {'MPC':>16} | {'Total Steps':>11}"
+        )
+        print("-" * 132)
+        for m_name in hybrid_check_methods:
+            sub_runs = [r for r in agg[m_name] if filter_fn(r)]
+            tot_steps = sum(r["total_steps"] for r in sub_runs)
+            if tot_steps == 0:
+                continue
+            cols = []
+            for alg_k in HYBRID_ALGORITHMS:
+                cnt = sum(r["alg_counts"].get(alg_k, 0) for r in sub_runs)
+                pct = 100.0 * cnt / tot_steps
+                if alg_k == "MPC":
+                    cols.append(f"{pct:6.2f}% ({cnt:5d})")
+                else:
+                    cols.append(f"{pct:5.2f}% ({cnt:4d})")
+            print(
+                f"{m_name:<37} | {cols[0]:>14} | {cols[1]:>14} | {cols[2]:>14} | "
+                f"{cols[3]:>14} | {cols[4]:>16} | {tot_steps:11d}"
+            )
+    print("=" * 132)
 
 
 if __name__ == "__main__":
