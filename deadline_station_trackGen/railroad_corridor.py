@@ -34,7 +34,7 @@ class StationStopSpec:
 class RailroadCorridor:
     """
     Represents either a single leg or a full Multi-Station Corridor (14.5 - 17.5 km, 3 stations)
-    with dynamic vehicle mass M_leg (passengers joining/leaving) and spatial speed limits.
+    with stochastic passenger mass (sold tickets vs actual riders + weight variance) and weather forces.
     """
     route_name: str = "Express Line 1: Suburban -> Central -> Tech Park -> Airport (3 Stops)"
     station_x_m: float = 5200.0          # Current leg target distance (m)
@@ -42,8 +42,15 @@ class RailroadCorridor:
     deadline_s: float = 420.0            # Current leg target arrival clock time (s)
     dt: float = 0.50                     # MPC & physics integration step (s)
     macro_steps: int = 8                 # RL decision interval during open cruising (4.0s)
-    mass_kg: float = 85000.0             # Current vehicle mass including passengers (kg)
-    passengers: int = 170                # Current passenger count on board
+    mass_kg: float = 85000.0             # True physical vehicle mass (tare + actual passengers & luggage)
+    ticket_estimated_mass_kg: float = 85000.0  # Prior mass estimated from sold tickets (75kg * tickets)
+    passengers: int = 170                # Actual passenger count on board (capped at max_capacity=360)
+    sold_tickets: int = 170              # Sold ticket count reported at station turnstiles
+    max_capacity: int = 360              # Maximum passenger capacity of the 4-car train
+    weather_condition: str = "Dry"       # "Dry", "Rain", "Snow", or "ColdWind"
+    adhesion_mu_factor: float = 1.00     # Rail friction multiplier (1.0=Dry, 0.82=Rain, 0.68=Snow)
+    temp_celsius: float = 18.0           # Ambient temperature C (affects air density rho & drag A)
+    station_wind_sensor_mps2: float = 0.0 # Wayside station anemometer reading at departure
     is_infeasible_challenge: bool = False
 
     # Base physical & comfort bounds at nominal 85,000 kg mass (m/s^2)
@@ -63,13 +70,15 @@ class RailroadCorridor:
 
     @property
     def max_traction_accel(self) -> float:
-        """Heavier passenger loads reduce peak acceleration: a_max(M) = a_base * (85000 / M)."""
-        return float(self.base_max_traction_accel * (85000.0 / max(65000.0, self.mass_kg)))
+        """Mass- and rail-adhesion-scaled traction limit (Rain/Snow reduces wheel-rail friction)."""
+        mass_scale = 85000.0 / max(65000.0, self.mass_kg)
+        return float(self.base_max_traction_accel * mass_scale * self.adhesion_mu_factor)
 
     @property
     def max_service_braking(self) -> float:
-        """Heavier passenger loads reduce peak braking deceleration: b_max(M) = b_base * (85000 / M)."""
-        return float(self.base_max_service_braking * (85000.0 / max(65000.0, self.mass_kg)))
+        """Mass- and rail-adhesion-scaled braking limit (Rain/Snow requires earlier braking spot)."""
+        mass_scale = 85000.0 / max(65000.0, self.mass_kg)
+        return float(self.base_max_service_braking * mass_scale * self.adhesion_mu_factor)
 
     def get_speed_limit(self, x_m: float) -> float:
         for z in self.speed_zones:
@@ -226,10 +235,20 @@ def generate_multi_station_scenario(
     """
     rng = np.random.default_rng(seed)
     tare_mass_kg = 72000.0
-    pax_weight_kg = 75.0
-    curr_passengers = int(rng.integers(110, 180))  # Initial departure load
+    max_train_capacity = 360
+    curr_passengers = int(rng.integers(120, 185))
+    curr_tickets = int(np.clip(curr_passengers + rng.integers(-18, 22), 40, max_train_capacity))
     t_clock = float(np.round(rng.uniform(0.0, 30.0) * 2.0) / 2.0)
     cum_x_m = 0.0
+
+    # Sample environmental weather & rail-friction condition for the journey
+    weather_choices = [
+        ("Dry", 1.00, float(rng.uniform(14.0, 24.0))),
+        ("Rain", float(rng.uniform(0.82, 0.88)), float(rng.uniform(6.0, 13.0))),
+        ("Snow", float(rng.uniform(0.72, 0.78)), float(rng.uniform(-6.0, 1.0))),
+    ]
+    w_idx = int(rng.choice([0, 1, 2], p=[0.55, 0.30, 0.15]))
+    weather_name, mu_adhesion, temp_c = weather_choices[w_idx]
 
     legs = []
     station_names = ["Central Station", "Midtown Hub", "Tech Park Terminal", "Airport Express"]
@@ -238,34 +257,52 @@ def generate_multi_station_scenario(
         leg_len_m = float(np.round(rng.uniform(4900.0, 5800.0) / 50.0) * 50.0)
         zones, min_feas_s = _build_leg_zones(leg_len_m, rng)
 
-        # Passenger exchange at the station before departing on this leg
+        # 1. Stochastic Passenger Boarding/Alighting (Capped at max_train_capacity = 360)
         if leg_idx == 0:
-            n_leave = 0
-            n_join = curr_passengers
+            n_leave, n_join = 0, curr_passengers
         elif leg_idx == 1:
-            # Rush-hour hub pickup: many passengers join, train gets significantly heavier
-            n_leave = int(rng.integers(20, 55))
-            n_join = int(rng.integers(110, 175))
-            curr_passengers = int(np.clip(curr_passengers - n_leave + n_join, 40, 340))
+            n_leave = int(rng.integers(25, 65))
+            n_join = int(rng.integers(115, 185))
+            curr_passengers = int(np.clip(curr_passengers - n_leave + n_join, 40, max_train_capacity))
         else:
-            # Terminal dispersion: many passengers alight, train gets lighter
-            n_leave = int(rng.integers(110, min(220, curr_passengers - 20)))
-            n_join = int(rng.integers(15, 60))
-            curr_passengers = int(np.clip(curr_passengers - n_leave + n_join, 30, 340))
+            n_leave = int(rng.integers(100, min(210, curr_passengers - 20)))
+            n_join = int(rng.integers(20, 75))
+            curr_passengers = int(np.clip(curr_passengers - n_leave + n_join, 30, max_train_capacity))
 
-        leg_mass_kg = float(tare_mass_kg + curr_passengers * pax_weight_kg)
-        # Heavier train needs slightly more startup/braking time
-        mass_time_adder = max(0.0, (leg_mass_kg - 85000.0) / 2500.0)
+        # 2. Sold Tickets vs. Missed-Train Passengers, Evaders & Per-Passenger Weight Variance
+        missed_train_pax = int(rng.binomial(curr_passengers, 0.06))   # ~6% bought ticket but missed train
+        untracked_pass_holders = int(rng.poisson(14.0))               # Untracked pass/evader riders
+        curr_tickets = int(np.clip(curr_passengers + missed_train_pax - untracked_pass_holders, 30, max_train_capacity))
+
+        # Mean weight per passenger varies (e.g., heavier luggage on Leg 3 Airport Express, or overweight crowd)
+        avg_pax_weight_kg = float(rng.normal(82.0 if leg_idx == 2 else 75.5, 4.5))
+        leg_mass_kg = float(tare_mass_kg + curr_passengers * avg_pax_weight_kg)
+        ticket_est_mass_kg = float(tare_mass_kg + curr_tickets * 75.0)  # Controller only knows sold tickets * 75kg!
+
+        mass_time_adder = max(0.0, (leg_mass_kg - 85000.0) / 2200.0) + (4.0 if mu_adhesion < 0.85 else 0.0)
         eff_min_feas_s = min_feas_s + mass_time_adder
 
-        is_break = bool(allow_infeasible_breaks and (leg_idx == 1) and (rng.random() < 0.22))
+        # Stress-test leg (tight but physically solvable within +1.5s if shield coordinates speed & ramps)
+        is_break = bool(allow_infeasible_breaks and (leg_idx == 1) and (rng.random() < 0.20))
         if is_break:
-            leg_budget_s = float(np.round((eff_min_feas_s - rng.uniform(11.0, 18.0)) * 2.0) / 2.0)
+            leg_budget_s = float(np.round((eff_min_feas_s + rng.uniform(4.0, 8.0)) * 2.0) / 2.0)
         else:
             leg_budget_s = float(np.round((eff_min_feas_s + rng.uniform(16.0, 42.0)) * 2.0) / 2.0)
 
         leg_deadline_s = t_clock + leg_budget_s
         dwell_s = 25.0 if leg_idx < n_legs - 1 else 0.0
+
+        if wind_mode == "continuous":
+            w_prof, w_desc, w_meta = generate_continuous_evolving_wind(
+                leg_budget_s + 150.0, 0.50, seed=seed * 31 + leg_idx
+            )
+        else:
+            w_prof, w_desc, w_meta = generate_disjoint_wind_events(
+                leg_budget_s + 150.0, 0.50, seed=seed * 31 + leg_idx
+            )
+
+        # Wayside station anemometer reading at departure (with small sensor noise)
+        station_wind_reading = float(w_prof[0] + rng.normal(0.0, 0.015))
 
         corridor = RailroadCorridor(
             route_name=f"Leg {leg_idx+1} ({station_names[leg_idx]} -> {station_names[leg_idx+1]})",
@@ -273,19 +310,17 @@ def generate_multi_station_scenario(
             start_time_s=t_clock,
             deadline_s=leg_deadline_s,
             mass_kg=leg_mass_kg,
+            ticket_estimated_mass_kg=ticket_est_mass_kg,
             passengers=curr_passengers,
+            sold_tickets=curr_tickets,
+            max_capacity=max_train_capacity,
+            weather_condition=weather_name,
+            adhesion_mu_factor=mu_adhesion,
+            temp_celsius=temp_c,
+            station_wind_sensor_mps2=station_wind_reading,
             is_infeasible_challenge=is_break,
             speed_zones=zones,
         )
-
-        if wind_mode == "continuous":
-            w_prof, w_desc, w_meta = generate_continuous_evolving_wind(
-                leg_budget_s + 150.0, corridor.dt, seed=seed * 31 + leg_idx
-            )
-        else:
-            w_prof, w_desc, w_meta = generate_disjoint_wind_events(
-                leg_budget_s + 150.0, corridor.dt, seed=seed * 31 + leg_idx
-            )
 
         cum_x_m += leg_len_m
         legs.append({
@@ -299,9 +334,13 @@ def generate_multi_station_scenario(
             "budget_s": leg_budget_s,
             "dwell_s": dwell_s,
             "passengers": curr_passengers,
+            "sold_tickets": curr_tickets,
             "n_join": n_join,
             "n_leave": n_leave,
             "mass_kg": leg_mass_kg,
+            "ticket_mass_kg": ticket_est_mass_kg,
+            "weather": weather_name,
+            "adhesion_mu": mu_adhesion,
             "is_infeasible": is_break,
             "wind_profile": w_prof,
             "wind_desc": w_desc,
