@@ -535,6 +535,7 @@ class MPCTransitionRailroadEnv:
                 t_curr=self.t_curr,
                 x_curr=self.x_curr,
                 v_curr=self.v_curr,
+                v_prev=self.v_prev,
                 d_obs=self.d_hat,
                 force_replan=force_replan,
             )
@@ -1509,7 +1510,7 @@ def main():
     axes[0, 2].legend(fontsize=7.0, loc="upper left")
     axes[0, 2].grid(True, alpha=0.3)
 
-    short_labels = ["Greedy", "Naive", "Static", "PPO Unsh", "PPO+Sw", "PPO+DCBF", "PPO+UCB-DMPS", "Bilbao CBTC"]
+    short_labels = ["Greedy", "Naive", "Static", "PPO Unsh", "PPO+Sw", "PPO+DCBF", "PPO+DMPS", "Bilbao'25"]
     bar_colors = ["steelblue", "darkorange", "purple", "seagreen", "salmon", "indianred", "crimson", "goldenrod"]
     x_pos = np.arange(len(short_labels))
 

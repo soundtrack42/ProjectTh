@@ -101,3 +101,33 @@ Bilbao-Moreno et al. structure the CBTC-ATO system into three layers (Figs. 1–
 - **Intention:** Latch certified comfort ramp caps `(latched_a_cap, latched_b_cap)` across active ramps without inflating the intervention count (`Shield%` $\approx 7.9\%\text{--}8.8\%$), and trigger `C4_ECO_REGEN_COAST` in the pre-braking window before slower speed zones and station landings.
 - **Where & How Implemented:**
   - [`goodall_trajectory_shield.py` (lines 87–95, 201–258, 313–433)](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/goodall_trajectory_shield.py#L87-L433): Added `latched_a_cap`, `latched_b_cap`, and `latch_steps_rem` with $+0.045\text{ m/s}$ cruise pace compensation during latched steps so gentler ramps lose zero arrival time while reducing both `SmoothLoss` and `SpecEnergy`.
+
+
+### Change 5 — Standalone Implementation & Benchmark of Bilbao-Moreno et al. (2025) CBTC-ATO
+- **Intention:** Implement the two-layer CBTC-ATO architecture of Bilbao-Moreno, Elorza, Irigoyen, & Trojaola (2025) (*"ATO system for CBTC-based railways: Planning and disturbance estimation for enhanced automation"*, *Results in Engineering* 26, 105357) as a standalone competing benchmark (`8. Bilbao (2025) CBTC-ATO (RMBTP + PI)`) on the exact same generalized multi-station railroad problem without mixing it into our PPO/Contract-Shield controller.
+- **Where & How Implemented:**
+  - [`bilbao_cbtc_ato.py` (`BilbaoCBTCATOController`, lines 39–395)](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/bilbao_cbtc_ato.py#L39-L395):
+    - **Mesoscopic Layer — Reduced Model-Based Trajectory Planner (RMBTP, Sec. 3.2, Eqs. 12–16, Figs. 6–8):** Plans piecewise constant-acceleration / constant-speed / backward-braking segments across the corridor speed zones (`_build_rmbtp_segments`, lines 98–215) using $85\%\text{--}88\%$ of maximum comfort acceleration/braking and a $96\%$ ATP speed-limit margin. Uses **Regula Falsi** root-finding (`plan_rmbtp_trajectory`, lines 217–281) to compute the ECO cruise ceiling $V_{\text{eco}}$ that matches $T_{\text{deadline}}$.
+    - **Microscopic Layer — Cascade PI-Position + PI-Speed Controller with Braking Switcher & Anti-Windup Sync (Sec. 3.3, Eqs. 28–32, Fig. 11):** Implemented in `select_microscopic_action` (lines 298–395). Outer position loop $PI_\theta$ corrects position error $e_x(t) = x_{\text{ref}}(t) - x(t)$; the **Braking Switcher** (lines 352–359) disconnects positive position-error speed boosts during braking ramps (`a_ff < -0.05` or `v_ff >= v_bw_ceil - 0.15`) so schedule lag never causes ATP overspeed; **Sync Anti-Windup** (lines 361–367) clamps speed commands to `compute_backward_braking_ceiling`; and the inner $PI_\omega$ speed loop + inverse-dynamics feedforward outputs $u_{\text{cmd}} \in [-1, 1]$.
+    - **Disturbance Observer Replanning Trigger (Sec. 3.4, Eqs. 33–37, Fig. 14):** Triggers online RMBTP replanning in open track (`rem_dist > 1200 m`) when traction saturates with velocity lag (`|u| >= 0.85` and `vel_dev > 0.95 m/s`) or when external wind/resistance shifts significantly (lines 334–345).
+  - [`dynamic_railroad_mpc.py` (`step_bilbao_cbtc_ato`, lines 514–689 & `method_specs`, line 1335)](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/dynamic_railroad_mpc.py#L514-L689): Steps `BilbaoCBTCATOController` on the exact same `true_physics` plant, weather/wind profiles, and energy/smoothness evaluation metrics, and plots it across all panels of [`rl_cosine_mpc.png`](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/rl_cosine_mpc.png).
+
+### Change 6 — Updated LaTeX Project Report (`Report.tex`)
+- **Intention:** Provide a complete, well-flowing LaTeX report following the 3-stage progression of the project report while incorporating the generalized 1–5 station weather/mass benchmark, fair traction/regenerative energy accounting, contract-latching analysis, and the Bilbao-Moreno et al. (2025) benchmark comparison in clear, accessible language.
+- **Where & How Implemented:**
+  - [`Report.tex`](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/Report.tex) (also mirrored at [`/home/giorge/Desktop/ProjectTh/Report.tex`](file:///home/giorge/Desktop/ProjectTh/Report.tex)).
+
+---
+
+## 4. Current 30-Scenario Benchmark Summary (1..5 Stations, Clean + Weather-Disturbed)
+
+| Method | Clean `\|TimeErr\|` | Weather `\|TimeErr\|` | Combined `\|TimeErr\|` | `\|StopErr\|` | `SmoothLoss` | `SpecEnergy` | `LossScore` | `Shield%` | Step Latency (Mean) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1. Max-Speed Greedy Cosine + MPC** | `3.73 s` | `2.95 s` | `3.34 s` | `0.032 m` | `0.0733` | `50.86 Wh/tk` | `5.2362` | `0.0%` | `101.8 us` |
+| **2. Naive Pace (No Cruise Overshoot) + MPC** | `19.20 s` | `20.29 s` | `19.75 s` | `0.013 m` | `0.0547` | `43.60 Wh/tk` | `21.1335` | `0.0%` | `94.9 us` |
+| **3. Static Plan (No Wind/Mass Replan) + MPC** | `9.50 s` | `10.07 s` | `9.79 s` | `0.015 m` | `0.0596` | `43.60 Wh/tk` | `11.2213` | `0.0%` | `94.9 us` |
+| **4. Multi-Property PPO Pilot (Unshielded)** | **`1.05 s`** | **`2.17 s`** | **`1.61 s`** | `0.028 m` | `0.0606` | `46.66 Wh/tk` | **`3.3172`** | `0.0%` | `105.2 us` |
+| **5. Contract-Shielded PPO (Switch MPS)** | `1.18 s` | `2.45 s` | `1.82 s` | `0.028 m` | `0.0538` | `45.27 Wh/tk` | `3.4770` | `7.9%` | `145.4 us` |
+| **6. Contract-Shielded PPO (1-Step DCBF)** | `1.38 s` | `2.58 s` | `1.98 s` | **`0.027 m`** | **`0.0523`** | **`44.92 Wh/tk`** | `3.6083` | `7.9%` | `144.5 us` |
+| **7. Contract-Shielded PPO (UCB-DMPS Rollout)** | `1.48 s` | `2.66 s` | `2.07 s` | **`0.027 m`** | `0.0533` | `45.07 Wh/tk` | `3.7081` | `8.8%` | `146.4 us` |
+| **8. Bilbao (2025) CBTC-ATO (RMBTP + PI)** | `4.96 s` | `3.34 s` | `4.15 s` | `0.029 m` | `0.1041` | `45.52 Wh/tk` | `5.9302` | `0.0%` | **`21.2 us`** |
