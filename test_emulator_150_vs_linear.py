@@ -19,7 +19,7 @@ from benchmark_central import (
     generate_truly_random_trajectory,
     run_controller_benchmark,
 )
-from deadline_station_trackGen.havaei_generalizing_rl import (
+from havaei_generalizing_rl import (
     LearnedLinearizationModel,
     PathAgnosticHavaeiEnv,
     learn_150_step_emulator_for_trajectory,

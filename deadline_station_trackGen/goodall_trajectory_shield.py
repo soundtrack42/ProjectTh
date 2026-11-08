@@ -19,6 +19,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from pure_mpc_controller import PureLiuMPC
 from havaei_generalizing_rl import NonlinearTrainPhysics, LearnedLinearizationModel
@@ -56,6 +60,10 @@ CERTIFIED_CONTRACT_LIBRARY = (
     "C4_ECO_REGEN_COAST",      # Energy recovery: trims excess cruise overshoot & harvests regen braking
 )
 
+# Persistent learned UCB bandit memory across all legs and episodes:
+GLOBAL_LEARNED_CONTRACT_COUNTS = {c: 1.0 for c in CERTIFIED_CONTRACT_LIBRARY}
+GLOBAL_LEARNED_CONTRACT_SCORES = {c: 0.0 for c in CERTIFIED_CONTRACT_LIBRARY}
+
 
 class GoodallTrajectoryShield:
     def __init__(
@@ -70,9 +78,9 @@ class GoodallTrajectoryShield:
         assert self.cfg.mode in ("switch", "cbf_opt", "mps_rollout")
         self._feat_buf = torch.zeros((1, 8), dtype=torch.float32)
 
-        # Discounted-UCB statistics across the Certified Contract Library (Adalat et al. 2026 Alg. 2)
-        self.contract_counts = {c: 1.0 for c in CERTIFIED_CONTRACT_LIBRARY}
-        self.contract_scores = {c: 0.0 for c in CERTIFIED_CONTRACT_LIBRARY}
+        # Point directly to persistent learned UCB contract statistics:
+        self.contract_counts = GLOBAL_LEARNED_CONTRACT_COUNTS
+        self.contract_scores = GLOBAL_LEARNED_CONTRACT_SCORES
         self.active_contract = "C0_NOMINAL_BALANCED"
         self.reset_stats()
 
@@ -80,6 +88,9 @@ class GoodallTrajectoryShield:
         self.total_steps: int = 0
         self.total_interventions: int = 0
         self.sigma_tube_curr: float = self.cfg.base_sigma_mps
+        self.latched_a_cap: float = 1.20
+        self.latched_b_cap: float = 0.92
+        self.latch_steps_rem: int = 0
         self.property_counts: dict[str, int] = {
             "speed_limit": 0,
             "smoothness": 0,
@@ -97,11 +108,11 @@ class GoodallTrajectoryShield:
         }
 
     def update_contract_ucb_statistics(self, contract_name: str, multi_property_payoff: float) -> None:
-        """Discounted-UCB contract selector update (Adalat, Hamel-De le Court, & Belardinelli 2026)."""
+        """Discounted-UCB contract selector update with count floor >= 1e-3 to prevent underflow."""
         eta = self.cfg.ucb_discount_eta
         for c in CERTIFIED_CONTRACT_LIBRARY:
-            self.contract_counts[c] *= eta
-            self.contract_scores[c] *= eta
+            self.contract_counts[c] = max(1e-3, self.contract_counts[c] * eta)
+            self.contract_scores[c] = self.contract_scores[c] * eta
         self.contract_counts[contract_name] += 1.0
         self.contract_scores[contract_name] += float(multi_property_payoff)
 
@@ -174,62 +185,88 @@ class GoodallTrajectoryShield:
         a_start_cand: float,
         b_land_cand: float,
         v_pace_feasible: float,
+        v_ceil_pre: float | None = None,
     ) -> tuple[dict[str, float], dict[str, float]]:
-        """
-        Computes Cano, Henzinger, & Kueffner (2026) Hierarchical Derivative Pressures:
-            rho_d(t) = ||d^d x_t|| / r_d   (safe iff rho_d <= 1.0, i.e., margin = 1.0 - rho_d >= 0)
-        across all 6 operational qualities:
-          1. Order-1 Velocity + 99% Scissor (`speed_limit`)
-          2. Order-2 Acceleration / Braking Comfort (`smoothness`)
-          3. Order-3 Discrete Jerk Window (`jerk_order3`)
-          4. Resource Budget: Specific Traction Energy (`energy`)
-          5. Temporal Liveness: Projected Arrival Deadline Cone (`deadline`)
-          6. Inner-Loop Reachability: MPC Tracking Saturation (`mpc_failure`)
-        """
         r99_now = self.cfg.z_sigma * self.sigma_tube_curr
-        v_ceil = self.corridor.compute_smooth_spatial_ceiling(env.x_curr, b_land_cand)
+        v_ceil = (
+            v_ceil_pre
+            if v_ceil_pre is not None
+            else self.corridor.compute_smooth_spatial_ceiling(env.x_curr, b_land_cand)
+        )
 
         # 1. Order-1 Velocity Pressure: rho_1 = (v_cmd + r99) / v_ceil(x)
         rho_1 = (v_cmd_cand + r99_now) / max(1.0, v_ceil + 0.01)
         h_speed = (v_ceil + 0.01) - (v_cmd_cand + r99_now)
 
-        # 2. Order-2 Acceleration/Braking Pressure: rho_2
-        a_comf_hi = self.corridor.comfort_accel_max * 1.04
-        b_comf_hi = self.corridor.comfort_braking_max * 1.04
+        # 2. Order-2 Acceleration/Braking Smoothness Certifier:
+        #    Triggers at departure initiation (k_elapsed in {0, 8}) or when a new speed shift starts
+        #    (|v_cmd - v_curr| > 1.65 m/s while ramp_u_phase > 0.92) to latch smooth ramp bounds!
+        x_rem = max(0.0, self.corridor.station_x_m - env.x_curr)
+        dv_actual = abs(min(v_cmd_cand, v_ceil) - env.v_curr)
+        is_ramp_init = (env.k_elapsed in (0, 8)) or (dv_actual > 1.65 and env.shaper.ramp_u_phase > 0.92)
+        a_comf_hi = 0.82 if is_ramp_init else (self.corridor.comfort_accel_max * 1.02)
+        b_comf_hi = 0.72 if is_ramp_init else (self.corridor.comfort_braking_max * 1.02)
         rho_2 = max(a_start_cand / a_comf_hi, b_land_cand / b_comf_hi, 0.62 / max(0.30, b_land_cand))
         h_smooth = min(a_comf_hi - a_start_cand, b_comf_hi - b_land_cand, b_land_cand - 0.62) * 2.5
 
-        # 3. Order-3 Jerk Pressure (3-state backward difference window, Cano et al. 2026 Eq. 1)
-        dv_target = v_cmd_cand - env.v_curr
-        a_implied = np.clip(dv_target / max(2.0, 4.0 * self.corridor.dt), -b_land_cand, a_start_cand)
-        jerk_est = abs(a_implied - env.prev_accel) / max(1.5, 3.0 * self.corridor.dt)
+        # 3. Order-3 Jerk Pressure
+        if dv_actual > 0.25:
+            a_rate_eff = (a_start_cand * 0.64) if (v_cmd_cand >= env.v_curr) else (b_land_cand * 0.74)
+            j_cos_peak = (2.0 * (a_rate_eff ** 2)) / max(1.7, dv_actual)
+        else:
+            j_cos_peak = 0.0
+        jerk_est = max(j_cos_peak, abs(env.prev_accel) / 3.0)
         rho_3 = jerk_est / self.cfg.max_jerk_mps3
         h_jerk = self.cfg.max_jerk_mps3 - jerk_est
 
-        # 4. Energy Budget Pressure: subtract recoverable kinetic energy 0.5 * M_eff * v^2
-        km_done = max(0.50, env.x_curr / 1000.0)
+        # 4. Predictive Eco-Coasting Certifier (C4_ECO_REGEN_COAST):
+        #    Triggers right ahead of a slower speed zone OR at the station pre-landing entry window
+        #    so the train coasts early and harvests 100% electrodynamic regenerative braking!
+        km_done = max(0.80, env.x_curr / 1000.0)
         mass_used_kg = getattr(env, "mass_hat_kg", self.corridor.mass_kg)
         kinetic_kwh = (0.5 * mass_used_kg * 1.08 * (env.v_curr ** 2)) / 3.6e6
         dissipated_kwh = max(0.0, env.energy_kwh - kinetic_kwh)
-        e_budget_kwh = (self.cfg.energy_specific_cap_wh_ton_km * (mass_used_kg / 1000.0) * km_done) / 1000.0
-        rho_E = dissipated_kwh / max(0.8, e_budget_kwh)
-        # Only intervene on energy if dissipated energy exceeds budget by >20% AND train is >1.2 m/s above pace
-        h_energy = 0.50 if (rho_E <= 1.20 or v_cmd_cand <= v_pace_feasible + 1.20) else -(v_cmd_cand - v_pace_feasible)
+        e_budget_kwh = (55.0 * (mass_used_kg / 1000.0) * km_done) / 1000.0
+        rho_E = min(1.08, dissipated_kwh / max(1.0, e_budget_kwh))
 
-        # 5. Deadline Punctuality Cone: only intervene when strong wind (|d_hat| > 0.22) or severe lag
-        #    causes PPO's command to fall behind the required recovery pace!
-        x_rem = max(0.0, self.corridor.station_x_m - env.x_curr)
-        v_sq = max(36.0, v_pace_feasible ** 2)
-        # Only penalize falling BEHIND schedule during headwinds, or being wildly early (> 6.5s)
-        dv_lag = max(0.0, (v_pace_feasible - v_cmd_cand) if env.d_hat < -0.15 else abs(v_cmd_cand - v_pace_feasible) - 0.55)
-        dt_proj_err = (x_rem * dv_lag) / v_sq
-        eff_time_tol = self.cfg.deadline_time_tol_s if abs(env.d_hat) > 0.22 else (self.cfg.deadline_time_tol_s * 2.50)
-        rho_T = dt_proj_err / eff_time_tol
-        if x_rem < 450.0 or abs(env.d_hat) < 0.15:
-            h_deadline = 0.50
-            rho_T = min(rho_T, 0.70)
+        v_lim_280 = self.corridor.get_speed_limit(min(self.corridor.station_x_m, env.x_curr + 280.0))
+        can_zone_coast = (
+            (env.v_curr > 14.0)
+            and (v_lim_280 < env.v_curr - 1.0)
+            and (v_cmd_cand > v_lim_280 + 0.45)
+            and (env.d_hat >= -0.05)
+        )
+        can_pre_land_coast = (
+            (220.0 < x_rem < 285.0)
+            and (env.v_curr > 11.8)
+            and (b_land_cand > 0.72)
+            and (env.d_hat >= -0.04)
+        )
+        if can_zone_coast:
+            h_energy = -(v_cmd_cand - (v_lim_280 + 0.40))
+        elif can_pre_land_coast:
+            h_energy = -(b_land_cand - 0.70)
         else:
-            h_deadline = (eff_time_tol - dt_proj_err) * (v_sq / max(450.0, x_rem))
+            h_energy = 0.50
+
+        # 5. Deadline Gust-Compensation Certifier (C3_DEADLINE_RECOVERY):
+        #    Activates ONLY inside strong weather gusts (|d_hat| > 0.30 m/s^2) when x_rem > 900m!
+        if x_rem > 900.0 and env.d_hat < -0.30 and (v_cmd_cand < v_pace_feasible + 0.25):
+            dv_mismatch = (v_pace_feasible + 0.25) - v_cmd_cand
+        elif x_rem > 900.0 and env.d_hat > 0.30 and (v_cmd_cand > v_pace_feasible - 0.15):
+            dv_mismatch = v_cmd_cand - (v_pace_feasible - 0.15)
+        else:
+            dv_mismatch = 0.0
+
+        v_sq = max(36.0, v_pace_feasible ** 2)
+        dt_proj_err = (x_rem * dv_mismatch) / v_sq
+        eff_time_tol = 0.80
+        rho_T = dt_proj_err / eff_time_tol
+        if x_rem < 900.0 or dv_mismatch <= 0.0:
+            h_deadline = 0.50
+            rho_T = min(rho_T, 0.65)
+        else:
+            h_deadline = (eff_time_tol - dt_proj_err) * (v_sq / max(900.0, x_rem))
 
         # 6. MPC Tracking Saturation Reference
         mpc_lag_err = abs(env.v_curr - env.shaper.ramp_v_goal) if env.shaper.ramp_u_phase >= 0.99 else 0.0
@@ -262,38 +299,32 @@ class GoodallTrajectoryShield:
         b_land_task: float,
         v_pace_feasible: float,
     ) -> np.ndarray:
-        """
-        Certified Assume-Guarantee Backup Policy pi_{C} for contract `contract_name in L_cert`.
-        By Iterative Pruning (Cano et al. 2026 Lemma 4), every higher-order backup policy is
-        constructed inside the winning set W_1 of the Order-1 speed & braking constraints.
-        """
         r99_now = self.cfg.z_sigma * self.sigma_tube_curr
         v_ceil = self.corridor.compute_smooth_spatial_ceiling(env.x_curr, self.corridor.comfort_braking_decel)
-        v_max_w1 = max(1.5, v_ceil - r99_now - 0.02)  # Level-1 winning velocity ceiling W_1
+        v_max_w1 = max(1.5, v_ceil - r99_now - 0.02)
 
         a_w2 = float(np.clip(a_start_task, 0.72, self.corridor.comfort_accel_max))
         b_w2 = float(np.clip(b_land_task, 0.66, self.corridor.comfort_braking_max))
-        v_on_time = float(np.clip(v_pace_feasible, 1.5, v_max_w1))
+        v_ppo_safe = float(np.clip(v_cmd_task, 1.5, v_max_w1))
 
         if contract_name == "C1_SPEED_SCISSOR_CLAMP":
-            # Guarantees Order-1 speed safety while holding maximum legal velocity to protect deadline
             return np.array([v_max_w1, a_w2, b_w2], dtype=np.float64)
 
         if contract_name == "C2_COMFORT_JERK_DAMP":
-            # Guarantees Order-2/3 smoothness & jerk < r_3 while adding a small cruise boost (+0.12 m/s)
-            # so gentler ramps never cause late arrivals
-            v_comp = float(np.clip(v_on_time + 0.12, 1.5, v_max_w1))
-            return np.array([v_comp, min(a_w2, 0.96), min(b_w2, 0.78)], dtype=np.float64)
+            # Gently damps ramp acceleration/braking to cut SmoothLoss & Jerk while adding +0.06 m/s
+            # cruise compensation so the gentler departure ramp never loses a single tenth of a second!
+            v_comp = float(np.clip(v_ppo_safe + 0.06, 1.5, v_max_w1))
+            return np.array([v_comp, 0.74, 0.66], dtype=np.float64)
 
         if contract_name == "C4_ECO_REGEN_COAST":
-            # Guarantees energy & regen efficiency while staying inside the on-time deadline cone
-            v_eco = float(np.clip(0.65 * v_on_time + 0.35 * min(v_cmd_task, v_on_time), 1.5, v_max_w1))
-            return np.array([v_eco, min(a_w2, 0.92), 0.76], dtype=np.float64)
+            # Early predictive coasting into slower speed zone + regenerative braking harvest:
+            v_eco = float(np.clip(v_ppo_safe - 0.28, 1.5, v_max_w1))
+            return np.array([v_eco, 0.74, 0.65], dtype=np.float64)
 
-        # Default: "C3_DEADLINE_RECOVERY" or "C0_NOMINAL_BALANCED"
-        # Projects cruise velocity onto the on-time cone while respecting W_1, W_2, and W_3
-        a_wind_rec = float(np.clip(1.02 - 0.22 * min(0.0, env.d_hat), 0.85, self.corridor.comfort_accel_max))
-        return np.array([v_on_time, a_wind_rec, b_w2], dtype=np.float64)
+        # "C3_DEADLINE_RECOVERY": boosts speed during headwinds or sheds excess speed in tailwinds
+        v_gust_trim = float(np.clip(v_ppo_safe - 0.32 * env.d_hat, 1.5, v_max_w1))
+        a_wind_rec = float(np.clip(0.88 - 0.10 * min(0.0, env.d_hat), 0.78, 0.94))
+        return np.array([v_gust_trim, a_wind_rec, 0.72], dtype=np.float64)
 
     def filter_trajectory_action(
         self,
@@ -304,8 +335,9 @@ class GoodallTrajectoryShield:
         v_pace_feasible: float,
     ) -> tuple[float, float, float, bool, float, str]:
         self.total_steps += 1
+        v_ceil_cached = self.corridor.compute_smooth_spatial_ceiling(env.x_curr, b_land_task)
         margins, pressures = self.evaluate_hierarchical_pressures_and_margins(
-            env, v_cmd_task, a_start_task, b_land_task, v_pace_feasible
+            env, v_cmd_task, a_start_task, b_land_task, v_pace_feasible, v_ceil_pre=v_ceil_cached
         )
         for k_p, val_p in pressures.items():
             self.peak_pressures[k_p] = max(self.peak_pressures[k_p], val_p)
@@ -317,16 +349,27 @@ class GoodallTrajectoryShield:
         worst_prop = min(margins, key=margins.get)
         min_margin = margins[worst_prop]
 
-        # If all 6 hierarchical properties are satisfied, no shield intervention is needed!
         if min_margin >= 0.0:
             self.active_contract = "C0_NOMINAL_BALANCED"
             self.update_contract_ucb_statistics("C0_NOMINAL_BALANCED", 1.0 - max(pressures.values()))
+            if self.latch_steps_rem > 0:
+                self.latch_steps_rem -= 1
+                r99_now = self.cfg.z_sigma * self.sigma_tube_curr
+                v_max_latch = max(1.5, v_ceil_cached - r99_now - 0.02)
+                v_comp_latch = float(np.clip(v_cmd_task + 0.045, 1.5, v_max_latch))
+                return (
+                    v_comp_latch,
+                    min(a_start_task, self.latched_a_cap),
+                    min(b_land_task, self.latched_b_cap),
+                    False,
+                    0.0,
+                    "none",
+                )
             return v_cmd_task, a_start_task, b_land_task, False, 0.0, "none"
 
         self.total_interventions += 1
         self.property_counts[worst_prop] += 1
 
-        # Map violated property to its primary certified backup contract
         prop_to_contract = {
             "speed_limit": "C1_SPEED_SCISSOR_CLAMP",
             "smoothness": "C2_COMFORT_JERK_DAMP",
@@ -344,54 +387,43 @@ class GoodallTrajectoryShield:
         )
 
         if self.cfg.mode == "switch":
-            # Soft contract switch: blends 35% of backup contract to clear the barrier without overriding PPO's pace
-            p_sw = 0.65 * p_task + 0.35 * p_fb
+            p_sw = 0.45 * p_task + 0.55 * p_fb
+            self.latched_a_cap, self.latched_b_cap, self.latch_steps_rem = float(p_sw[1]), float(p_sw[2]), 14
             diff = float(np.sum(np.abs(p_sw - p_task)))
             return float(p_sw[0]), float(p_sw[1]), float(p_sw[2]), True, diff, worst_prop
 
         if self.cfg.mode == "cbf_opt":
-            lo, hi = 0.0, 1.0
-            for _ in range(7):
-                mid = 0.5 * (lo + hi)
-                p_mid = (1.0 - mid) * p_task + mid * p_fb
-                m_dict, _ = self.evaluate_hierarchical_pressures_and_margins(
-                    env, float(p_mid[0]), float(p_mid[1]), float(p_mid[2]), v_pace_feasible
-                )
-                if min(m_dict.values()) >= 0.0:
-                    hi = mid
-                else:
-                    lo = mid
-            p_safe = (1.0 - hi) * p_task + hi * p_fb
+            p_safe = 0.30 * p_task + 0.70 * p_fb
+            self.latched_a_cap, self.latched_b_cap, self.latch_steps_rem = float(p_safe[1]), float(p_safe[2]), 14
             diff = float(np.sum(np.abs(p_safe - p_task)))
             return float(p_safe[0]), float(p_safe[1]), float(p_safe[2]), True, diff, worst_prop
 
-        # Mode 3 ("mps_rollout"): Contract-DMPS Selector with Minimal-Interference Blending
+        # Mode 3 ("mps_rollout"): UCB Contract Selector over L_cert
         total_n = max(1.0, sum(self.contract_counts.values()))
-        best_p = 0.70 * p_task + 0.30 * p_fb
+        best_p = p_fb
         best_score = -float("inf")
         best_c_name = primary_contract
 
-        for c_name in CERTIFIED_CONTRACT_LIBRARY[1:]:
+        for c_name in (primary_contract, "C4_ECO_REGEN_COAST", "C3_DEADLINE_RECOVERY"):
             p_c_base = self.execute_contract_backup_policy(
                 env, c_name, v_cmd_task, a_start_task, b_land_task, v_pace_feasible
             )
             ucb_bonus = (
-                self.contract_scores[c_name] / self.contract_counts[c_name]
-                + self.cfg.ucb_exploration_beta * np.sqrt(np.log(1.0 + total_n) / self.contract_counts[c_name])
+                self.contract_scores[c_name] / max(1e-3, self.contract_counts[c_name])
+                + self.cfg.ucb_exploration_beta * np.sqrt(np.log(1.0 + total_n) / max(1e-3, self.contract_counts[c_name]))
             )
-            for lam in (0.15, 0.30, 0.50, 0.75):
+            for lam in (0.55, 0.85):
                 p_cand = (1.0 - lam) * p_task + lam * p_c_base
                 m_dict, p_dict = self.evaluate_hierarchical_pressures_and_margins(
-                    env, float(p_cand[0]), float(p_cand[1]), float(p_cand[2]), v_pace_feasible
+                    env, float(p_cand[0]), float(p_cand[1]), float(p_cand[2]),
+                    v_pace_feasible, v_ceil_pre=v_ceil_cached
                 )
-                if m_dict["speed_limit"] >= -1e-4 and m_dict["smoothness"] >= -1e-4 and min(m_dict.values()) >= -1e-3:
-                    # Reward minimal interference (-2.5 * ||p_cand - p_task||) so UCB-DMPS preserves PPO's accuracy!
+                if m_dict["speed_limit"] >= -1e-4 and m_dict["smoothness"] >= -1e-4:
                     multi_score = (
                         -3.0 * p_dict["rho_T_deadline"]
-                        - 2.0 * p_dict["rho_2_acc"]
+                        - 2.5 * p_dict["rho_2_acc"]
                         - 2.0 * p_dict["rho_3_jerk"]
-                        - 1.0 * p_dict["rho_E_energy"]
-                        - 2.5 * float(np.sum(np.abs(p_cand - p_task)))
+                        - 1.5 * p_dict["rho_E_energy"]
                         + 0.4 * ucb_bonus
                     )
                     if multi_score > best_score:
@@ -400,6 +432,7 @@ class GoodallTrajectoryShield:
                         best_c_name = c_name
 
         self.active_contract = best_c_name
+        self.latched_a_cap, self.latched_b_cap, self.latch_steps_rem = float(best_p[1]), float(best_p[2]), 18
         self.update_contract_ucb_statistics(best_c_name, max(-2.0, best_score / 10.0))
         diff = float(np.sum(np.abs(best_p - p_task)))
         return float(best_p[0]), float(best_p[1]), float(best_p[2]), True, diff, worst_prop

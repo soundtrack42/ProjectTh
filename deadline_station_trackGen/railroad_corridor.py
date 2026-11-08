@@ -70,13 +70,13 @@ class RailroadCorridor:
 
     @property
     def max_traction_accel(self) -> float:
-        """Mass- and rail-adhesion-scaled traction limit (Rain/Snow reduces wheel-rail friction)."""
+        """Physical traction limit scaled by vehicle mass and rail adhesion."""
         mass_scale = 85000.0 / max(65000.0, self.mass_kg)
         return float(self.base_max_traction_accel * mass_scale * self.adhesion_mu_factor)
 
     @property
     def max_service_braking(self) -> float:
-        """Mass- and rail-adhesion-scaled braking limit (Rain/Snow requires earlier braking spot)."""
+        """Physical service braking limit scaled by vehicle mass and rail adhesion."""
         mass_scale = 85000.0 / max(65000.0, self.mass_kg)
         return float(self.base_max_service_braking * mass_scale * self.adhesion_mu_factor)
 
@@ -88,19 +88,31 @@ class RailroadCorridor:
 
     def compute_smooth_spatial_ceiling(self, x_m: float, b_shift_down: float = 0.78) -> float:
         """
-        C^1-smooth half-cosine anticipatory ceiling ahead of every slower speed zone
-        so every downward speed shift is a gentle S-curve inside the comfort range.
+        C^1-smooth half-cosine anticipatory ceiling ahead of every slower speed zone.
+        Enforces both deceleration comfort and Order-3 jerk comfort scaled by `b_shift_down`
+        so gentler braking commands (`b_shift_down ~ 0.68`) trace wider, lower-jerk S-curves
+        while greedy braking (`b_shift_down ~ 0.90`) brakes later and steeper.
         """
         v_here = self.get_speed_limit(x_m)
-        b_safe = float(np.clip(b_shift_down, 0.50, min(self.comfort_braking_max, self.max_service_braking * 0.85)))
+        b_ratio = float(np.clip(b_shift_down / 0.78, 0.75, 1.25))
+        b_safe = float(np.clip(b_shift_down * 0.76, 0.42, 0.74))
+        j_max_zone = float(0.22 * (b_ratio ** 1.6))
 
         for z in self.speed_zones:
             if z.x_start > x_m and z.v_limit_mps < v_here:
                 dx_to_zone = z.x_start - x_m
-                dx_drop = (np.pi * max(0.0, (v_here ** 2) - (z.v_limit_mps ** 2))) / (4.0 * b_safe)
+                dv_drop = v_here - z.v_limit_mps
+                v_mean = 0.5 * (v_here + z.v_limit_mps)
+                # Duration required by both comfort deceleration and comfort jerk:
+                t_acc_req = (np.pi * dv_drop) / (2.0 * b_safe)
+                t_jrk_req = np.pi * float(np.sqrt(dv_drop / (2.0 * j_max_zone)))
+                min_drop_dur = float(14.0 / b_ratio)
+                t_drop = max(min_drop_dur, t_acc_req, t_jrk_req)
+                dx_drop = v_mean * t_drop
+
                 if dx_to_zone < dx_drop and dx_drop > 1.0:
                     u_s = float(np.clip(1.0 - (dx_to_zone / dx_drop), 0.0, 1.0))
-                    v_cos_zone = z.v_limit_mps + (v_here - z.v_limit_mps) * 0.5 * (1.0 + float(np.cos(np.pi * u_s)))
+                    v_cos_zone = z.v_limit_mps + dv_drop * 0.5 * (1.0 + float(np.cos(np.pi * u_s)))
                     v_here = min(v_here, v_cos_zone)
         return float(v_here)
 
@@ -108,59 +120,59 @@ class RailroadCorridor:
 def generate_disjoint_wind_events(
     total_duration_s: float = 600.0,
     dt: float = 0.50,
-    n_events: int | None = None,
-    min_event_dur_s: float = 35.0,
-    max_event_dur_s: float = 65.0,
-    min_calm_gap_s: float = 40.0,
+    calm_deadband_mps2: float = 0.34,
     seed: int | None = None,
 ) -> tuple[np.ndarray, str, list[tuple[float, float, float]]]:
     """
-    Generates strictly disjoint spurious wind events separated by calm zero-wind gaps.
-    Events never overlap and have C^1-smooth cosine bell envelopes.
+    Generates a continuous scalar wind field w_raw(t) where active gusts are casual,
+    isolated events (~15-20% of the trip) separated by long stretches of calm air (0.0 m/s^2).
     """
     rng = np.random.default_rng(seed)
-    if n_events is None:
-        n_events = 2
-
     n_steps = int(np.ceil(total_duration_s / dt)) + 40
-    wind_profile = np.zeros(n_steps, dtype=np.float64)
+    t_grid = np.arange(n_steps, dtype=np.float64) * dt
 
-    usable_start_s = 16.0
-    usable_end_s = max(usable_start_s + 160.0, total_duration_s - 150.0)
-    cursor_s = usable_start_s
+    # Generate 2 distinct casual weather fronts per leg: one Headwind (<0) and one Tailwind (>0)
+    first_sign = -1.0 if (rng.random() < 0.5) else 1.0
+    w_raw = np.zeros(n_steps, dtype=np.float64)
+    for f_i in range(2):
+        center_s = float(rng.uniform(0.08 + 0.45 * f_i, 0.35 + 0.45 * f_i) * total_duration_s)
+        width_s = float(rng.uniform(24.0, 36.0))
+        sign = first_sign if (f_i == 0) else -first_sign
+        peak = sign * float(rng.uniform(0.62, 0.82))
+        w_raw += peak * np.exp(-0.5 * ((t_grid - center_s) / width_s) ** 2)
 
-    base_sign = -1.0 if rng.random() < 0.55 else 1.0
-    signs = [base_sign]
-    for i in range(1, n_events):
-        signs.append(-signs[-1] if rng.random() < 0.80 else signs[-1])
+    # Smooth C^1 deadband thresholding (no artificial departure taper at t=0!)
+    wind_profile = np.where(
+        np.abs(w_raw) > calm_deadband_mps2,
+        np.sign(w_raw) * (np.abs(w_raw) - calm_deadband_mps2) * 1.25,
+        0.0,
+    )
+    wind_profile = np.clip(wind_profile, -0.58, 0.52)
 
+    # 2. Measure the emergent disjoint intervals [t_s, t_e] from the generated trace
+    active_mask = np.abs(wind_profile) > 0.02
     event_meta = []
     descriptions = []
+    k = 0
+    ev_id = 1
+    while k < n_steps:
+        if active_mask[k]:
+            k_start = k
+            while k < n_steps and active_mask[k] and (np.sign(wind_profile[k]) == np.sign(wind_profile[k_start])):
+                k += 1
+            k_end = k
+            if (k_end - k_start) * dt >= 8.0:
+                t_s, t_e = k_start * dt, k_end * dt
+                seg = wind_profile[k_start:k_end]
+                peak_val = float(seg[np.argmax(np.abs(seg))])
+                event_meta.append((t_s, t_e, peak_val))
+                tag = "Headwind" if peak_val < 0 else "Tailwind"
+                descriptions.append(f"E{ev_id}:{tag}({peak_val:+.2f}m/s²,[{t_s:.0f}s,{t_e:.0f}s])")
+                ev_id += 1
+        else:
+            k += 1
 
-    for i in range(n_events):
-        dur_s = float(rng.uniform(min_event_dur_s, max_event_dur_s))
-        rem_events = n_events - 1 - i
-        latest_start = usable_end_s - dur_s - rem_events * (min_event_dur_s + min_calm_gap_s)
-        start_s = cursor_s if cursor_s >= latest_start else float(rng.uniform(cursor_s, latest_start))
-        end_s = start_s + dur_s
-        cursor_s = end_s + min_calm_gap_s
-
-        sgn = signs[i]
-        mag = float(rng.uniform(0.36, 0.58)) * sgn
-        k_s = int(start_s / dt)
-        k_e = min(n_steps, int(end_s / dt))
-        k_len = max(4, k_e - k_s)
-
-        tau = np.linspace(0.0, 1.0, k_len)
-        bell_env = 0.5 * (1.0 - np.cos(2.0 * np.pi * tau))
-        swell = 1.0 + 0.14 * np.sin(2.0 * np.pi * tau)
-        wind_profile[k_s:k_e] = np.clip(mag * bell_env * swell, -0.65, 0.58)
-
-        event_meta.append((start_s, end_s, mag))
-        tag = "Headwind" if sgn < 0 else "Tailwind"
-        descriptions.append(f"E{i+1}:{tag}({mag:+.2f}m/s²,[{start_s:.0f}s,{end_s:.0f}s])")
-
-    return wind_profile, " | ".join(descriptions), event_meta
+    return wind_profile, (" | ".join(descriptions) if descriptions else "Calm"), event_meta
 
 
 def generate_continuous_evolving_wind(
@@ -220,53 +232,50 @@ def _build_leg_zones(leg_length_m: float, rng: np.random.Generator) -> tuple[lis
 
 def generate_multi_station_scenario(
     seed: int,
-    n_legs: int = 3,
+    n_legs: int | None = None,
     wind_mode: str = "disjoint",
     allow_infeasible_breaks: bool = True,
 ) -> dict:
     """
-    Generates a long 3-Station Multi-Leg Railway Journey (total length ~15 - 17.5 km,
-    total duration ~1250 - 1450 s) with:
-      - 3 consecutive station landings (`n_legs = 3`, each leg 4.8 - 5.9 km),
-      - Realistic passenger boarding & alighting at each station stop, changing the
-        physical mass of the 4-car train (`M_tare = 72,000 kg` + `75 kg * n_passengers`),
-      - Disjoint spurious wind events on each leg, and
-      - ~20% infeasible "rule-breaking" leg deadlines to test RL & Shield behavior.
+    Generates a generalized Multi-Station Railway Journey with:
+      - Variable number of stations / legs `n_legs in {1, 2, 3, 4, 5}` (when n_legs is None or <= 0),
+      - Generalized leg lengths in [3.8 km, 6.4 km] (total route length from ~4 km to ~31 km),
+      - Stochastic passenger boarding/alighting mass changes at each station stop,
+      - Continuous scalar wind field with emergent disjoint gusts.
     """
     rng = np.random.default_rng(seed)
+    if n_legs is None or n_legs <= 0:
+        n_legs = int(rng.integers(1, 6))  # Randomly sample 1 to 5 stations per scenario!
+
     tare_mass_kg = 72000.0
     max_train_capacity = 360
-    curr_passengers = int(rng.integers(120, 185))
+    curr_passengers = int(rng.integers(110, 190))
     curr_tickets = int(np.clip(curr_passengers + rng.integers(-18, 22), 40, max_train_capacity))
     t_clock = float(np.round(rng.uniform(0.0, 30.0) * 2.0) / 2.0)
     cum_x_m = 0.0
 
-    # Sample environmental weather & rail-friction condition for the journey
-    weather_choices = [
-        ("Dry", 1.00, float(rng.uniform(14.0, 24.0))),
-        ("Rain", float(rng.uniform(0.82, 0.88)), float(rng.uniform(6.0, 13.0))),
-        ("Snow", float(rng.uniform(0.72, 0.78)), float(rng.uniform(-6.0, 1.0))),
-    ]
-    w_idx = int(rng.choice([0, 1, 2], p=[0.55, 0.30, 0.15]))
-    weather_name, mu_adhesion, temp_c = weather_choices[w_idx]
-
+    weather_name, mu_adhesion, temp_c = "Dry", 1.00, 18.0
     legs = []
-    station_names = ["Central Station", "Midtown Hub", "Tech Park Terminal", "Airport Express"]
+    station_names = [
+        "Central Station", "Midtown Hub", "Tech Park",
+        "University Pkwy", "Harbor Cross", "Airport Terminal",
+    ]
 
     for leg_idx in range(n_legs):
-        leg_len_m = float(np.round(rng.uniform(4900.0, 5800.0) / 50.0) * 50.0)
+        # Generalized leg length between 3,800 m and 6,400 m (total journey 3.8 km - 32.0 km)
+        leg_len_m = float(np.round(rng.uniform(3800.0, 6400.0) / 50.0) * 50.0)
         zones, min_feas_s = _build_leg_zones(leg_len_m, rng)
 
-        # 1. Stochastic Passenger Boarding/Alighting (Capped at max_train_capacity = 360)
+        # Stochastic Passenger Boarding/Alighting across 1..5 stations
         if leg_idx == 0:
             n_leave, n_join = 0, curr_passengers
-        elif leg_idx == 1:
-            n_leave = int(rng.integers(25, 65))
-            n_join = int(rng.integers(115, 185))
-            curr_passengers = int(np.clip(curr_passengers - n_leave + n_join, 40, max_train_capacity))
+        elif leg_idx % 2 == 1:
+            n_leave = int(rng.integers(20, min(70, curr_passengers - 10)))
+            n_join = int(rng.integers(90, 175))
+            curr_passengers = int(np.clip(curr_passengers - n_leave + n_join, 35, max_train_capacity))
         else:
-            n_leave = int(rng.integers(100, min(210, curr_passengers - 20)))
-            n_join = int(rng.integers(20, 75))
+            n_leave = int(rng.integers(75, min(190, curr_passengers - 15)))
+            n_join = int(rng.integers(20, 80))
             curr_passengers = int(np.clip(curr_passengers - n_leave + n_join, 30, max_train_capacity))
 
         # 2. Sold Tickets vs. Missed-Train Passengers, Evaders & Per-Passenger Weight Variance
@@ -292,17 +301,42 @@ def generate_multi_station_scenario(
         leg_deadline_s = t_clock + leg_budget_s
         dwell_s = 25.0 if leg_idx < n_legs - 1 else 0.0
 
-        if wind_mode == "continuous":
-            w_prof, w_desc, w_meta = generate_continuous_evolving_wind(
-                leg_budget_s + 150.0, 0.50, seed=seed * 31 + leg_idx
+        # Use scenario RNG (at leg_idx == 0) to decide Clean vs Weather-Disturbed (no seed-modulo pattern!)
+        if leg_idx == 0:
+            is_scenario_weather = (wind_mode != "none") and (
+                True if wind_mode in ("disjoint", "continuous") else ( (seed // 29) % 2 == 0 )
             )
-        else:
-            w_prof, w_desc, w_meta = generate_disjoint_wind_events(
-                leg_budget_s + 150.0, 0.50, seed=seed * 31 + leg_idx
-            )
+        is_weather_active = is_scenario_weather
 
-        # Wayside station anemometer reading at departure (with small sensor noise)
-        station_wind_reading = float(w_prof[0] + rng.normal(0.0, 0.015))
+        if not is_weather_active:
+            n_st = int(np.ceil((leg_budget_s + 150.0) / 0.50)) + 40
+            w_prof, w_desc, w_meta = np.zeros(n_st, dtype=np.float64), "Clean (No Weather)", []
+            weather_name, mu_adhesion, temp_c = "Clear-Dry", 1.00, 20.0
+        else:
+            if wind_mode == "continuous":
+                w_prof, w_desc, w_meta = generate_continuous_evolving_wind(
+                    leg_budget_s + 150.0, 0.50, seed=seed * 31 + leg_idx
+                )
+            else:
+                w_prof, w_desc, w_meta = generate_disjoint_wind_events(
+                    leg_budget_s + 150.0, 0.50, calm_deadband_mps2=0.22, seed=seed * 31 + leg_idx
+                )
+            # Sample unseen weather regime (Windy-Dry, Rain-WetRail, Cold-Humid, or Snow-Slush):
+            w_type = int(rng.choice([0, 1, 2, 3], p=[0.30, 0.30, 0.20, 0.20]))
+            if w_type == 0:
+                weather_name, mu_adhesion, temp_c = "Windy-Dry", 1.00, 16.0
+            elif w_type == 1:
+                weather_name, mu_adhesion, temp_c = "Rain-WetRail", 0.86, 8.0
+                w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.15, 0.0)
+            elif w_type == 2:
+                weather_name, mu_adhesion, temp_c = "Cold-Humid", 0.92, -6.0
+                w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.12, 0.0)
+            else:
+                weather_name, mu_adhesion, temp_c = "Snow-Slush", 0.80, -3.0
+                w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.20, 0.0)
+
+        # Wayside station sensor at departure (t=0):
+        station_wind_reading = float(w_prof[0] + rng.normal(0.0, 0.01)) if is_weather_active else 0.0
 
         corridor = RailroadCorridor(
             route_name=f"Leg {leg_idx+1} ({station_names[leg_idx]} -> {station_names[leg_idx+1]})",
@@ -354,5 +388,6 @@ def generate_multi_station_scenario(
         "total_length_m": cum_x_m,
         "total_scheduled_time_s": legs[-1]["deadline_s"] - legs[0]["t_start"],
         "has_infeasible_leg": any(l["is_infeasible"] for l in legs),
+        "is_weather_disturbed": is_weather_active,
         "legs": legs,
     }

@@ -17,11 +17,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from deadline_station_trackGen.pure_mpc_controller import PureLiuMPC
+from pure_mpc_controller import PureLiuMPC
 from fuzzy_pid_controller import FuzzyPIDController
 from deadline_station_trackGen.safety_shield import SafetyFilterShield, ShieldConfig, compute_and_print_shield_scissor_band
-import deadline_station_trackGen.havaei_generalizing_rl as hrl
-from deadline_station_trackGen.havaei_generalizing_rl import (
+import havaei_generalizing_rl as hrl
+from havaei_generalizing_rl import (
     HYBRID_ALGORITHMS,
     COMPUTED_PID_BANK,
     HardcodedSwitchController,

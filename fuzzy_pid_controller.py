@@ -133,7 +133,7 @@ def optimize_fuzzy_pid_via_ilr_pso(
     Evaluates the ITAE + overshoot + settling objective across a representative multi-regime
     train speed profile (acceleration, shift jump, grade resistance, and station stop).
     """
-    from deadline_station_trackGen.havaei_generalizing_rl import COMPUTED_PID_BANK
+    from havaei_generalizing_rl import COMPUTED_PID_BANK
 
     # Base bounds around the Cardano-optimized PID operating region
     ga_base = COMPUTED_PID_BANK["GA"]

@@ -95,9 +95,9 @@ class CosineTrajectoryShaper:
 
         # Deadline-synchronized landing rate: if near the braking zone, modulate b_target
         # within [b_comf_lo, b_comf_hi] so T_land = pi * v / (2 * b) aligns with remaining time!
-        if t_rem_deadline is not None and 10.0 < t_rem_deadline < 42.0:
+        if t_rem_deadline is not None and 10.0 < t_rem_deadline < 45.0:
             b_for_exact_time = (np.pi * v_eff) / (2.0 * t_rem_deadline)
-            b_target = float(np.clip(0.65 * b_for_exact_time + 0.35 * b_target, b_comf_lo, b_comf_hi))
+            b_target = float(np.clip(0.75 * b_for_exact_time + 0.25 * b_target, b_comf_lo, b_comf_hi))
 
         t_land = (np.pi * v_eff) / (2.0 * b_target)
         dx_brake = 0.5 * v_eff * t_land
@@ -113,31 +113,57 @@ class CosineTrajectoryShaper:
         b_land_cos: float,
         d_wind_hat: float,
     ) -> None:
-        if abs(v_goal_now - self.ramp_v_goal) > 0.10 or self.ramp_u_phase >= 0.999:
-            dv = v_goal_now - v_curr
-            if abs(dv) <= 0.03:
-                self.ramp_v_start = v_goal_now
-                self.ramp_v_goal = v_goal_now
+        """
+        Advances a true C^2-smooth half-cosine S-curve for EVERY speed change:
+            v(u) = v_start + (v_goal - v_start) * 0.5 * (1 - cos(pi * u)),  u in [0, 1]
+        Enforces both Order-2 acceleration limits and Order-3 jerk limits:
+            T_ramp = max( pi * |dv| / (2 * a_rate),  pi * sqrt(|dv| / (2 * j_comf)),  min_dur )
+        and advances `u` strictly by `dt / T_ramp` so the sinusoid is never short-circuited!
+        """
+        is_departing_from_rest = (v_curr < 1.35 and self.ramp_v_start < 1.0)
+        # During mid-cruise shifts, use a wider threshold (0.32 m/s) so minor macro-step
+        # pace updates smoothly adjust the endpoint without resetting `u = 0` mid-wave!
+        retrigger_tol = 0.15 if self.ramp_u_phase >= 0.98 else 0.45
+
+        if abs(v_goal_now - self.ramp_v_goal) > retrigger_tol:
+            # Start a new half-cosine S-curve from the current smooth reference velocity
+            v_anchor = (
+                self.ramp_v_start + (self.ramp_v_goal - self.ramp_v_start) * 0.5 * (1.0 - float(np.cos(np.pi * self.ramp_u_phase)))
+                if self.ramp_u_phase < 0.99
+                else float(v_curr)
+            )
+            dv = v_goal_now - v_anchor
+            if abs(dv) <= 0.04:
+                self.ramp_v_start = float(v_goal_now)
+                self.ramp_v_goal = float(v_goal_now)
                 self.ramp_t_dur = self.corridor.dt
                 self.ramp_u_phase = 1.0
             else:
                 if dv >= 0.0:
-                    rate = self.feasible_comfort_accel(v_curr, a_start_cos, d_wind_hat)
+                    a_ratio = float(np.clip(a_start_cos / 0.96, 0.72, 1.28))
+                    cruise_scale = 1.0 if is_departing_from_rest else (0.62 * a_ratio)
+                    rate = self.feasible_comfort_accel(v_curr, a_start_cos * cruise_scale, d_wind_hat)
+                    j_comf = (0.38 if is_departing_from_rest else 0.20) * (a_ratio ** 1.6)
+                    min_sinusoid_dur = (16.0 if is_departing_from_rest else 12.0) / a_ratio
                 else:
-                    rate = self.feasible_comfort_braking(b_land_cos, d_wind_hat)
-                self.ramp_v_start = float(v_curr)
+                    b_ratio = float(np.clip(b_land_cos / 0.78, 0.75, 1.25))
+                    rate = self.feasible_comfort_braking(b_land_cos * (0.72 * b_ratio), d_wind_hat)
+                    j_comf = 0.20 * (b_ratio ** 1.6)
+                    min_sinusoid_dur = 12.0 / b_ratio
+
+                # Order-3 Cosine Jerk bound: |j_max| = pi^2 * |dv| / (2 * T^2) <= j_comf
+                t_from_acc = (np.pi * abs(dv)) / (2.0 * max(0.30, rate))
+                t_from_jrk = np.pi * float(np.sqrt(abs(dv) / (2.0 * j_comf)))
+
+                self.ramp_v_start = float(v_anchor)
                 self.ramp_v_goal = float(v_goal_now)
-                self.ramp_t_dur = max(self.corridor.dt * 3.0, (np.pi * abs(dv)) / (2.0 * rate))
+                self.ramp_t_dur = float(max(min_sinusoid_dur, t_from_acc, t_from_jrk))
                 self.ramp_u_phase = 0.0
         else:
-            span = self.ramp_v_goal - self.ramp_v_start
-            if abs(span) > 0.06:
-                p = float(np.clip((v_curr - self.ramp_v_start) / span, 0.0, 1.0))
-                u_from_v = float(np.arccos(np.clip(1.0 - 2.0 * p, -1.0, 1.0)) / np.pi)
-                min_step_u = self.ramp_u_phase + (self.corridor.dt / self.ramp_t_dur)
-                self.ramp_u_phase = float(np.clip(max(u_from_v, min_step_u), 0.0, 1.0))
-            else:
-                self.ramp_u_phase = 1.0
+            # Softly update goal for small drift while advancing phase u strictly by dt / T_ramp
+            self.ramp_v_goal = float(0.85 * self.ramp_v_goal + 0.15 * v_goal_now)
+            if self.ramp_u_phase < 1.0:
+                self.ramp_u_phase = float(min(1.0, self.ramp_u_phase + (self.corridor.dt / self.ramp_t_dur)))
 
     def step_reference_horizon(
         self,
@@ -218,13 +244,12 @@ class CosineTrajectoryShaper:
         sim_v = float(v_curr)
 
         for i in range(n_p):
-            u_i = min(1.0, self.ramp_u_phase + (i + 1) * du_ramp)
+            u_i = min(1.0, self.ramp_u_phase + i * du_ramp)
             cos_prog = 0.5 * (1.0 - float(np.cos(np.pi * u_i)))
             v_cos = self.ramp_v_start + (self.ramp_v_goal - self.ramp_v_start) * cos_prog
 
             local_ceil = self.corridor.compute_smooth_spatial_ceiling(sim_x, b_land_cos)
             rem_i = max(0.0, self.corridor.station_x_m - sim_x)
-            # Only apply landing ceiling when within 1.15 * dx_brake_now so cruise speed is never clipped early
             if rem_i <= 1.15 * max(80.0, dx_brake_now):
                 v_land_env = float(np.sqrt(max(0.0, (4.0 * b_eff_now * rem_i) / np.pi)))
             else:

@@ -188,8 +188,10 @@ class PureLiuMPC:
             return float(U_unc[0, 0])
 
         U = np.clip(U_unc, self.u_min, self.u_max)
-        step_lr = 1.0 / (float(np.max(np.linalg.eigvalsh(H))) + 1e-6)
-        for _ in range(12):
+        # Fast O(1) Gershgorin upper bound on max eigenvalue (avoids slow LAPACK eigvalsh spike!):
+        max_eig_bound = float(np.max(np.sum(np.abs(H), axis=1)))
+        step_lr = 1.0 / (max_eig_bound + 1e-6)
+        for _ in range(10):
             U_new = np.clip(U - step_lr * (H @ U + g), self.u_min, self.u_max)
             if float(np.max(np.abs(U_new - U))) < 1e-5:
                 U = U_new
