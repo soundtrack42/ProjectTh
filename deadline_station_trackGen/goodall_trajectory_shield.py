@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -76,7 +77,17 @@ class GoodallTrajectoryShield:
         self.emulator = emulator
         self.cfg = config if config is not None else TrajectoryShieldConfig()
         assert self.cfg.mode in ("switch", "cbf_opt", "mps_rollout")
-        self._feat_buf = torch.zeros((1, 8), dtype=torch.float32)
+        self._feat_buf = np.zeros(5, dtype=np.float32)
+        if self.emulator is not None:
+            net = self.emulator.net
+            self._emu_w1 = net[0].weight.detach().numpy()[:, :5].T
+            self._emu_b1 = net[0].bias.detach().numpy()
+            self._emu_w2 = net[2].weight.detach().numpy().T
+            self._emu_b2 = net[2].bias.detach().numpy()
+            self._emu_w3 = net[4].weight.detach().numpy().T
+            self._emu_b3 = net[4].bias.detach().numpy()
+        else:
+            self._emu_w1 = None
 
         # Point directly to persistent learned UCB contract statistics:
         self.contract_counts = GLOBAL_LEARNED_CONTRACT_COUNTS
@@ -127,38 +138,46 @@ class GoodallTrajectoryShield:
         sigma_v_curr: float,
         d_wind_hat: float = 0.0,
     ) -> tuple[float, float, float]:
-        u_clamped = float(np.clip(u_cmd, -1.0, 1.0))
+        u_clamped = -1.0 if u_cmd < -1.0 else (1.0 if u_cmd > 1.0 else float(u_cmd))
         u_act_next = 0.72 * u_clamped + 0.28 * u_act_curr
         f_prop_lin = u_act_next * physics.M_eff * physics.max_traction_accel
         a_lin = (f_prop_lin - physics.B * mu_v) / physics.M_eff
         inertia_mom = 0.14 * (mu_v - v_prev)
-        v_lin = float(max(0.0, mu_v + self.corridor.dt * a_lin + inertia_mom))
+        v_lin_raw = mu_v + self.corridor.dt * a_lin + inertia_mom
+        v_lin = v_lin_raw if v_lin_raw > 0.0 else 0.0
 
-        if self.emulator is not None:
+        if self._emu_w1 is not None:
             ext_f_norm = (
                 physics.grade_resistance(x_curr) + physics.curve_resistance(x_curr)
             ) / (0.03 * physics.M * physics.g)
             v_norm = mu_v / 15.0
-            self._feat_buf[0, 0] = (v_lin - mu_v) / 1.5
-            self._feat_buf[0, 1] = v_norm
-            self._feat_buf[0, 2] = u_clamped
-            self._feat_buf[0, 3] = ext_f_norm
-            self._feat_buf[0, 4] = v_norm * v_norm
-            with torch.no_grad():
-                out = self.emulator.net(self._feat_buf)
-                dv_res = float(out[0, 0].item())
-                log_var = float(np.clip(out[0, 1].item(), -10.5, -3.2))
-                sigma_delta = float(np.exp(0.5 * log_var))
-            mu_next = float(max(0.0, v_lin + dv_res))
+            fb = self._feat_buf
+            fb[0] = (v_lin - mu_v) / 1.5
+            fb[1] = v_norm
+            fb[2] = u_clamped
+            fb[3] = ext_f_norm
+            fb[4] = v_norm * v_norm
+            z1 = fb @ self._emu_w1 + self._emu_b1
+            h1 = z1 / (1.0 + np.exp(-z1))
+            z2 = h1 @ self._emu_w2 + self._emu_b2
+            h2 = z2 / (1.0 + np.exp(-z2))
+            out = h2 @ self._emu_w3 + self._emu_b3
+            dv_res = float(out[0])
+            lv_raw = float(out[1])
+            log_var = -10.5 if lv_raw < -10.5 else (-3.2 if lv_raw > -3.2 else lv_raw)
+            sigma_delta = math.exp(0.5 * log_var)
+            mu_raw = v_lin + dv_res
+            mu_next = mu_raw if mu_raw > 0.0 else 0.0
         else:
             sigma_delta = self.cfg.base_sigma_mps
             mu_next = v_lin
 
         if mu_next > 1e-3 or u_clamped > 1e-3:
-            mu_next = float(max(0.0, mu_next + self.corridor.dt * d_wind_hat))
+            mu_w = mu_next + self.corridor.dt * d_wind_hat
+            mu_next = mu_w if mu_w > 0.0 else 0.0
             sigma_wind_extra = 0.007 * abs(d_wind_hat)
-            sigma_step_tot = np.hypot(sigma_delta, sigma_wind_extra)
-            sigma_next = float(np.sqrt(self.cfg.gamma_sigma * (sigma_v_curr ** 2) + (sigma_step_tot ** 2)))
+            sigma_step_tot = math.hypot(sigma_delta, sigma_wind_extra)
+            sigma_next = math.sqrt(self.cfg.gamma_sigma * (sigma_v_curr * sigma_v_curr) + (sigma_step_tot * sigma_step_tot))
         else:
             sigma_next = self.cfg.base_sigma_mps
 

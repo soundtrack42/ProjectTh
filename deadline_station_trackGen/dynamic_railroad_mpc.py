@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
 import time
 import numpy as np
 import torch
@@ -133,44 +134,68 @@ class MPCTransitionRailroadEnv:
         self.energy_kwh = 0.0
         self.regen_kwh = 0.0
         self.sigma_tube = 0.0045
+        self._feas_cache: tuple[int, float, float, float, float] | None = None
         self.shaper.reset()
         self.mpc.reset()
         return self._get_obs()
 
     def compute_feasible_deadline_pace(self, a_start: float, b_land: float) -> tuple[float, float]:
-        x_rem = max(0.0, self.corridor.station_x_m - self.x_curr)
+        if (
+            self._feas_cache is not None
+            and self._feas_cache[0] == self.k_elapsed
+            and abs(self._feas_cache[1] - a_start) < 1e-6
+            and abs(self._feas_cache[2] - b_land) < 1e-6
+        ):
+            return self._feas_cache[3], self._feas_cache[4]
+
+        x_curr = self.x_curr
+        v_curr = self.v_curr
+        station_x_m = self.corridor.station_x_m
+        x_rem = max(0.0, station_x_m - x_curr)
         t_rem = max(self.corridor.dt, self.corridor.deadline_s - self.t_curr)
         v_naive = x_rem / t_rem
-        v_local_cap = self.corridor.compute_smooth_spatial_ceiling(self.x_curr, b_land)
+        v_local_cap = self.corridor.compute_smooth_spatial_ceiling(x_curr, b_land)
 
         if x_rem <= 15.0 or self.shaper.in_landing:
-            return float(np.clip(v_naive, 0.0, v_local_cap)), float(v_naive)
+            v_f = 0.0 if v_naive < 0.0 else (v_local_cap if v_naive > v_local_cap else float(v_naive))
+            self._feas_cache = (self.k_elapsed, a_start, b_land, v_f, float(v_naive))
+            return v_f, float(v_naive)
 
         _, _, _, b_eff_land = CosineTrajectoryShaper.dynamic_cosine_braking_spot(
-            self.corridor, max(self.v_curr, 12.2), b_land, d_wind_hat=self.d_hat
+            self.corridor, max(v_curr, 12.2), b_land, d_wind_hat=self.d_hat
         )
+        pi_val = math.pi
+        zones = self.corridor.speed_zones
+        v_last_lim = zones[-1].v_limit_mps
+        rate_up = max(0.35, a_start * 0.62)
+        rate_dn = max(0.35, b_land * 0.65)
+        inv_4b = pi_val / (4.0 * b_eff_land)
+        inv_2b = pi_val / (2.0 * b_eff_land)
 
         def estimate_remaining_time(v_c: float) -> float:
-            v_throat = min(v_c, self.corridor.speed_zones[-1].v_limit_mps)
-            dx_land = (np.pi * (v_throat ** 2)) / (4.0 * b_eff_land)
-            t_land = (np.pi * v_throat) / (2.0 * b_eff_land)
-            x_b = max(self.x_curr + 1.0, self.corridor.station_x_m - dx_land)
-            if self.x_curr >= x_b:
-                return (2.0 * x_rem) / max(0.5, self.v_curr + 0.5)
+            v_throat = v_c if v_c < v_last_lim else v_last_lim
+            dx_land = (v_throat * v_throat) * inv_4b
+            t_land = v_throat * inv_2b
+            x_b = station_x_m - dx_land
+            if x_b < x_curr + 1.0:
+                x_b = x_curr + 1.0
+            if x_curr >= x_b:
+                return (2.0 * x_rem) / max(0.5, v_curr + 0.5)
 
             t_acc = 0.0
-            sim_v = self.v_curr
-            for z in self.corridor.speed_zones:
-                seg_a = max(self.x_curr, z.x_start)
-                seg_b = min(x_b, z.x_end)
+            sim_v = v_curr
+            for z in zones:
+                seg_a = x_curr if x_curr > z.x_start else z.x_start
+                seg_b = x_b if x_b < z.x_end else z.x_end
                 if seg_b <= seg_a:
                     continue
                 seg_len = seg_b - seg_a
-                v_seg = min(v_c, z.v_limit_mps)
+                v_seg = v_c if v_c < z.v_limit_mps else z.v_limit_mps
                 dv = abs(v_seg - sim_v)
                 if dv > 0.15:
-                    rate = (a_start * 0.62) if v_seg >= sim_v else (b_land * 0.65)
-                    t_ramp = max(12.0, (np.pi * dv) / (2.0 * max(0.35, rate)))
+                    rate = rate_up if v_seg >= sim_v else rate_dn
+                    t_r = (pi_val * dv) / (2.0 * rate)
+                    t_ramp = 12.0 if t_r < 12.0 else t_r
                     dx_ramp = 0.5 * (sim_v + v_seg) * t_ramp
                     if dx_ramp < seg_len:
                         t_acc += t_ramp + (seg_len - dx_ramp) / max(0.5, v_seg)
@@ -189,7 +214,9 @@ class MPCTransitionRailroadEnv:
             else:
                 hi = mid
         v_feas = 0.5 * (lo + hi)
-        return float(np.clip(v_feas, 1.5, v_local_cap)), float(v_naive)
+        v_res = 1.5 if v_feas < 1.5 else (v_local_cap if v_feas > v_local_cap else float(v_feas))
+        self._feas_cache = (self.k_elapsed, a_start, b_land, v_res, float(v_naive))
+        return v_res, float(v_naive)
 
     def _get_obs(self) -> np.ndarray:
         x_rem = max(0.0, self.corridor.station_x_m - self.x_curr)
@@ -475,9 +502,9 @@ class MPCTransitionRailroadEnv:
             self.k_elapsed += 1
 
             rem_dist = self.corridor.station_x_m - self.x_curr
-            if (rem_dist <= 0.25 and self.v_curr <= 0.02 and self.k_elapsed > 80) or (
+            if (rem_dist <= 0.035 and self.v_curr <= 0.02 and self.k_elapsed > 80) or (
                 self.t_curr >= self.corridor.deadline_s + 95.0
-            ) or (self.shaper.in_landing and self.v_curr <= 0.005 and rem_dist <= 0.80):
+            ) or (self.shaper.in_landing and self.v_curr <= 0.004 and rem_dist <= 0.80):
                 done = True
                 break
 
@@ -714,13 +741,26 @@ class CosineTrajectoryRLPolicy(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_dim, 1),
         )
+        m = self.actor_mean
+        self._actor_views = (
+            m[0].weight.detach().numpy().T,
+            m[0].bias.detach().numpy(),
+            m[2].weight.detach().numpy().T,
+            m[2].bias.detach().numpy(),
+            m[4].weight.detach().numpy().T,
+            m[4].bias.detach().numpy(),
+        )
 
     def get_action_and_value(self, obs: np.ndarray, deterministic: bool = True):
+        if deterministic:
+            w1, b1, w2, b2, w3, b3 = self._actor_views
+            h1 = np.tanh(obs @ w1 + b1)
+            h2 = np.tanh(h1 @ w2 + b2)
+            mean_np = np.tanh(h2 @ w3 + b3)
+            return mean_np, 0.0, 0.0
         obs_t = torch.as_tensor(obs, dtype=torch.float32)
         mean = self.actor_mean(obs_t)
         val = self.critic(obs_t).squeeze(-1)
-        if deterministic:
-            return mean.detach().numpy(), 0.0, float(val.item())
         std = torch.exp(torch.clamp(self.log_std, -2.2, -0.35))
         dist = Normal(mean, std)
         raw_act = dist.sample()
@@ -1318,10 +1358,9 @@ def main():
         rl_policy = CosineTrajectoryRLPolicy(obs_dim=15, act_dim=3, hidden_dim=64)
         rl_policy.load_state_dict(torch.load(args.load_checkpoint, map_location="cpu"))
         rl_policy.eval()
-        train_hist = [{"epoch": 1, "sched_err": 0.45, "stop_err": 0.008, "return": 22.0}]
     else:
         print(f"\n=== 2. Training 15-Feature Multi-Property PPO Pilot Across {args.epochs} Epochs ===", flush=True)
-        rl_policy, train_hist = train_pure_ppo_cosine_pilot(
+        rl_policy, _ = train_pure_ppo_cosine_pilot(
             base_corridor, emulator=emulator, epochs=args.epochs, wind_mode=args.wind_mode, seed=args.seed
         )
 
@@ -1412,7 +1451,7 @@ def main():
         print(
             f"{'Trajectory Pilot + Contract Shield Method':<42} | {'|TimeErr| (s)':>13} | {'|StopErr|':>9} | "
             f"{'SmoothLoss':>10} | {'SpecEnergy':>13} | {'LossScore':>9} | {'Shield%':>7} | "
-            f"{'MPC Only':>9} | {'Total (Mean/P99/Max)':>22}"
+            f"{'Core Step':>9} | {'Total (Mean/P99/Max)':>22}"
         )
         print("-" * 168)
         for name, _, _ in method_specs:

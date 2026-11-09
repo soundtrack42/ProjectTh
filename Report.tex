@@ -2,7 +2,7 @@
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
-\usepackage[margin=1.8cm]{geometry}
+\usepackage[margin=1.75cm]{geometry}
 \usepackage{amsmath,amssymb,amsfonts}
 \usepackage{booktabs}
 \usepackage{graphicx}
@@ -19,119 +19,130 @@
 }
 
 \title{\textbf{Safe and Smooth Automatic Train Speed Control:\\
-From Emulated-Trajectory Shielding to Generalized Multi-Station\\
-Hierarchical Contract-Based PPO}}
+Sequential Evolution from Actuator-Lifted MPC to Multi-Station\\
+Hierarchical Differential \& Assume-Guarantee Contract Shielding}}
 \author{Technical Project Report}
-\date{November 8, 2026}
+\date{November 9, 2026}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-Modern railway control is split into two worlds: \textbf{Automatic Train Protection (ATP)}, which enforces strict speed limits using worst-case braking rules (often causing harsh braking and rough rides), and \textbf{Automatic Train Operation (ATO)}, which drives the train smoothly and stops accurately at station platforms, but lacks formal safety guarantees. In this project, we bridge both objectives across a three-stage architectural evolution. In \textbf{Stage 1}, we upgrade an Intelligent-PID (IPID) switcher and a State-Augmented Linear Time-Varying Model Predictive Controller (LTV-MPC), combine them via Reinforcement Learning (RL) trained on a \textbf{Heteroscedastic Neural Physics Emulator}, and wrap the system inside a runtime \textbf{Safety Filter Shield}, achieving $3\text{ mm/s}$ ($0.0030\text{ m/s}$) tracking error and $8.2\text{ cm}$ stopping accuracy across 30 unseen tracks. In \textbf{Stage 2}, we show that a standalone 5-step State-Augmented LTV-MPC ($N_p = 5, N_c = 3$) paired with an online Moving-Average Disturbance Observer (DOB) and a disturbance-gated Scissor Shield rejects turbulent wind gusts up to $1.03\text{ m/s}^2$ in under $100\text{ }\mu\text{s}$ per step. In \textbf{Stage 3}, we move from tracking fixed speed arrays to \textbf{online deadline-driven trajectory planning} across generalized \textbf{1-to-5 station corridors ($4\text{--}31\text{ km}$)} with random passenger weight changes at each station, wet/snowy rail friction drops, ambient temperature air-density shifts, and wind gusts. We also implement and benchmark the recent two-layer CBTC-ATO architecture of \textbf{Bilbao-Moreno et al.\ (2025)} \cite{bilbao2025} on the exact same corridor problem. By combining an \textbf{8-step departure mass identifier} with a 15-feature \textbf{Multi-Property PPO Trajectory Pilot} and a \textbf{Hierarchical Contract Shield}, our system achieves $1.05\text{--}1.48\text{ s}$ arrival error in clean conditions ($1.61\text{--}2.07\text{ s}$ across all weather scenarios), $2.7\text{ cm}$ station stopping precision, $99.9\%$ safety tube containment, and reduces ride jerk/acceleration loss by $14\%$ ($49\%$ lower than Bilbao-Moreno et al.\ \cite{bilbao2025}) while saving $1.4\text{--}1.7\text{ Wh/t-km}$ of traction energy.
+Modern railway control is divided between \textbf{Automatic Train Protection (ATP)}, which enforces strict speed ceilings using conservative worst-case braking rules, and \textbf{Automatic Train Operation (ATO)}, which aims for smooth passenger ride quality, low traction energy, and accurate station docking, but lacks formal multi-property safety guarantees. In this work, we present a unified, sequential three-stage control architecture that bridges both worlds in real time. In \textbf{Stage 1}, we eliminate speed-shift overshoot caused by first-order motor delay ($u_{\text{act}}(k) = 0.72\,u_{\text{cmd}}(k) + 0.28\,u_{\text{act}}(k-1)$) by lifting the physical actuator state directly into a \textbf{State-Augmented Linear Time-Varying Model Predictive Controller (LTV-MPC)} and wrapping it inside a \textbf{Heteroscedastic Neural Physics Emulator} ($\hat{f}_\theta$) that constructs a 99\% Gaussian Scissor Tube ($3.0\text{ mm/s}$ tracking error and $8.2\text{ cm}$ stopping accuracy across 30 unseen tracks). In \textbf{Stage 2}, observing that $99.4\%$ of actuator lag decays within 4 steps ($0.28^4 \approx 0.6\%$), we compress the MPC horizon to $N_p = 5, N_c = 3$, remove redundant PID switching, and pair the controller with an \textbf{Online Disturbance Observer (DOB)} and a gust-gated Scissor Shield to reject $1.03\text{ m/s}^2$ storm gusts. Finally, in \textbf{Stage 3}, we address the complete real-world problem where no pre-computed speed profile is given in advance: the train must plan and adapt its own trajectory online across \textbf{1-to-5 station corridors ($4\text{--}31\text{ km}$)} under unknown passenger mass changes ($75.6\text{--}94.2\text{ t}$), wet/snowy rail adhesion drops, ambient air-density shifts, and wind gusts. We introduce a three-layer architecture combining: (i) an \textbf{8-step departure passenger mass identifier}, (ii) a 15-feature \textbf{Multi-Property PPO Trajectory Pilot} driving a phase-tracked \textbf{$C^2$ Half-Cosine S-Curve Shaper}, and (iii) a \textbf{Hierarchical Differential \& Assume-Guarantee Contract Shield} with ramp-initiation latching across velocity ($d=1$), acceleration ($d=2$), jerk ($d=3$), regenerative energy, and arrival deadline cones. By exploiting upper-triangular scalar propagation, a closed-form $3\times 3$ Cramer QP solver, and zero-copy NumPy neural parameter views, our core shaper-plus-MPC step executes in just $\mathbf{24.7\text{--}25.5\text{ }\mu\text{s}}$ ($\mathbf{29.0\text{--}41.5\text{ }\mu\text{s}}$ total per step including the emulator, PPO pilot, and contract shield), achieving $1.10\text{--}1.52\text{ s}$ clean schedule accuracy ($1.57\text{--}2.00\text{ s}$ across all 30 scenarios), $1.0\text{ cm}$ stopping error, $99.9\%$ tube containment, and $14.0\%$ lower ride jerk/acceleration loss.
 \end{abstract}
 
-\section{Introduction and Physical Problem Formulation}
+\section{Physical Problem Formulation and Real-World Railway Constraints}
 
-We simulate a 4-car subway train with nominal mass $M = 85,000\text{ kg}$ (empty tare weight $M_{\text{tare}} = 72,000\text{ kg}$ plus passenger load), rotational inertia factor $\gamma = 0.08$ ($M_{\text{eff}} = M(1 + \gamma)$), control time step $\Delta t = 0.50\text{ s}$, and spatial sample distance $d = 8.33\text{ m}$ \cite{havaei2022,liu2025}. Unlike idealized textbook models, a real train faces four everyday physical constraints:
+We consider a 4-car electric subway train with nominal mass $M = 85,000\text{ kg}$ (empty tare weight $M_{\text{tare}} = 72,000\text{ kg}$ plus variable passenger load), rotational inertia factor $\gamma = 0.08$ ($M_{\text{eff}} = M(1 + \gamma)$), discrete control step $\Delta t = 0.50\text{ s}$, and spatial sampling interval $d = 8.33\text{ m}$ \cite{havaei2022,liu2025}. Unlike idealized point-mass models with instantaneous actuators, our plant enforces four critical physical phenomena that govern real railway operations:
 \begin{enumerate}[leftmargin=*]
-    \item \textbf{Running Drag, Slopes, and Curves:} The train is opposed by aerodynamic and rolling resistance given by the Davis equation $F_d(v) = A v^2 + B v + C$ (with $A = 14.5$, $B = 185.0$, and breakaway friction $C = 1450\text{ N}$), alongside uphill/downhill slope resistance $F_{\text{grade}}(x) = M g \sin(\theta(x))$ and curve friction $F_{\text{curve}}(x)$ \cite{havaei2022,liu2025}. Cold weather increases air density $\rho_{\text{air}} = 293.15 / (273.15 + T_{^\circ\text{C}})$, raising aerodynamic drag.
-    \item \textbf{First-Order Motor and Brake Lag:} When the controller commands throttle or braking $u_{\text{cmd}}(k) \in [-1, 1]$, the traction motors and pneumatic brakes do not react instantly; they follow a first-order delay:
+    \item \textbf{Nonlinear Running Resistance, Grades, Curves, and Air Density:} Longitudinal motion is opposed by mechanical rolling and aerodynamic drag governed by the Davis equation $F_d(v) = (A v^2 + B v + C)\,\rho_{\text{air}}(T_{^\circ\text{C}})$ (with $A = 14.5$, $B = 185.0$, breakaway friction $C = 1450\text{ N}$, and temperature-dependent air density factor $\rho_{\text{air}} = 293.15 / (273.15 + T_{^\circ\text{C}})$), alongside spatial grade resistance $F_{\text{grade}}(x) = M g \sin(\theta(x))$ and curve resistance $F_{\text{curve}}(x)$ \cite{havaei2022,liu2025}.
+    \item \textbf{First-Order Drivetrain and Pneumatic Brake Lag:} When the controller issues a normalized traction or braking command $u_{\text{cmd}}(k) \in [-1, 1]$, the traction inverters and electro-pneumatic brakes respond with a first-order lag:
     \begin{equation}
         u_{\text{act}}(k) = 0.72\, u_{\text{cmd}}(k) + 0.28\, u_{\text{act}}(k - 1)
         \label{eq:actuator_lag}
     \end{equation}
-    \item \textbf{Acceleration Limits, Wet Rails, and High-Speed Field Weakening:} At nominal mass ($85\text{ t}$) on dry rails ($\mu = 1.0$), physical traction acceleration is capped at $a_{\max} = 1.85\text{ m/s}^2$ and service braking at $b_{\max} = 1.65\text{ m/s}^2$. Rain ($\mu = 0.82$) and snow ($\mu = 0.68$) reduce usable wheel-rail grip, while above $14.0\text{ m/s}$ ($\approx 50\text{ km/h}$) the electric motors enter constant-power field weakening, causing available force to drop off as $14.0/v$ \cite{liu2025}.
-    \item \textbf{Station Standstill and Departure Reality:} While stopped at a platform ($v = 0$), holding brakes lock the wheels. The train cannot pre-apply throttle early without rolling out prematurely, nor can it measure wind drag from wheel motion while stationary. Instead, it reads the station anemometer at departure and experiences a natural 1-step rise delay when the brakes release.
+    coupled with longitudinal car-body inertia momentum $0.14\,(v_k - v_{k-1})$.
+    \item \textbf{Wheel-Rail Adhesion Drops and High-Speed Field Weakening:} At nominal mass ($85\text{ t}$) on dry rails ($\mu = 1.0$), maximum traction acceleration is $a_{\max} = 1.85\text{ m/s}^2$ and service braking is $b_{\max} = 1.65\text{ m/s}^2$. Rain ($\mu = 0.82$) and snow ($\mu = 0.68$) scale down usable wheel-rail adhesion, while above the motor base speed of $14.0\text{ m/s}$ ($\approx 50\text{ km/h}$) constant-power field weakening reduces available traction force as $14.0 / v$ \cite{liu2025}.
+    \item \textbf{Causal Station Standstill and Departure Physics:} While parked at a station platform ($v = 0$), holding brakes lock the wheels. A causal controller cannot pre-wind traction before departure without creeping early, nor can it infer aerodynamic wind drag from wheel acceleration while stationary; instead, it reads wayside station telemetry at brake release and experiences a natural 1-step rise delay.
 \end{enumerate}
 
-\section{Stage 1: Hybrid RL-IPID-MPC and Emulated-Trajectory Shielding}
+\section{Stage 1: Actuator-Lifted LTV-MPC and Heteroscedastic Scissor Shielding}
 
-\subsection{Blended-Lookahead IPID Switching and State-Augmented LTV-MPC}
+\subsection{Why Standard Controllers Overshoot Speed Shifts: State-Augmented LTV-MPC}
 
-Havaei and Sandidzadeh \cite{havaei2022} used four offline-tuned PID controllers (GA, PSO, DE, and ICA) switched by fixed hand-crafted rules across 6 driving modes: (1) Acceleration, (2) Shift-Up, (3) Cruising, (4) Braking, (5) Shift-Down, and (6) Station Stop. We replace those rigid rules with a 20-feature RL policy observing a 60-step blended lookahead $A_{\text{ref}} \in \mathbb{R}^{60}$ that combines spatial kinetic energy changes $\frac{v_{k+1}^2 - v_k^2}{2d}$ with temporal acceleration $\frac{v_{k+1} - v_k}{\Delta t}$, paired with smooth integral decay.
+Our investigation began with the classical speed-tracking setup of Havaei and Sandidzadeh \cite{havaei2022} and Liu et al.\ \cite{liu2025}, where a target velocity profile $v_{\text{ref}}(x)$ across six driving modes (Acceleration, Shift-Up, Cruising, Braking, Shift-Down, and Station Stop) is given offline. In \cite{havaei2022}, four offline-tuned PID controllers (GA, PSO, DE, ICA) are switched by rigid hand-crafted rules. Replacing those fixed rules with a 20-feature RL policy observing a 60-step kinetic-temporal lookahead improves PID switching, but PID loops fundamentally struggle with the nonlinear Davis drag and motor lag.
 
-Standard LTV-MPC \cite{liu2025} linearizes train drag at each step ($v_{k+1} = A_k v_k + B_k u_k + r_k$) over a 10-step horizon ($N_p = 10, N_c = 5$), but assumes motor commands act immediately, causing noticeable overshoot when shifting speeds. We remove this overshoot by putting the actual motor state $u_{\text{act}}(k-1)$ directly inside the MPC state vector $z_k = [v_k,\, u_{\text{act}}(k-1)]^\top$:
+Conversely, standard Linear Time-Varying MPC (LTV-MPC) \cite{liu2025} linearizes the Davis drag at each step ($v_{k+1} = A_k v_k + B_k u_k + r_k$) over a receding horizon ($N_p = 10, N_c = 5$), but assumes that $u_{\text{cmd}}(k)$ acts instantaneously on the wheels. Because the real drivetrain retains $28\%$ of the previous step's effort (Eq.~\ref{eq:actuator_lag}), standard MPC keeps pushing at the end of a ramp and suffers a large $0.748\text{ m/s}$ shift overshoot (Table~\ref{tab:stage1}).
+
+Our first core design step eliminates this overshoot by lifting the physical actuator state $u_{\text{act}}(k-1)$ directly into the augmented state vector $z_k = [v_k,\, u_{\text{act}}(k-1)]^\top$:
 \begin{equation}
     z_{k+1} =
-    \begin{bmatrix}
+    \underbrace{\begin{bmatrix}
         A_k & 0.28\, B_k \\
         0   & 0.28
-    \end{bmatrix} z_k +
-    \begin{bmatrix}
+    \end{bmatrix}}_{A_{z,k}} z_k +
+    \underbrace{\begin{bmatrix}
         0.72\, B_k \\
         0.72
-    \end{bmatrix} u_{\text{cmd}}(k) +
+    \end{bmatrix}}_{B_{z,k}} u_{\text{cmd}}(k) +
     \begin{bmatrix}
         r_k \\
         0
     \end{bmatrix}
     \label{eq:lifted_mpc}
 \end{equation}
-Because the controller now knows how much motor force is already built up in the drivetrain, it anticipates the 2-step lag and lands smoothly on new speed plateaus without dipping or overshooting.
+Paired with regime-adaptive control-variation weights ($Q_3$) and a causal plateau lookahead guard, the controller anticipates the exact two-step momentum built up in the motors and lands smoothly on new speed plateaus, cutting shift overshoot by more than $20\times$ (from $0.7480\text{ m/s}$ down to $0.0350\text{ m/s}$) and stopping error from $57.1\text{ cm}$ down to $8.2\text{ cm}$.
 
-\subsection{Neural Physics Emulator and Safety Filter Shield}
+\subsection{Heteroscedastic Neural Physics Emulator and 99\% Scissor Tube}
 
-Following Wang et al.\ \cite{wang2023} and Goodall \& Belardinelli \cite{goodall2026,goodall_code}, we train a two-head \textbf{Neural Physics Emulator} $\hat{f}_\theta$ (150 AdamW steps per batch) that predicts:
+To provide formal runtime safety guarantees without relying on heavy offline polyhedral Minkowski sums and Pontryagin differences (which scale poorly with horizon length in classical tube MPC \cite{mayne2005,cannon2010,sun2024}), we draw on Wang et al.\ \cite{wang2023} and Goodall \& Belardinelli \cite{goodall2026,goodall_code} to train a two-head \textbf{Heteroscedastic Neural Physics Emulator} $\hat{f}_\theta$ (a $8 \to 64 \to 64 \to 2$ SiLU network trained via Gaussian Negative Log-Likelihood) that predicts:
 \begin{enumerate}[leftmargin=*]
-    \item The nonlinear speed residual mean $\Delta\hat{v}_\mu(s_k, u_k)$:
+    \item The nonlinear velocity residual mean $\Delta\hat{v}_\mu(s_k, u_k)$ over the nominal linear step $v_{\text{lin},k+1}$:
     \begin{equation}
-        \hat{v}_{k+1} = \max\!\Big(0,\; v_{\text{lin},k+1} + \Delta\hat{v}_\mu(v_k, u_k, F_{\text{ext},k}, v_k^2, K_{\text{PID}})\Big)
+        \hat{v}_{k+1} = \max\!\Big(0,\; v_{\text{lin},k+1} + \Delta\hat{v}_\mu(v_k, u_k, F_{\text{ext},k}, v_k^2)\Big)
     \end{equation}
-    \item The state- and action-dependent uncertainty $\log \sigma_\theta^2(s_k, u_k)$.
+    \item The state- and action-dependent epistemic/aleatoric log-variance $\log \sigma_\theta^2(s_k, u_k) \in [-10.5, -3.2]$.
 \end{enumerate}
-Our runtime \textbf{Safety Filter Shield} \cite{banerjee2024,goodall2026,hsu2024} rolls out the emulator to track the achievable reference velocity $\hat{v}_{\text{emu}}(k)$ and its accumulated tube uncertainty $\sigma_{\text{tube}}(k)$:
+At runtime, our \textbf{Safety Filter Shield} \cite{banerjee2024,goodall2026,hsu2024} propagates the contractive stochastic tube variance:
 \begin{equation}
-    \sigma_{\text{tube}}^2(k) = \gamma_\sigma\, \sigma_{\text{tube}}^2(k - 1) + \sigma_\theta^2(s_k, u_k), \qquad \gamma_\sigma = \rho^2 \approx 0.65
+    \sigma_{\text{tube}}^2(k) = \gamma_\sigma\, \sigma_{\text{tube}}^2(k - 1) + \sigma_\theta^2(s_k, u_k), \qquad \gamma_\sigma = 0.65
+    \label{eq:tube_var}
 \end{equation}
-Following tube MPC \cite{cannon2010,mayne2005} and Goodall \& Belardinelli's A2C-GP-Shield \cite{goodall2026}, the \textbf{99th-Percentile Scissor Band (Yellow)} is $\hat{v}_{\text{emu}}(k) \pm 2.576\,\sigma_{\text{tube}}(k)$, and the \textbf{Safe Envelope (Green)} adds the physical regime tolerance ($\pm 0.14\text{ m/s}$ in cruise, $\pm 0.16\text{ m/s}$ in braking, tapering to $\pm 0.015\text{ m/s}$ at standstill). Table~\ref{tab:stage1} summarizes the Stage 1 results across 30 unseen trajectories.
+defining the \textbf{99th-Percentile Scissor Band (Yellow)} as $\hat{v}_{\text{emu}}(k) \pm 2.576\,\sigma_{\text{tube}}(k)$ ($\Phi^{-1}(0.995) = 2.576$) and the \textbf{Safe Physical Envelope (Green)} by adding the regime pincer tolerance ($\pm 0.14\text{ m/s}$ in cruise, $\pm 0.16\text{ m/s}$ in shifts/braking, tapering to $\pm 0.015\text{ m/s}$ at station stop). Table~\ref{tab:stage1} summarizes the Stage 1 zero-shot evaluation across 30 unseen trajectories.
 
 \begin{table}[h!]
 \centering
 \caption{Stage 1 Zero-Shot Performance Across 30 Unseen Random Trajectories ($T = 1000$ Steps, Modes 1--6, No Wind, Mean $\pm$ Std).}
 \label{tab:stage1}
-\footnotesize
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{lccccccc}
 \toprule
 \textbf{Controller Method} & \textbf{MeanErr (m/s)} & \textbf{BrakeErr} & \textbf{ShiftOS} & \textbf{ShiftAvg} & \textbf{StopErr (m)} & \textbf{PaperScore} & \textbf{StepInfer} \\
 \midrule
 Pure MPC (Standard Fixed $Q_3$) \cite{liu2025} & $0.0372 \pm 0.0109$ & $0.0835$ & $0.7480$ & $0.1444$ & $0.5713$ & $0.3169 \pm 0.1096$ & $63.93\text{ }\mu\text{s}$ \\
-Adaptive MPC (Shift-$Q_3$) & $0.0031 \pm 0.0011$ & $0.0047$ & $0.0350$ & $0.0061$ & $0.0821$ & $0.0262 \pm 0.0201$ & $59.99\text{ }\mu\text{s}$ \\
+Adaptive State-Augmented MPC (Shift-$Q_3$) & $0.0031 \pm 0.0011$ & $0.0047$ & $0.0350$ & $0.0061$ & $0.0821$ & $0.0262 \pm 0.0201$ & $59.99\text{ }\mu\text{s}$ \\
 Hardcoded-Switch IPID (Havaei) \cite{havaei2022} & $0.2135 \pm 0.0602$ & $0.1550$ & $0.1251$ & $1.2051$ & $3.0725$ & $0.9542 \pm 0.3680$ & $7.65\text{ }\mu\text{s}$ \\
 \midrule
-RL-Switch Way 2 (Unshielded) & $0.1373 \pm 0.0278$ & $0.1191$ & $0.2203$ & $0.5176$ & $2.3055$ & $0.6600 \pm 0.3000$ & $38.86\text{ }\mu\text{s}$ \\
+RL-Switch IPID (Unshielded) & $0.1373 \pm 0.0278$ & $0.1191$ & $0.2203$ & $0.5176$ & $2.3055$ & $0.6600 \pm 0.3000$ & $38.86\text{ }\mu\text{s}$ \\
 Shielded RL-Switch (1-Step DCBF) & $0.2109 \pm 0.0499$ & $0.1439$ & $0.2052$ & $1.0509$ & $3.0081$ & $0.9238 \pm 0.3570$ & $41.75\text{ }\mu\text{s}$ \\
 Shielded RL-Switch (DMPS Rollout) & $0.1063 \pm 0.0185$ & $0.1037$ & $0.0994$ & $0.4028$ & $2.0222$ & $0.5469 \pm 0.2714$ & $44.15\text{ }\mu\text{s}$ \\
 \midrule
 Hybrid RL-IPID-MPC (Unshielded) & $0.0039 \pm 0.0012$ & $0.0067$ & $0.0318$ & $0.0101$ & $0.0837$ & $0.0272 \pm 0.0214$ & $102.81\text{ }\mu\text{s}$ \\
-Shielded Hybrid RL-MPC (Switch MPS) & $0.0038 \pm 0.0017$ & $0.0062$ & $0.0350$ & $0.0062$ & $0.0819$ & $0.0266 \pm 0.0200$ & $104.47\text{ }\mu\text{s}$ \\
-Shielded Hybrid RL-MPC (1-Step DCBF) & $0.0040 \pm 0.0015$ & $0.0066$ & $0.0231$ & $0.0085$ & $0.0822$ & $0.0249 \pm 0.0208$ & $103.72\text{ }\mu\text{s}$ \\
-Shielded Hybrid RL-MPC (DMPS Rollout) & $0.0038 \pm 0.0017$ & $0.0063$ & $0.0350$ & $0.0062$ & $0.0819$ & $0.0266 \pm 0.0200$ & $106.03\text{ }\mu\text{s}$ \\
+\textbf{Shielded Hybrid RL-MPC (Switch MPS)} & $\mathbf{0.0038 \pm 0.0017}$ & $\mathbf{0.0062}$ & $0.0350$ & $\mathbf{0.0062}$ & $\mathbf{0.0819}$ & $0.0266 \pm 0.0200$ & $104.47\text{ }\mu\text{s}$ \\
+\textbf{Shielded Hybrid RL-MPC (1-Step DCBF)} & $0.0040 \pm 0.0015$ & $0.0066$ & $\mathbf{0.0231}$ & $0.0085$ & $0.0822$ & $\mathbf{0.0249 \pm 0.0208}$ & $103.72\text{ }\mu\text{s}$ \\
+\textbf{Shielded Hybrid RL-MPC (DMPS Rollout)} & $\mathbf{0.0038 \pm 0.0017}$ & $0.0063$ & $0.0350$ & $\mathbf{0.0062}$ & $\mathbf{0.0819}$ & $0.0266 \pm 0.0200$ & $106.03\text{ }\mu\text{s}$ \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table}
 
-\section{Stage 2: Disturbance-Driven Standalone MPC Shielding}
+\section{Stage 2: Short-Horizon LTV-MPC, Disturbance Observer, and Fast Solver}
 
-Stage 1 showed that once LTV-MPC accounts for the $0.28$ actuator lag (Eq.~\ref{eq:lifted_mpc}), the Hybrid RL agent picks MPC at almost every step. Because $0.28^4 \approx 0.6\%$ (meaning $99.4\%$ of motor delay settles within 4 steps), we shortened the MPC horizon from $N_p = 10, N_c = 5$ to $N_p = 5, N_c = 3$, cutting unshielded MPC runtime from $59.99\text{ }\mu\text{s}$ to $40.80\text{ }\mu\text{s}$ and removing the redundant PID-switching network.
+\subsection{Why Stage 1 Simplifies Naturally: Horizon Compression and Gust Shielding}
 
-In calm conditions without wind, a safety shield around MPC never needs to step in ($0.0\%$ interventions). A shield becomes vital when the train hits unexpected external forces. In Stage 2, we added strong wind gusts ($\pm 0.55\text{--}0.85\text{ m/s}^2$, peaking at $1.03\text{ m/s}^2$) and paired MPC with an \textbf{Online Disturbance Observer (DOB)}:
+Analyzing Stage 1 revealed two key insights that directly shaped Stage 2:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Shortening the MPC Horizon ($N_p = 5, N_c = 3$) and Dropping PID Switching:} Once the actuator lag $0.28$ is embedded inside $z_k$ (Eq.~\ref{eq:lifted_mpc}), the Hybrid RL agent selects LTV-MPC on $>98\%$ of steps. Because $0.28^4 = 0.0061$ and $0.28^5 = 0.0017$, $99.4\%$ of actuator delay settles within 4 steps ($2.0\text{ s}$). Compressing the horizon from $N_p = 10, N_c = 5$ to $N_p = 5, N_c = 3$ and removing the redundant PID-bank switcher cuts computational overhead while preserving identical tracking precision.
+    \item \textbf{Disturbance-Driven Shield Activation:} In calm conditions without external disturbances, a well-calibrated LTV-MPC stays inside its 99\% Scissor Tube with $0.0\%$ shield interventions. Runtime shielding becomes essential when the train encounters unmodeled external forces.
+\end{enumerate}
+In Stage 2, we subject the train to severe turbulent wind bursts ($\pm 0.55\text{--}0.85\text{ m/s}^2$, peaking at $1.03\text{ m/s}^2$) and pair the $N_p = 5, N_c = 3$ LTV-MPC with an \textbf{Online Disturbance Observer (DOB)} that measures the single-step acceleration residual:
 \begin{equation}
-    d_{\text{step}}(k) = a_{\text{meas}}(k - 1) - a_{\text{nom}}(k - 1)
+    d_{\text{step}}(k) = a_{\text{meas}}(k - 1) - a_{\text{nom}}(k - 1), \qquad \hat{d}_k = 0.55\,\hat{d}_{k-1} + 0.45\,d_{\text{step}}(k)
+    \label{eq:dob}
 \end{equation}
-While nominal MPC receives a smoothed estimate $0.35\,\hat{d}_k$ for ride comfort, the Safety Shield watches the raw gust $d_{\text{raw}}(k)$. Whenever a sudden gust ($|d_{\text{raw}}| > 0.05\text{ m/s}^2$) threatens to push the train outside the 99\% Scissor Band, the shield applies a counter-thrust $u_{\text{fb}}$ and releases as soon as the gust passes (Table~\ref{tab:stage2}).
+To keep normal riding smooth, the nominal MPC receives a damped feed-forward share of $\hat{d}_k$, while the Scissor Shield monitors the raw gust residual. Whenever a sudden storm front ($|d_{\text{raw}}| > 0.05\text{ m/s}^2$) threatens to push the velocity outside the 99\% Scissor Band, the shield injects a counter-thrust backup action $u_{\text{fb}}$ and releases immediately once the gust subsides, cutting wind-induced tracking error in half ($0.0165 \to 0.0068\text{ m/s}$, Table~\ref{tab:stage2}).
 
 \begin{table}[h!]
 \centering
 \caption{Stage 2 Benchmark Across 30 Unseen $[0, 1000]$ Trajectories with Storm Gusts (Peak $1.03\text{ m/s}^2$, Mean $\pm$ Std).}
 \label{tab:stage2}
-\footnotesize
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{lccccccc}
 \toprule
 \textbf{Controller Method} & \textbf{MeanErr (m/s)} & \textbf{BrakeErr} & \textbf{ShiftOS} & \textbf{ShiftAvg} & \textbf{StopErr (m)} & \textbf{PaperScore} & \textbf{StepInfer} \\
 \midrule
 Pure MPC (Standard Fixed $Q_3$) \cite{liu2025} & $0.0560 \pm 0.0211$ & $0.1150$ & $0.7797$ & $0.1537$ & $0.7093$ & $0.3628 \pm 0.1718$ & $64.04\text{ }\mu\text{s}$ \\
-Adaptive MPC (Shift-$Q_3$) & $0.0165 \pm 0.0125$ & $0.0333$ & $0.0740$ & $0.0202$ & $0.1963$ & $0.0681 \pm 0.0918$ & $40.80\text{ }\mu\text{s}$ \\
+Adaptive MPC ($N_p=5, N_c=3$, Unshielded) & $0.0165 \pm 0.0125$ & $0.0333$ & $0.0740$ & $0.0202$ & $0.1963$ & $0.0681 \pm 0.0918$ & $40.80\text{ }\mu\text{s}$ \\
 Hybrid RL-IPID-MPC (Unshielded) & $0.0167 \pm 0.0127$ & $0.0337$ & $0.0740$ & $0.0205$ & $0.2286$ & $0.0747 \pm 0.1040$ & $82.56\text{ }\mu\text{s}$ \\
 Shielded Hybrid RL-MPC (DMPS Rollout) & $0.0080 \pm 0.0054$ & $0.0182$ & $0.0569$ & $0.0174$ & $0.1377$ & $0.0476 \pm 0.0482$ & $82.66\text{ }\mu\text{s}$ \\
 \midrule
@@ -139,151 +150,185 @@ Shielded Hybrid RL-MPC (DMPS Rollout) & $0.0080 \pm 0.0054$ & $0.0182$ & $0.0569
 \textbf{Shielded Adaptive MPC (1-Step DCBF)} & $0.0076 \pm 0.0050$ & $0.0147$ & $0.0628$ & $0.0158$ & $0.1225$ & $0.0447 \pm 0.0386$ & $98.87\text{ }\mu\text{s}$ \\
 \textbf{Shielded Adaptive MPC (DMPS Rollout)} & $0.0077 \pm 0.0053$ & $0.0181$ & $\mathbf{0.0569}$ & $0.0170$ & $0.1220$ & $0.0443 \pm 0.0432$ & $112.01\text{ }\mu\text{s}$ \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table}
 
-\section{Stage 3: Generalized Multi-Station Trajectory Planning, Fair Energy Accounting, and Contract Shielding}
+\subsection{Eliminating Computational Bottlenecks for Real-Time Onboard Inference}
 
-\subsection{Three-Layer Multi-Station Control Hierarchy}
-
-In real railway operations, a reference speed curve is not handed to the train in advance: the train must travel across a \textbf{multi-station corridor} (generalized across 1 to 5 station stops and $4\text{--}31\text{ km}$ total length), obey changing track speed limits $v_{\lim}(x)$, and stop at each station platform at its scheduled deadline $T_{\text{deadline},\ell}$. When headwinds, wet rails, or heavy passenger loads slow the train down, a fixed plan arrives late.
-
-We organize the Stage 3 control loop into three clear layers:
+In embedded railway hardware, per-step inference latency is a primary deployment concern \cite{sun2024}. Profiling our control loop revealed that solving a $N_p = 5, N_c = 3$ receding-horizon QP via generic NumPy matrix allocations and LAPACK \texttt{np.linalg.solve}, alongside single-sample PyTorch C++ dispatcher calls for the neural emulator and actor network, accounted for $>75\%$ of CPU time. We implemented four exact mathematical optimizations that preserve bit-for-bit identical control outputs while reducing inference latency by $\mathbf{3.7\times}$:
 \begin{enumerate}[leftmargin=*]
-    \item \textbf{Outer Layer --- 15-Feature Multi-Property PPO Trajectory Pilot:} Observes track speed limits, remaining distance $x_{\text{rem}}$, remaining time $t_{\text{rem}} = T_{\text{deadline}} - t$, online wind estimate $\hat{d}_{\text{wind}}$, and online estimated train weight $\hat{M}_{\text{leg}}$. Every macro-step ($4.0\text{ s}$ in open cruise, $0.5\text{ s}$ during station landing), it outputs a 3D command $p_{\text{task}} = (v_{\text{cmd}}, a_{\text{start}}, b_{\text{land}})$ setting the target cruise speed, cosine acceleration rate, and cosine braking rate.
-    \item \textbf{Middle Layer --- Hierarchical Contract Shield and Cosine S-Curve Shaper:} Checks whether $p_{\text{task}}$ respects speed, ride comfort, jerk, energy, and timetable rules. If a command would cause a rough ramp or excess energy use, the shield latches a gentler certified backup contract across the ramp and generates a smooth 5-step velocity reference $V_{\text{ref}}$.
-    \item \textbf{Inner Layer --- State-Augmented LTV-MPC Transition Engine:} Tracks $V_{\text{ref}}$ at every $0.5\text{ s}$ micro-step using the online-identified mass $\hat{M}_{\text{leg}}$ and disturbance feed-forward $\hat{d}_{\text{wind}}$.
+    \item \textbf{Zero-Allocation Upper-Triangular Lifted Propagation:} Because $A_{z,k}$ in Eq.~\ref{eq:lifted_mpc} is $2\times 2$ upper-triangular, its powers $A_{z,k}^i$ follow the scalar recurrence $a_{01}^{(i)} = a_{00}^{(i-1)}(0.28 B_k) + 0.28\,a_{01}^{(i-1)}$ and $a_{00}^{(i)} = A_k\,a_{00}^{(i-1)}$, populating pre-allocated horizon buffers $F, \Phi, \Psi$ without a single array allocation or 2D matrix multiply.
+    \item \textbf{Closed-Form $3\times 3$ Cramer QP Solver:} For $N_c = 3$, the Hessian $H = \Phi^\top Q_1 \Phi + q_2 I_3 + q_3 D^\top D \in \mathbb{R}^{3\times 3}$ is solved analytically via symmetric cofactor expansion ($U_{\text{unc}} = -H^{-1}g$) in $<0.5\text{ }\mu\text{s}$, bypassing LAPACK dispatch overhead, followed by scalar projected-gradient clamping when box constraints $u \in [-1, 1]$ are active.
+    \item \textbf{Scalar-Math Spatial Ceiling \& S-Curve Shaping:} Replacing NumPy scalar ufunc calls (\texttt{np.cos}, \texttt{np.sqrt}, \texttt{np.clip}) with native IEEE-754 \texttt{math} primitives across the 5-step horizon reduces reference shaping to $\sim 5\text{ }\mu\text{s}$.
+    \item \textbf{Cached NumPy Forward Passes for Frozen Neural Networks:} Exporting the trained weights of the SiLU emulator $\hat{f}_\theta$ and Tanh PPO actor $\pi_\phi$ into contiguous NumPy arrays at \texttt{.eval()} time eliminates PyTorch tensor-wrapping and C++ dispatcher overhead at every $0.5\text{ s}$ step.
 \end{enumerate}
 
-\subsection{Why Cruise Overshoot Is Needed for Smooth Cosine Landings}
+\section{Stage 3: Online Multi-Station Trajectory Planning, Hierarchical Differential Shielding, and Assume-Guarantee Contracts}
 
-Every speed change and station stop is shaped as a half-cosine S-curve so that longitudinal jerk starts and ends at zero:
+\subsection{Sequential Motivation, Foundational Literature, and Closed-Loop Architecture}
+
+Stages 1 and 2 tracked a pre-computed speed curve $v_{\text{ref}}(x)$. However, in real multi-station railway operations, no fixed speed array can remain optimal when headwinds, wet rails, temporary restrictions, or heavy passenger loads delay the train \cite{zhong2022,xiao2023}. In the literature, two primary optimization paths have been explored to generate online energy-saving speed profiles:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Moving-Horizon Multi-Phase Pseudospectral MPC (Zhong et al., 2022 \cite{zhong2022}):} Formulates online speed profile generation with regenerative braking recovery ($\mu$) via a hybrid scheme that checks time-optimal feasibility within the moving horizon and triggers full-remaining-trip delay recovery when delay exceeds a threshold ($t_{\text{dly}}^k > T_d$). Each step is transcribed via the Radau Pseudospectral Method (RPM / GPOPS) into a nonlinear program requiring $\sim 0.5\text{ s}$ ($500,000\text{ }\mu\text{s}$) per step. Notably, Zhong et al.\ \cite{zhong2022} observe that direct pseudospectral transcription exhibits control fluctuations along the singular cruising arc that require smoothing, and identify stochastic/robust MPC under uncertain resistance parameters as a key open direction.
+    \item \textbf{Space-Domain Convex Programming \& Real-Time Iteration SQP (Xiao et al., 2023 \cite{xiao2023}):} Demonstrates that minimizing holistic electrical energy (accounting for dynamic traction-chain inverter/motor losses $\eta_{\text{eds}}(f_t, v)$ and regenerative recuperation $\eta_{\text{cir}}$ rather than naive wheel mechanical work) significantly improves eco-driving efficiency. By convexifying the space-domain shrinking-horizon MPC in kinetic energy coordinates $E(s) = \frac{1}{2}v^2(s)$ and solving one QP per step via RTI-SQP (ACADOS), they reduce per-step solve time to $\sim 29\text{ ms}$ ($29,000\text{ }\mu\text{s}$), while noting in Remark 3 and Section VII the need for state-augmented input-delay compensation and tube-based stochastic robustness.
+\end{itemize}
+In \textbf{Stage 3}, we build directly upon the online moving-horizon scheduling, delay-recovery, and dynamic traction-chain loss foundations of Zhong et al.\ \cite{zhong2022} and Xiao et al.\ \cite{xiao2023}, while taking a complementary hierarchical learning-and-shielding path across \textbf{generalized 1-to-5 station corridors ($4\text{--}31\text{ km}$)}: instead of solving a full-horizon NLP ($500\text{ ms}$) or shrinking-horizon SQP ($29\text{ ms}$) at every step, we parameterize smooth trajectories via an analytical $C^2$ Half-Cosine Shaper guided by a learned PPO Pilot and certified by a Hierarchical Contract Shield, achieving microsecond execution ($\sim 25\text{ }\mu\text{s}$ core step, $\sim 41.5\text{ }\mu\text{s}$ total) and eliminating singular-arc control chattering by construction.
+
+\begin{figure}[t!]
+\centering
+\includegraphics[width=0.98\textwidth]{contracts_hierarchical_shielding_arch.png}
+\caption{\textbf{Closed-Loop Stage 3 Control Process (Contracts + Hierarchical Shielding):} (1) The 15-feature PPO Pilot outputs a macro-step trajectory command $p_{\text{task}} = (v_{\text{cmd}}, a, b)$ every $\Delta t_{\text{M}} = 4\text{ s}$. (2) The \textbf{Hierarchical \& Contract Shield} enforces derivative-pressure bounds $\rho_1(v), \rho_2(a), \rho_3(j) \le 1$ across orders $d=1..3$ and latches priority Assume-Guarantee Contracts ($\mathcal{C}_1..\mathcal{C}_4$) via the 99\% UCB Scissor Tube $r_{\text{tube}}$ to project $p_{\text{task}} \mapsto p_{\text{safe}}$. (3) The $C^2$ Cosine Shaper generates the 5-step reference horizon $v_{\text{ref}}(k+1:k+5)$ for (4) the Fast State-Augmented LTV-MPC ($\Delta t = 0.5\text{ s}$, $3\times 3$ QP in $\sim 25\text{ }\mu\text{s}$). (5) In the feedback path, the Online Station Mass ID ($k < 8$) and Heteroscedastic Physics Emulator ($k \ge 8$) supply $\hat{M}, \hat{d}_k$, and $r_{\text{tube}}(k)$.}
+\label{fig:arch_diagram}
+\end{figure}
+
+As synthesized in Figure~\ref{fig:arch_diagram}, our closed-loop process operates across five interconnected blocks:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Outer Layer --- 15-Feature Multi-Property PPO Trajectory Pilot (Macro-Step $M=8$):} Every $4.0\text{ s}$ in open cruise (and every $0.5\text{ s}$, $M=1$, during station landing), the PPO policy $\pi_\phi(s_k)$ observes remaining distance $x_{\text{rem}}$, remaining deadline time $t_{\text{rem}} = T_{\text{deadline}} - t$, current and $300\text{ m}$-ahead speed limits, dynamic braking distance $\Delta x_{\text{brake}}$, track grade/curve slope, online wind $\hat{d}_{\text{wind}}$, and identified mass $\hat{M}_{\text{locked}}$. It outputs a 3D trajectory task command $p_{\text{task}} = (v_{\text{cmd}}, a_{\text{start}}, b_{\text{land}})$ specifying target cruise speed, cosine departure/shift acceleration rate, and cosine landing deceleration rate.
+    \item \textbf{Middle Layer --- Hierarchical Differential \& Assume-Guarantee Contract Shield + $C^2$ Cosine Shaper:} Certifies $p_{\text{task}}$ against five safety, comfort, energy, and punctuality specifications. Whenever any property margin $h_i(p_{\text{task}}) < 0$ is threatened, the shield selects and latches a certified backup contract $p_{\text{safe}}^\star \in \mathcal{L}_{\text{cert}}$, which the phase-tracked $C^2$ Half-Cosine Shaper converts into a smooth 5-step velocity horizon $V_{\text{ref}}(k) \in \mathbb{R}^5$.
+    \item \textbf{Inner Layer --- Fast State-Augmented LTV-MPC ($\Delta t = 0.5\text{ s}$) \& Online Mass/Tube Observer:} Tracks $V_{\text{ref}}(k)$ at every micro-step using the online-locked train mass $\hat{M}_{\text{locked}}$ and disturbance observer feed-forward $\hat{d}_{\text{wind}}$.
+\end{enumerate}
+
+\subsection{Phase-Tracked $C^2$ Half-Cosine S-Curves and Why Cruise Overshoot Is Required}
+
+To guarantee zero jerk at the start and end of every speed transition and station stop, we shape every velocity change as a phase-tracked half-cosine S-curve. During station landing from entry speed $v_{\text{eff}}$ over duration $T_{\text{land}}$:
 \begin{equation}
     v(\tau) = \frac{v_{\text{eff}}}{2}\left(1 + \cos\!\left(\frac{\pi \tau}{T_{\text{land}}}\right)\right), \qquad
     a(\tau) = -\frac{\pi v_{\text{eff}}}{2 T_{\text{land}}}\sin\!\left(\frac{\pi \tau}{T_{\text{land}}}\right), \qquad \tau \in [0, T_{\text{land}}]
+    \label{eq:cosine_land}
 \end{equation}
-Matching the peak midpoint deceleration $|a_{\max}| = \frac{\pi v_{\text{eff}}}{2 T_{\text{land}}}$ to the target comfort deceleration $b_{\text{eff}} \in [0.66, 0.90]\text{ m/s}^2$ gives the landing time $T_{\text{land}}$ and braking distance $\Delta x_{\text{brake}}$:
+Matching the midpoint peak deceleration $|a_{\max}| = \frac{\pi v_{\text{eff}}}{2 T_{\text{land}}}$ to the target comfort deceleration $b_{\text{eff}} \in [0.66, 0.90]\text{ m/s}^2$ yields the exact landing duration $T_{\text{land}}$ and dynamic braking spot $x_{\text{brake}}$:
 \begin{equation}
     T_{\text{land}}(v_{\text{eff}}, b_{\text{eff}}) = \frac{\pi v_{\text{eff}}}{2\,b_{\text{eff}}}, \qquad
     \Delta x_{\text{brake}}(v_{\text{eff}}, b_{\text{eff}}) = \frac{\pi v_{\text{eff}}^2}{4\,b_{\text{eff}}}, \qquad
     x_{\text{brake}} = x_{\text{station}} - \Delta x_{\text{brake}}
+    \label{eq:braking_spot}
 \end{equation}
-Because the train averages half its entry speed ($\frac{1}{2}v_{\text{eff}}$) across the braking zone, a \textbf{Naive Pace} baseline cruising at $v_{\text{naive}} = x_{\text{rem}}/t_{\text{rem}}$ loses time during every speed-down and station landing, arriving $\sim 19.8\text{ s}$ late per leg. Conversely, a \textbf{Max-Speed Greedy} baseline accelerates at maximum comfort rate ($a_{\text{start}} = 1.18\text{ m/s}^2$, $b_{\text{land}} = 0.90\text{ m/s}^2$) to stay ahead of schedule before synchronizing its landing, which costs extra energy and higher jerk. Our \textbf{PPO Pilot} learns just enough cruise overshoot ($v_{\text{cmd}} > v_{\text{naive}}$) in open zones to arrive on time while keeping ramps gentle.
+Because the mean velocity across the cosine braking curve is $\frac{1}{2}v_{\text{eff}}$, the train spends an extra $\frac{1}{2}T_{\text{land}} = \frac{\pi v_{\text{eff}}}{4 b_{\text{eff}}}\text{ s}$ decelerating compared to cruising at $v_{\text{eff}}$ up to the platform. Consequently, a \textbf{Naive Pace} baseline that simply tracks $v_{\text{naive}} = x_{\text{rem}} / t_{\text{rem}}$ without cruise overshoot arrives $\sim 19.8\text{ s}$ late per leg. Conversely, a \textbf{Max-Speed Greedy} baseline that blasts at maximum comfort ramp rates ($a_{\text{start}} = 1.18\text{ m/s}^2, b_{\text{land}} = 0.90\text{ m/s}^2$) wastes traction energy and inflates ride jerk. Our \textbf{PPO Pilot} learns the exact cruise velocity overshoot $v_{\text{cmd}} = v_{\text{naive}} + \Delta v_{\text{overshoot}}$ needed in open zones so the train glides into the cosine landing curve right on schedule.
 
-\subsection{8-Step Departure Mass Identification and Fair Energy Measurement}
+\subsection{Decoupling Passenger Mass from Weather (8-Step ID) and Holistic Traction-Chain Energy Model}
 
-Passenger boarding and alighting shift the true train mass $M_{\text{true}}$ between $75.6\text{ t}$ and $94.2\text{ t}$. During the first $K = 8$ steps ($4.0\text{ s}$) after brake release, the controller reads the station anemometer $d_{\text{standstill}}$ and uses the known motor force $F_{\text{motor}}(k)$ and measured wheel acceleration $a_{\text{kin}}(k)$ to isolate the train's true weight via Newton's Second Law:
+At each station stop, random passenger boarding and alighting shift the true train mass $M_{\text{true}}$ between $75.6\text{ t}$ and $94.2\text{ t}$. Since mass $M$ and external wind $d_{\text{wind}}$ both scale longitudinal acceleration, an observer that tries to estimate both simultaneously on open track suffers from algebraic ambiguity. We resolve this by exploiting the first $K = 8$ micro-steps ($4.0\text{ s}$) of station departure: while the train is still inside the station platform zone, the wayside anemometer provides the local wind $d_{\text{standstill}}$, so the only unknown in Newton's Second Law is the passenger mass:
 \begin{equation}
     \hat{M}_{\text{sample}}(k) = \frac{F_{\text{motor}}(k) - F_d(v_{k-1})}{(1 + \gamma)\big(a_{\text{kin}}(k) - d_{\text{standstill}}\big) + g\,\iota(x_k)}, \qquad
     \hat{M}_{\text{locked}} = \text{median}_{k=1..8}\big\{\hat{M}_{\text{sample}}(k)\big\}
+    \label{eq:mass_id}
 \end{equation}
-At step $k = 8$, $\hat{M}_{\text{locked}}$ is locked for the rest of the leg (preserving the active departure S-curve phase without resetting the shaper), so all later acceleration differences measure open-line wind and weather disturbances $\hat{d}_{\text{wind}}(k)$.
+At step $k = 8$, $\hat{M}_{\text{locked}}$ is locked into the LTV-MPC and physics model (without resetting the active departure S-curve phase), allowing all subsequent acceleration residuals ($k \ge 8$) to cleanly track open-corridor wind and weather gusts $\hat{d}_{\text{wind}}(k)$.
 
-To evaluate energy consumption fairly across aggressive and smooth controllers, we account for both traction drivetrain losses and electrodynamic regenerative braking blending:
+Motivated by Xiao et al.\ \cite{xiao2023} and Zhong et al.\ \cite{zhong2022}, who emphasize that realistic eco-driving must account for dynamic electric drive system (EDS) losses and regenerative recuperation rather than pure mechanical wheel work, our plant models both drivetrain losses and electrodynamic regenerative braking blending:
 \begin{itemize}[leftmargin=*]
-    \item \textbf{Traction Inverter and Motor Losses ($F_{\text{prop}} \ge 0$):} Heavy throttle ($u_{\text{act}}^2$ copper heating), rapid acceleration/jerk slewing ($a_{\text{real}}$, $j$, and steep $a_{\text{start}}$), and high-speed field weakening ($v > 13.4\text{ m/s}$) reduce drivetrain efficiency $\eta_{\text{trac}} \in [0.58, 0.92]$, drawing $\Delta E_{\text{trac}} = \frac{(F_{\text{prop}} / \eta_{\text{trac}})\,\bar{v}\,\Delta t}{3.6 \times 10^6}\text{ kWh}$.
-    \item \textbf{Regenerative Braking Blending ($F_{\text{prop}} < 0$):} Gentle decelerations ($b_{\text{land}} \le 0.70\text{ m/s}^2$, $|a_{\text{real}}| \le 0.68\text{ m/s}^2$) are captured by the electric motors with up to $46\%$ grid recovery, whereas hard braking blends in pneumatic friction pads that waste kinetic energy as heat.
+    \item \textbf{Traction Inverter \& Copper Losses ($F_{\text{prop}} \ge 0$):} Heavy throttle ($u_{\text{act}}^2$ heating), rapid acceleration/jerk slewing ($a_{\text{real}}$, $j$, and steep $a_{\text{start}}$), and high-speed field weakening ($v > 13.4\text{ m/s}$) reduce drivetrain efficiency $\eta_{\text{trac}} \in [0.58, 0.92]$, drawing $\Delta E_{\text{trac}} = \frac{(F_{\text{prop}} / \eta_{\text{trac}})\,\bar{v}\,\Delta t}{3.6 \times 10^6}\text{ kWh}$.
+    \item \textbf{Electrodynamic Regenerative Braking ($F_{\text{prop}} < 0$):} Smooth decelerations ($b_{\text{land}} \le 0.70\text{ m/s}^2$, $|a_{\text{real}}| \le 0.68\text{ m/s}^2$) are captured by the traction motors with up to $46\%$ grid recovery, whereas harsh braking blends in pneumatic friction pads that dissipate kinetic energy as heat.
 \end{itemize}
 
-\subsection{Hierarchical Contract Shielding with Ramp-Initiation Latching}
+\subsection{Core Contribution: Hierarchical Differential Shielding and Assume-Guarantee Contracts}
 
-Following Cano et al.\ \cite{cano2026} and Adalat et al.\ \cite{adalat2026a,adalat2026b}, we monitor five operational properties via their normalized \textbf{Derivative Pressures} $\rho_d(t) = \|\partial_t^d(x)\| / r_d \le 1.0$:
+Unifying Cano et al.'s Higher-Order Differential Shielding \cite{cano2026} with Adalat et al.'s Compositional Assume-Guarantee Contracts \cite{adalat2026a,adalat2026b}, our middle layer certifies five operational properties via their normalized \textbf{Derivative Pressures} $\rho_d(t) = \|\partial_t^d x\| / r_d \le 1.0$ across nested viability domains $\mathcal{W}_3 \subseteq \mathcal{W}_2 \subseteq \mathcal{W}_1$:
 \begin{enumerate}[leftmargin=*]
-    \item \textbf{Order $d=1$ Speed \& 99\% Scissor Tube:} $\rho_1(t) = (v_{\text{next}} + 2.576\,\sigma_{\text{tube}}) / v_{\text{ceil}}(x_t) \le 1.0$.
-    \item \textbf{Order $d=2$ Comfort Acceleration \& Braking:} $\rho_2(t) = \max(a_t / 1.20,\, -a_t / 0.92) \le 1.0$.
-    \item \textbf{Order $d=3$ Ride Jerk:} $\rho_3(t) = |a_t - a_{t-1}| / (0.48\,\Delta t) \le 1.0$, and smooth step cost $J_{\text{smooth}} = \mathbb{E}[\rho_2(t)^2 + \rho_3(t)^2]$.
-    \item \textbf{Deadline Punctuality Cone:} Bounds projected arrival time drift within $\pm \tau_{\text{tol}}$ when winds oppose the train.
-    \item \textbf{Traction Energy Ceiling:} Bounds kinetic-energy-compensated dissipated energy $E_{\text{diss}}(x_t) \le E_{\text{budget}}(x_t)$.
+    \item \textbf{Order $d=1$ Speed Ceiling \& 99\% Scissor Tube ($\mathcal{W}_1$):} Ensures the 99\% upper velocity bound never violates the anticipatory cosine spatial ceiling $v_{\text{ceil}}(x_t)$, with margin $h_1 = v_{\text{ceil}}(x_t) - (v_{\text{cmd}} + 2.576\,\sigma_{\text{tube}}) \ge 0$ and pressure $\rho_1(t) = (v_{\text{cmd}} + 2.576\,\sigma_{\text{tube}}) / v_{\text{ceil}}(x_t)$.
+    \item \textbf{Order $d=2$ Comfort Acceleration \& Braking ($\mathcal{W}_2 \subseteq \mathcal{W}_1$):} Bounds longitudinal acceleration and deceleration within passenger comfort limits, with step pressure $\rho_2(t) = \max(a_t / 1.20,\, -a_t / 0.92)$.
+    \item \textbf{Order $d=3$ Ride Jerk ($\mathcal{W}_3 \subseteq \mathcal{W}_2$):} Bounds peak S-curve jerk $j_{\text{peak}} = \frac{2 a_{\text{eff}}^2}{\max(1.7, |\Delta v|)} \le j_{\max} = 0.48\text{ m/s}^3$, with $\rho_3(t) = |\dot{a}_t| / 0.48$ and cumulative smoothness loss $\text{SmoothLoss} = \mathbb{E}[\rho_2(t)^2 + \rho_3(t)^2]$.
+    \item \textbf{System Energy Contract ($h_E, \rho_E$):} Detects pre-zone speed drops ($280\text{ m}$ ahead) and pre-landing entry windows ($x_{\text{rem}} \in [220, 285]\text{ m}$) where early coasting harvests $100\%$ electrodynamic regenerative braking.
+    \item \textbf{Deadline Gust-Compensation Cone ($h_T, \rho_T$):} Activates during strong open-track headwinds or tailwinds ($|\hat{d}_{\text{wind}}| > 0.30\text{ m/s}^2$, $x_{\text{rem}} > 900\text{ m}$) when projected arrival drift exceeds $\tau_{\text{tol}} = 0.80\text{ s}$.
 \end{enumerate}
-Because our Cosine Shaper locks its ramp rate at the start of each speed change, intervening only after jerk spikes mid-ramp is too late. Our shield therefore checks whether a new speed ramp or station departure is starting with ample schedule buffer, and \textbf{latches a smoother backup contract} ($a_{\text{cap}} \in [0.80, 0.82]\text{ m/s}^2$, $b_{\text{cap}} \in [0.68, 0.70]\text{ m/s}^2$ selected via Discounted-UCB / 1-Step DCBF / DMPS Rollout) across the entire ramp duration while trimming unnecessary cruise speed overshoot by $0.14\text{--}0.16\text{ m/s}$.
 
-\subsection{Standalone Benchmark: Bilbao-Moreno et al.\ (2025) CBTC-ATO}
-
-To benchmark our architecture against a recent railway control system from the literature without mixing the two designs, we implemented the two-layer CBTC-ATO system of \textbf{Bilbao-Moreno, Elorza, Irigoyen, and Trojaola (2025)} \cite{bilbao2025} as a standalone baseline (\texttt{bilbao\_cbtc\_ato.py}) solving the exact same multi-station problem:
+\paragraph{Assume-Guarantee Contract Library $\mathcal{L}_{\text{cert}}$ and Ramp-Initiation Latching:}
+Because a $C^2$ half-cosine S-curve locks its duration $T_{\text{ramp}}$ at the start of a speed shift, waiting until jerk spikes mid-ramp is too late. Instead, our shield evaluates the candidate command $p_{\text{task}}$ at ramp initiation ($k \in \{0, 8\}$ or when $|\Delta v| > 1.65\text{ m/s}$). When $\min_i h_i(p_{\text{task}}) < 0$, the shield maps the threatened property to a certified backup contract from $\mathcal{L}_{\text{cert}}$:
 \begin{itemize}[leftmargin=*]
-    \item \textbf{Mesoscopic Layer --- Reduced Model-Based Trajectory Planner (RMBTP):} Plans across the corridor speed zones using $90\%$ of service traction and braking capacity and a $96\%$ ATP speed margin, integrating backward from every speed drop and station stop so spatial speed limits $v_{\lim}(x)$ are respected. In \textbf{ECO mode}, it uses \textbf{Regula Falsi} root-finding updates ($V_{k+1} = V_k \frac{\Delta t_{\text{sim}}}{\Delta t_{\text{sim}} + (T_{\text{deadline}} - T_{\text{sim}})}$) to find the constant cruise ceiling that meets the leg deadline $T_{\text{deadline}}$.
-    \item \textbf{Microscopic Layer --- Cascade PI-Position and PI-Speed Controller with Braking Switcher:} An outer PI position loop adjusts the target speed based on position lag $e_x(t) = x_{\text{ref}}(t) - x(t)$, feeding an inner PI speed loop with inverse-dynamics traction feed-forward. During braking ramps, a \textbf{Braking Switcher} disconnects positive position-error speed boosts so schedule lag can never push the train above the safe braking curve, paired with anti-windup saturation sync and a reactive disturbance observer.
+    \item $\mathcal{C}_1$ (\texttt{C1\_SPEED\_SCISSOR\_CLAMP}): Projects $v_{\text{cmd}} \leftarrow v_{\text{ceil}}(x_t) - 2.576\,\sigma_{\text{tube}} - 0.02\text{ m/s}$ into $\mathcal{W}_1$.
+    \item $\mathcal{C}_2$ (\texttt{C2\_COMFORT\_JERK\_DAMP}): Latches gentle ramp caps ($a_{\text{cap}} = 0.74\text{ m/s}^2, b_{\text{cap}} = 0.66\text{ m/s}^2$) for $14\text{--}18$ steps across the ramp duration while adding $+0.06\text{ m/s}$ of cruise velocity compensation so the gentler departure ramp never loses a tenth of a second on the timetable.
+    \item $\mathcal{C}_3$ (\texttt{C3\_DEADLINE\_RECOVERY}): Trims target cruise speed against wind gusts ($v_{\text{cmd}} - 0.32\,\hat{d}_{\text{wind}}$) and, if an infeasible break-test leg arrives late, shortens the $25\text{ s}$ station dwell down to $19\text{ s}$ to recover multi-station timetable slack \cite{zhong2022}.
+    \item $\mathcal{C}_4$ (\texttt{C4\_ECO\_REGEN\_COAST}): Commands early predictive coasting ($v_{\text{cmd}} - 0.28\text{ m/s}, b = 0.65\text{ m/s}^2$) ahead of slower speed zones to maximize regenerative energy recovery \cite{xiao2023}.
 \end{itemize}
+In \textbf{UCB-DMPS Rollout} mode, a recency-weighted Discounted-UCB selector ($\eta = 0.992$) evaluates candidate convex blends $p_{\text{cand}} = (1 - \lambda)p_{\text{task}} + \lambda p_{\mathcal{C}}$ ($\lambda \in \{0.55, 0.85\}$) across $\mathcal{L}_{\text{cert}}$ and selects the contract maximizing the composite multi-property payoff while strictly satisfying $h_1 \ge 0$ and $h_2 \ge 0$.
 
-\section{Stage 3 Experimental Results (Generalized 1--5 Station Benchmark)}
+\section{Stage 3 Experimental Validation and Literature Comparison}
 
-We evaluated all 8 competing methods across \textbf{30 generalized multi-station scenarios} (1 to 5 station stops, $4.75\text{ km}$ to $30.8\text{ km}$ total route length), split evenly between \textbf{15 No-Weather (Clean)} scenarios and \textbf{15 Weather-Disturbed} (Wind, Rain, Snow, and Cold Air) scenarios. Every controller is scored on the exact physical loss terms:
+We evaluated our architecture across \textbf{30 generalized multi-station scenarios} (1 to 5 station stops, $4.75\text{ km}$ to $30.8\text{ km}$ total route length), split evenly between \textbf{15 No-Weather (Clean)} scenarios and \textbf{15 Weather-Disturbed} (Wind, Rain, Snow, and Cold Air) scenarios, using the composite physical loss score:
 \begin{equation}
     \text{LossScore} = 1.0\,|\text{TimeErr}| + 15.0\,|\text{StopErr}| + 2.0\,\text{SmoothLoss} + 0.025\,\text{SpecEnergy}
 \end{equation}
-Tables~\ref{tab:scen_sample}--\ref{tab:scissor_diag} and Figures~\ref{fig:dual_axis}--\ref{fig:six_panel} present the complete benchmark results.
+Alongside our three internal ablations (\textbf{Max-Speed Greedy}, \textbf{Naive Pace}, and \textbf{Static Plan}), we contextualize our results against four representative railway control paradigms from the literature:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Bilbao-Moreno et al.\ (2025) Two-Layer CBTC-ATO \cite{bilbao2025}:} Implemented as a standalone benchmark (\texttt{bilbao\_cbtc\_ato.py}) on our exact corridor. Its mesoscopic \textbf{Reduced Model-Based Trajectory Planner (RMBTP)} plans piecewise constant-acceleration ($90\%$ effort) and backward-braking zones using \textbf{Regula Falsi} root-finding to match $T_{\text{deadline}}$, tracked by a microscopic \textbf{Cascade PI-Position + PI-Speed Controller} with a \textbf{Braking Switcher} that disconnects positive position-error boosts during deceleration.
+    \item \textbf{Zhong et al.\ (2022) Moving-Horizon Pseudospectral MPC \cite{zhong2022} \& Xiao et al.\ (2023) Space-Domain Convex RTI-SQP \cite{xiao2023}:} Provide the foundational mathematical programming paths for online speed profile generation (`~500 ms` per step via multi-phase Radau pseudospectral NLP in \cite{zhong2022}, and `~29 ms` per step via space-domain convex RTI-SQP in \cite{xiao2023}). Our macro-step PPO + $C^2$ Cosine Shaper + Contract-Shielded $3\times 3$ LTV-MPC achieves the same online schedule recovery and holistic traction-chain energy savings in $\mathbf{41.5\text{ }\mu\text{s}}$ total per step ($\sim 700\times$ faster than RTI-SQP and $\sim 12,000\times$ faster than RPM).
+    \item \textbf{Sun et al.\ (2024) Event-Triggered Tube MPC (ETTMPC) \cite{sun2024}:} Uses piecewise-linear drag approximations and offline polyhedral Reachable Sets ($\mathbb{Z}_{k+i}$) in MATLAB MPT3 to track a static offline reference curve, skipping QP solves when tracking error is small ($19.3\%$ trigger reduction, achieving $0.195\text{ m/s}$ speed RMSE and $18.7\text{ cm}$ stopping error). By contrast, our macro/micro hierarchy ($M=8$ in cruise) achieves an $87.5\%$ trigger reduction on the high-level planner + contract shield, while our neural Scissor Tube and closed-form $3\times 3$ LTV-MPC achieve $\mathbf{1.0\text{ cm}}$ stopping error ($18.7\times$ tighter) in $\sim 25\text{ }\mu\text{s}$ per core step without offline polyhedral vertex growth.
+\end{itemize}
 
 \begin{table}[h!]
 \centering
 \caption{Sample of the 30 Generalized Multi-Station ($1\text{..}5$ Stops, $4\text{..}31\text{ km}$) Scenarios --- Contract-Shielded PPO (UCB-DMPS Rollout).}
 \label{tab:scen_sample}
-\footnotesize
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{ccccccccc}
 \toprule
 \textbf{Scen\#} & \textbf{Stops} & \textbf{Total Len} & \textbf{Passenger Mass Evolution Across Stops} & \textbf{|TimeErr|} & \textbf{|StopErr|} & \textbf{SpecEnergy} & \textbf{LossScore} & \textbf{Shield\%} \\
 \midrule
-1 & 4 & $21.35\text{ km}$ & $82.5\text{t} \to 84.6\text{t} \to 82.7\text{t} \to 89.7\text{t}$ & $0.88\text{ s}$ & $0.025\text{ m}$ & $66.81\text{ Wh/tk}$ & $3.0245$ & $4.7\%$ \\
+1 & 4 & $21.35\text{ km}$ & $82.5\text{t} \to 84.6\text{t} \to 82.7\text{t} \to 89.7\text{t}$ & $1.12\text{ s}$ & $0.015\text{ m}$ & $66.81\text{ Wh/tk}$ & $3.1103$ & $4.7\%$ \\
 2 & 3 & $15.55\text{ km}$ & $84.4\text{t} \to 93.6\text{t} \to 88.4\text{t}$ & $2.33\text{ s}$ & $0.004\text{ m}$ & $36.91\text{ Wh/tk}$ & $3.4258$ & $9.7\%$ \\
-3 & 3 & $15.45\text{ km}$ & $83.2\text{t} \to 85.8\text{t} \to 83.3\text{t}$ & $1.33\text{ s}$ & $0.021\text{ m}$ & $56.04\text{ Wh/tk}$ & $3.1782$ & $9.3\%$ \\
+3 & 3 & $15.45\text{ km}$ & $83.2\text{t} \to 85.8\text{t} \to 83.3\text{t}$ & $1.33\text{ s}$ & $0.024\text{ m}$ & $56.04\text{ Wh/tk}$ & $3.2212$ & $9.3\%$ \\
 4 & 1 & $4.75\text{ km}$  & $86.0\text{t}$ & $1.00\text{ s}$ & $0.004\text{ m}$ & $35.83\text{ Wh/tk}$ & $2.0536$ & $5.7\%$ \\
-5 & 3 & $13.90\text{ km}$ & $83.5\text{t} \to 92.3\text{t} \to 86.8\text{t}$ & $1.83\text{ s}$ & $0.012\text{ m}$ & $29.24\text{ Wh/tk}$ & $2.8546$ & $15.2\%$ \\
-6 & 2 & $10.10\text{ km}$ & $84.1\text{t} \to 87.4\text{t}$ & $2.50\text{ s}$ & $0.003\text{ m}$ & $38.12\text{ Wh/tk}$ & $3.6294$ & $13.8\%$ \\
-7 & 2 & $10.85\text{ km}$ & $82.9\text{t} \to 94.2\text{t}$ & $1.75\text{ s}$ & $0.059\text{ m}$ & $61.60\text{ Wh/tk}$ & $4.2908$ & $8.9\%$ \\
+5 & 3 & $13.90\text{ km}$ & $83.5\text{t} \to 92.3\text{t} \to 86.8\text{t}$ & $1.83\text{ s}$ & $0.011\text{ m}$ & $29.24\text{ Wh/tk}$ & $2.8425$ & $15.2\%$ \\
+6 & 2 & $10.10\text{ km}$ & $84.1\text{t} \to 87.4\text{t}$ & $2.75\text{ s}$ & $0.003\text{ m}$ & $38.12\text{ Wh/tk}$ & $3.8793$ & $13.7\%$ \\
+7 & 2 & $10.85\text{ km}$ & $82.9\text{t} \to 94.2\text{t}$ & $2.25\text{ s}$ & $0.007\text{ m}$ & $61.60\text{ Wh/tk}$ & $4.0081$ & $8.8\%$ \\
 8 & 2 & $11.65\text{ km}$ & $83.6\text{t} \to 86.9\text{t}$ & $1.25\text{ s}$ & $0.006\text{ m}$ & $36.36\text{ Wh/tk}$ & $2.3390$ & $6.0\%$ \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table}
 
 \begin{table}[h!]
 \centering
-\caption{Stage 3 Generalized Multi-Station Benchmark Across Clean (15 Scenarios), Weather-Disturbed (15 Scenarios), and Combined (30 Scenarios).}
+\caption{Stage 3 Generalized Multi-Station Benchmark Across Clean (15 Scenarios), Weather-Disturbed (15 Scenarios), and Combined (30 Scenarios) with Optimized Low-Latency MPC \& Live Neural Parameter Views.}
 \label{tab:stage3_main}
-\scriptsize
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{lcccccccc}
 \toprule
 \textbf{Trajectory Pilot + Contract Shield Method} & \textbf{|TimeErr|} & \textbf{|StopErr|} & \textbf{SmoothLoss} & \textbf{SpecEnergy} & \textbf{LossScore} & \textbf{Shield\%} & \textbf{Core Step} & \textbf{Total (Mean/P99)} \\
 \midrule
 \multicolumn{9}{l}{\textbf{Part A: No-Weather (Clean) Scenarios Only (15 Scenarios | 1..5 Stations)}} \\
 \midrule
-1. Max-Speed Greedy Cosine + MPC & $3.73\text{ s}$ & $0.004\text{ m}$ & $0.0729$ & $41.27\text{ Wh/tk}$ & $4.9610$ & $0.0\%$ & $93.2\text{ }\mu\text{s}$ & $102.2 / 155.2\text{ }\mu\text{s}$ \\
-2. Naive Pace (No Cruise Overshoot) + MPC & $19.20\text{ s}$ & $0.003\text{ m}$ & $0.0550$ & $35.60\text{ Wh/tk}$ & $20.2530$ & $0.0\%$ & $89.2\text{ }\mu\text{s}$ & $94.7 / 133.9\text{ }\mu\text{s}$ \\
-3. Static Plan (No Wind/Mass Replan) + MPC & $9.50\text{ s}$ & $0.003\text{ m}$ & $0.0593$ & $36.20\text{ Wh/tk}$ & $10.5735$ & $0.0\%$ & $87.8\text{ }\mu\text{s}$ & $93.7 / 120.5\text{ }\mu\text{s}$ \\
-\textbf{4. Multi-Property PPO Pilot (Unshielded)} & $\mathbf{1.05\text{ s}}$ & $0.004\text{ m}$ & $0.0615$ & $38.21\text{ Wh/tk}$ & $\mathbf{2.1910}$ & $0.0\%$ & $89.6\text{ }\mu\text{s}$ & $103.4 / 156.8\text{ }\mu\text{s}$ \\
-\textbf{5. Contract-Shielded PPO (Switch MPS)} & $1.18\text{ s}$ & $0.005\text{ m}$ & $0.0542$ & $36.79\text{ Wh/tk}$ & $2.2805$ & $6.6\%$ & $92.7\text{ }\mu\text{s}$ & $143.8 / 217.2\text{ }\mu\text{s}$ \\
-\textbf{6. Contract-Shielded PPO (1-Step DCBF)} & $1.38\text{ s}$ & $0.004\text{ m}$ & $\mathbf{0.0526}$ & $\mathbf{36.48\text{ Wh/tk}}$ & $2.4635$ & $6.7\%$ & $92.7\text{ }\mu\text{s}$ & $143.7 / 210.1\text{ }\mu\text{s}$ \\
-\textbf{7. Contract-Shielded PPO (UCB-DMPS Rollout)} & $1.48\text{ s}$ & $0.004\text{ m}$ & $0.0529$ & $36.69\text{ Wh/tk}$ & $2.5662$ & $8.0\%$ & $93.1\text{ }\mu\text{s}$ & $145.7 / 224.0\text{ }\mu\text{s}$ \\
-8. Bilbao et al.\ (2025) CBTC-ATO (RMBTP + PI) \cite{bilbao2025} & $4.96\text{ s}$ & $0.016\text{ m}$ & $0.1104$ & $38.64\text{ Wh/tk}$ & $6.3940$ & $0.0\%$ & $21.4\text{ }\mu\text{s}$ & $21.4 / 27.9\text{ }\mu\text{s}$ \\
+1. Max-Speed Greedy Cosine + MPC & $3.73\text{ s}$ & $0.004\text{ m}$ & $0.0729$ & $41.27\text{ Wh/tk}$ & $4.9624$ & $0.0\%$ & $24.7\text{ }\mu\text{s}$ & $28.0 / 42.0\text{ }\mu\text{s}$ \\
+2. Naive Pace (No Cruise Overshoot) + MPC & $19.20\text{ s}$ & $0.003\text{ m}$ & $0.0550$ & $35.60\text{ Wh/tk}$ & $20.2530$ & $0.0\%$ & $24.4\text{ }\mu\text{s}$ & $27.4 / 41.9\text{ }\mu\text{s}$ \\
+3. Static Plan (No Wind/Mass Replan) + MPC & $9.50\text{ s}$ & $0.003\text{ m}$ & $0.0593$ & $36.20\text{ Wh/tk}$ & $10.5736$ & $0.0\%$ & $24.5\text{ }\mu\text{s}$ & $28.0 / 41.5\text{ }\mu\text{s}$ \\
+\textbf{4. Multi-Property PPO Pilot (Unshielded)} & $\mathbf{1.10\text{ s}}$ & $0.005\text{ m}$ & $0.0615$ & $38.21\text{ Wh/tk}$ & $\mathbf{2.2549}$ & $0.0\%$ & $24.5\text{ }\mu\text{s}$ & $28.8 / 43.9\text{ }\mu\text{s}$ \\
+\textbf{5. Contract-Shielded PPO (Switch MPS)} & $1.27\text{ s}$ & $0.005\text{ m}$ & $0.0543$ & $36.79\text{ Wh/tk}$ & $2.3685$ & $6.6\%$ & $25.3\text{ }\mu\text{s}$ & $40.2 / 68.1\text{ }\mu\text{s}$ \\
+\textbf{6. Contract-Shielded PPO (1-Step DCBF)} & $1.45\text{ s}$ & $0.005\text{ m}$ & $\mathbf{0.0526}$ & $\mathbf{36.48\text{ Wh/tk}}$ & $2.5422$ & $6.7\%$ & $25.4\text{ }\mu\text{s}$ & $40.3 / 73.1\text{ }\mu\text{s}$ \\
+\textbf{7. Contract-Shielded PPO (UCB-DMPS Rollout)} & $1.52\text{ s}$ & $0.004\text{ m}$ & $0.0529$ & $36.69\text{ Wh/tk}$ & $2.6101$ & $8.0\%$ & $25.5\text{ }\mu\text{s}$ & $41.4 / 73.3\text{ }\mu\text{s}$ \\
+8. Bilbao et al.\ (2025) CBTC-ATO (RMBTP + PI) \cite{bilbao2025} & $4.96\text{ s}$ & $0.016\text{ m}$ & $0.1104$ & $38.64\text{ Wh/tk}$ & $6.3940$ & $0.0\%$ & $20.9\text{ }\mu\text{s}$ & $20.9 / 27.2\text{ }\mu\text{s}$ \\
 \midrule
 \multicolumn{9}{l}{\textbf{Part B: Weather-Disturbed (Wind / Rain / Snow / Cold) Scenarios Only (15 Scenarios | 1..5 Stations)}} \\
 \midrule
-1. Max-Speed Greedy Cosine + MPC & $2.95\text{ s}$ & $0.060\text{ m}$ & $0.0738$ & $60.46\text{ Wh/tk}$ & $5.5114$ & $0.0\%$ & $92.6\text{ }\mu\text{s}$ & $101.4 / 169.6\text{ }\mu\text{s}$ \\
-2. Naive Pace (No Cruise Overshoot) + MPC & $20.29\text{ s}$ & $0.022\text{ m}$ & $0.0544$ & $51.61\text{ Wh/tk}$ & $22.0140$ & $0.0\%$ & $89.6\text{ }\mu\text{s}$ & $95.1 / 140.4\text{ }\mu\text{s}$ \\
-3. Static Plan (No Wind/Mass Replan) + MPC & $10.07\text{ s}$ & $0.027\text{ m}$ & $0.0598$ & $51.00\text{ Wh/tk}$ & $11.8691$ & $0.0\%$ & $90.1\text{ }\mu\text{s}$ & $96.1 / 146.4\text{ }\mu\text{s}$ \\
-\textbf{4. Multi-Property PPO Pilot (Unshielded)} & $\mathbf{2.17\text{ s}}$ & $0.052\text{ m}$ & $0.0598$ & $55.10\text{ Wh/tk}$ & $\mathbf{4.4434}$ & $0.0\%$ & $92.5\text{ }\mu\text{s}$ & $107.0 / 177.3\text{ }\mu\text{s}$ \\
-\textbf{5. Contract-Shielded PPO (Switch MPS)} & $2.45\text{ s}$ & $0.051\text{ m}$ & $0.0533$ & $53.75\text{ Wh/tk}$ & $4.6736$ & $9.1\%$ & $95.1\text{ }\mu\text{s}$ & $146.9 / 232.2\text{ }\mu\text{s}$ \\
-\textbf{6. Contract-Shielded PPO (1-Step DCBF)} & $2.58\text{ s}$ & $0.049\text{ m}$ & $\mathbf{0.0520}$ & $53.37\text{ Wh/tk}$ & $4.7531$ & $9.2\%$ & $94.1\text{ }\mu\text{s}$ & $145.3 / 219.8\text{ }\mu\text{s}$ \\
-\textbf{7. Contract-Shielded PPO (UCB-DMPS Rollout)} & $2.66\text{ s}$ & $0.050\text{ m}$ & $0.0538$ & $53.45\text{ Wh/tk}$ & $4.8501$ & $9.6\%$ & $94.3\text{ }\mu\text{s}$ & $147.1 / 223.5\text{ }\mu\text{s}$ \\
-8. Bilbao et al.\ (2025) CBTC-ATO (RMBTP + PI) \cite{bilbao2025} & $3.34\text{ s}$ & $0.041\text{ m}$ & $0.0978$ & $52.39\text{ Wh/tk}$ & $5.4663$ & $0.0\%$ & $21.0\text{ }\mu\text{s}$ & $21.0 / 27.4\text{ }\mu\text{s}$ \\
+1. Max-Speed Greedy Cosine + MPC & $3.13\text{ s}$ & $0.007\text{ m}$ & $0.0738$ & $60.46\text{ Wh/tk}$ & $4.8992$ & $0.0\%$ & $24.8\text{ }\mu\text{s}$ & $28.1 / 43.6\text{ }\mu\text{s}$ \\
+2. Naive Pace (No Cruise Overshoot) + MPC & $20.43\text{ s}$ & $0.010\text{ m}$ & $0.0542$ & $51.63\text{ Wh/tk}$ & $21.9812$ & $0.0\%$ & $24.4\text{ }\mu\text{s}$ & $27.4 / 37.8\text{ }\mu\text{s}$ \\
+3. Static Plan (No Wind/Mass Replan) + MPC & $10.35\text{ s}$ & $0.013\text{ m}$ & $0.0596$ & $51.02\text{ Wh/tk}$ & $11.9406$ & $0.0\%$ & $24.8\text{ }\mu\text{s}$ & $28.4 / 45.3\text{ }\mu\text{s}$ \\
+\textbf{4. Multi-Property PPO Pilot (Unshielded)} & $\mathbf{2.03\text{ s}}$ & $0.017\text{ m}$ & $0.0597$ & $55.17\text{ Wh/tk}$ & $\mathbf{3.7782}$ & $0.0\%$ & $24.9\text{ }\mu\text{s}$ & $29.3 / 47.0\text{ }\mu\text{s}$ \\
+\textbf{5. Contract-Shielded PPO (Switch MPS)} & $2.20\text{ s}$ & $0.016\text{ m}$ & $0.0530$ & $53.80\text{ Wh/tk}$ & $3.8988$ & $9.1\%$ & $25.6\text{ }\mu\text{s}$ & $40.6 / 64.8\text{ }\mu\text{s}$ \\
+\textbf{6. Contract-Shielded PPO (1-Step DCBF)} & $2.36\text{ s}$ & $0.016\text{ m}$ & $\mathbf{0.0515}$ & $53.42\text{ Wh/tk}$ & $4.0350$ & $9.2\%$ & $25.5\text{ }\mu\text{s}$ & $40.4 / 63.8\text{ }\mu\text{s}$ \\
+\textbf{7. Contract-Shielded PPO (UCB-DMPS Rollout)} & $2.47\text{ s}$ & $0.016\text{ m}$ & $0.0531$ & $53.49\text{ Wh/tk}$ & $4.1492$ & $9.6\%$ & $25.5\text{ }\mu\text{s}$ & $41.7 / 68.2\text{ }\mu\text{s}$ \\
+8. Bilbao et al.\ (2025) CBTC-ATO (RMBTP + PI) \cite{bilbao2025} & $3.34\text{ s}$ & $0.041\text{ m}$ & $0.0978$ & $52.39\text{ Wh/tk}$ & $5.4663$ & $0.0\%$ & $20.7\text{ }\mu\text{s}$ & $20.7 / 26.2\text{ }\mu\text{s}$ \\
 \midrule
 \multicolumn{9}{l}{\textbf{Part C: United Benchmark --- All Generalized Scenarios Combined (30 Scenarios | 1..5 Stations)}} \\
 \midrule
-1. Max-Speed Greedy Cosine + MPC & $3.34\text{ s}$ & $0.032\text{ m}$ & $0.0733$ & $50.86\text{ Wh/tk}$ & $5.2362$ & $0.0\%$ & $92.9\text{ }\mu\text{s}$ & $101.8 / 162.4\text{ }\mu\text{s}$ \\
-2. Naive Pace (No Cruise Overshoot) + MPC & $19.75\text{ s}$ & $0.013\text{ m}$ & $0.0547$ & $43.60\text{ Wh/tk}$ & $21.1335$ & $0.0\%$ & $89.4\text{ }\mu\text{s}$ & $94.9 / 137.2\text{ }\mu\text{s}$ \\
-3. Static Plan (No Wind/Mass Replan) + MPC & $9.79\text{ s}$ & $0.015\text{ m}$ & $0.0596$ & $43.60\text{ Wh/tk}$ & $11.2213$ & $0.0\%$ & $89.0\text{ }\mu\text{s}$ & $94.9 / 133.4\text{ }\mu\text{s}$ \\
-\textbf{4. Multi-Property PPO Pilot (Unshielded)} & $\mathbf{1.61\text{ s}}$ & $0.028\text{ m}$ & $0.0606$ & $46.66\text{ Wh/tk}$ & $\mathbf{3.3172}$ & $0.0\%$ & $91.1\text{ }\mu\text{s}$ & $105.2 / 167.0\text{ }\mu\text{s}$ \\
-\textbf{5. Contract-Shielded PPO (Switch MPS)} & $1.82\text{ s}$ & $0.028\text{ m}$ & $0.0538$ & $45.27\text{ Wh/tk}$ & $3.4770$ & $7.9\%$ & $93.9\text{ }\mu\text{s}$ & $145.4 / 224.7\text{ }\mu\text{s}$ \\
-\textbf{6. Contract-Shielded PPO (1-Step DCBF)} & $1.98\text{ s}$ & $\mathbf{0.027\text{ m}}$ & $\mathbf{0.0523}$ & $\mathbf{44.92\text{ Wh/tk}}$ & $3.6083$ & $7.9\%$ & $93.4\text{ }\mu\text{s}$ & $144.5 / 214.9\text{ }\mu\text{s}$ \\
-\textbf{7. Contract-Shielded PPO (UCB-DMPS Rollout)} & $2.07\text{ s}$ & $\mathbf{0.027\text{ m}}$ & $0.0533$ & $45.07\text{ Wh/tk}$ & $3.7081$ & $8.8\%$ & $93.7\text{ }\mu\text{s}$ & $146.4 / 223.7\text{ }\mu\text{s}$ \\
-8. Bilbao et al.\ (2025) CBTC-ATO (RMBTP + PI) \cite{bilbao2025} & $4.15\text{ s}$ & $0.029\text{ m}$ & $0.1041$ & $45.52\text{ Wh/tk}$ & $5.9302$ & $0.0\%$ & $\mathbf{21.2\text{ }\mu\text{s}}$ & $\mathbf{21.2 / 27.7\text{ }\mu\text{s}}$ \\
+1. Max-Speed Greedy Cosine + MPC & $3.43\text{ s}$ & $\mathbf{0.006\text{ m}}$ & $0.0733$ & $50.86\text{ Wh/tk}$ & $4.9308$ & $0.0\%$ & $24.8\text{ }\mu\text{s}$ & $28.0 / 42.8\text{ }\mu\text{s}$ \\
+2. Naive Pace (No Cruise Overshoot) + MPC & $19.82\text{ s}$ & $0.007\text{ m}$ & $0.0546$ & $43.61\text{ Wh/tk}$ & $21.1171$ & $0.0\%$ & $24.4\text{ }\mu\text{s}$ & $27.4 / 39.8\text{ }\mu\text{s}$ \\
+3. Static Plan (No Wind/Mass Replan) + MPC & $9.92\text{ s}$ & $0.008\text{ m}$ & $0.0594$ & $43.61\text{ Wh/tk}$ & $11.2571$ & $0.0\%$ & $24.7\text{ }\mu\text{s}$ & $28.2 / 43.4\text{ }\mu\text{s}$ \\
+\textbf{4. Multi-Property PPO Pilot (Unshielded)} & $\mathbf{1.57\text{ s}}$ & $0.011\text{ m}$ & $0.0606$ & $46.69\text{ Wh/tk}$ & $\mathbf{3.0165}$ & $0.0\%$ & $24.7\text{ }\mu\text{s}$ & $29.0 / 45.5\text{ }\mu\text{s}$ \\
+\textbf{5. Contract-Shielded PPO (Switch MPS)} & $1.74\text{ s}$ & $0.011\text{ m}$ & $0.0536$ & $45.29\text{ Wh/tk}$ & $3.1337$ & $7.9\%$ & $25.5\text{ }\mu\text{s}$ & $40.4 / 66.4\text{ }\mu\text{s}$ \\
+\textbf{6. Contract-Shielded PPO (1-Step DCBF)} & $1.91\text{ s}$ & $0.010\text{ m}$ & $\mathbf{0.0521}$ & $\mathbf{44.95\text{ Wh/tk}}$ & $3.2886$ & $7.9\%$ & $25.4\text{ }\mu\text{s}$ & $40.3 / 68.5\text{ }\mu\text{s}$ \\
+\textbf{7. Contract-Shielded PPO (UCB-DMPS Rollout)} & $2.00\text{ s}$ & $0.010\text{ m}$ & $0.0530$ & $45.09\text{ Wh/tk}$ & $3.3796$ & $8.8\%$ & $25.5\text{ }\mu\text{s}$ & $41.5 / 70.8\text{ }\mu\text{s}$ \\
+8. Bilbao et al.\ (2025) CBTC-ATO (RMBTP + PI) \cite{bilbao2025} & $4.15\text{ s}$ & $0.029\text{ m}$ & $0.1041$ & $45.52\text{ Wh/tk}$ & $5.9302$ & $0.0\%$ & $\mathbf{20.8\text{ }\mu\text{s}}$ & $\mathbf{20.8 / 26.7\text{ }\mu\text{s}}$ \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table}
 
 \begin{table}[h!]
 \centering
-\caption{Hierarchical Differential \& Contract Shield Diagnostics on 4-Station ($21.35\text{ km}$) Route (Emu-to-Real RMSE $= 0.0217\text{ m/s}$, Emp 99th-Pct $= 0.0633\text{ m/s}$, Physical Tube Containment $= 99.9\%$; Contract Interventions by Property: Speed $= 0$, SmoothAccel $= 10$, Jerk $= 17$, Energy $= 2$, DeadlineCone $= 3$).}
+\caption{Hierarchical Differential \& Contract Shield Diagnostics on 4-Station ($21.35\text{ km}$) Route (Emu-to-Real RMSE $= 0.0217\text{ m/s}$, Emp 99th-Pct $= 0.0639\text{ m/s}$, Physical Tube Containment $= 99.9\%$; Contract Interventions by Property: Speed $= 0$, SmoothAccel $= 10$, Jerk $= 17$, Energy $= 2$, DeadlineCone $= 3$).}
 \label{tab:scissor_diag}
-\footnotesize
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{lcccccc}
 \toprule
 \textbf{Driving Regime} & \textbf{Steps} & \textbf{Emu-Real RMSE} & \textbf{Learned 99\% (Yellow)} & \textbf{Safe Envelope (Green)} & \textbf{Regime MaxErr} & \textbf{Micro-Step Interventions} \\
@@ -291,9 +336,10 @@ Tables~\ref{tab:scen_sample}--\ref{tab:scissor_diag} and Figures~\ref{fig:dual_a
 Cruise           & 2596 & $0.0180\text{ m/s}$ & $\pm 0.0907\text{ m/s}$ & $\pm 0.2307\text{ m/s}$ & $0.0643\text{ m/s}$ & $19\text{ }(0.7\%)$ \\
 Shift (Up/Down)  &  192 & $0.0125\text{ m/s}$ & $\pm 0.0855\text{ m/s}$ & $\pm 0.2455\text{ m/s}$ & $0.0291\text{ m/s}$ & $5\text{ }(2.6\%)$ \\
 Brake            &  352 & $0.0236\text{ m/s}$ & $\pm 0.0840\text{ m/s}$ & $\pm 0.2440\text{ m/s}$ & $0.0667\text{ m/s}$ & $0\text{ }(0.0\%)$ \\
-Station Stop     &  358 & $0.0403\text{ m/s}$ & $\pm 0.0483\text{ m/s}$ & $\pm 0.1102\text{ m/s}$ & $0.3370\text{ m/s}$ & $8\text{ }(2.2\%)$ \\
+Station Stop     &  359 & $0.0403\text{ m/s}$ & $\pm 0.0485\text{ m/s}$ & $\pm 0.1103\text{ m/s}$ & $0.3322\text{ m/s}$ & $8\text{ }(2.2\%)$ \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table}
 
 \begin{figure}[h!]
@@ -306,17 +352,16 @@ Station Stop     &  358 & $0.0403\text{ m/s}$ & $\pm 0.0483\text{ m/s}$ & $\pm 0
 \begin{figure}[h!]
 \centering
 \includegraphics[width=0.98\textwidth]{rl_cosine_mpc.png}
-\caption{Six-panel generalized benchmark overview across all 8 competing controllers: (1) multi-station speed profiles $v(x)$ including Bilbao et al.\ (2025) CBTC-ATO \cite{bilbao2025}, (2) smooth Order-2 acceleration $a(t)$ and Order-3 jerk $j(t)$, (3) online 8-step passenger mass identification and weather observer $\hat{d}(t)$, (4) mean deadline error across Clean, Weather-Disturbed, and Combined runs, (5) composite multi-objective LossScore, and (6) normalized breakdown of $15\times\text{SmoothLoss}$, Stop Error (cm), and $\text{SpecEnergy}/25$ (Wh/t-km).}
+\caption{Six-panel generalized benchmark overview across all 8 competing controllers: (1) multi-station speed profiles $v(x)$, (2) smooth Order-2 acceleration $a(t)$ and Order-3 jerk $j(t)$, (3) online 8-step passenger mass identification and weather observer $\hat{d}(t)$, (4) mean deadline error across Clean, Weather-Disturbed, and Combined runs, (5) composite multi-objective LossScore, and (6) normalized breakdown of $15\times\text{SmoothLoss}$, Stop Error (cm), and $\text{SpecEnergy}/25$ (Wh/t-km).}
 \label{fig:six_panel}
 \end{figure}
 
-\section{Discussion and Conclusions}
+\section{Key Takeaways and Conclusions}
 
 \begin{enumerate}[leftmargin=*]
-    \item \textbf{Why Max-Speed Greedy Suffers in Smoothness and Energy:} When the Max-Speed Greedy baseline maximizes cruise speed with steep ramps ($a_{\text{start}} = 1.18\text{ m/s}^2$, $b_{\text{land}} = 0.90\text{ m/s}^2$) until ahead of schedule, its sharp acceleration and late braking drive up Order-2/3 smoothness loss ($\text{SmoothLoss} = 0.0733$) and inverter/friction energy losses ($50.86\text{ Wh/t-km}$), whereas our PPO pilot achieves more than $2\times$ better schedule accuracy ($1.61\text{ s}$ vs.\ $3.34\text{ s}$) at $4.2\text{ Wh/t-km}$ lower specific energy.
-    \item \textbf{How Contract Latching Improves Both Ride Comfort and Energy:} By detecting the start of speed ramps and station departures and latching gentler backup contracts ($a_{\text{cap}} \approx 0.80\text{ m/s}^2$, $b_{\text{cap}} \approx 0.68\text{ m/s}^2$) for the ramp duration, the Contract Shield cuts $\text{SmoothLoss}$ by $13.7\%$ (from $0.0606$ to $0.0523$) and saves $1.74\text{ Wh/t-km}$ of traction energy while intervening on only $7.9\%\text{--}8.8\%$ of macro-steps.
-    \item \textbf{Understanding Panel 6 (Normalized Multi-Property Breakdown):} Because raw $\text{SmoothLoss} \approx 0.05\text{--}0.10$, stopping error $\approx 0.028\text{ m}$, and specific energy $\approx 45\text{ Wh/t-km}$ span three different orders of magnitude, Panel 6 in Figure~\ref{fig:six_panel} plots $15 \times \text{SmoothLoss}$, $\text{Stop Error in cm}$ ($100 \times |\text{StopErr}|$), and $\text{SpecEnergy} / 25$ side by side on a shared $[0, 3.2]$ vertical axis so their physical trade-offs are directly visible.
-    \item \textbf{Comparison with Bilbao-Moreno et al.\ (2025) CBTC-ATO \cite{bilbao2025}:} Implementing Bilbao-Moreno et al.'s RMBTP planner (with Regula Falsi ECO speed selection and backward braking curves) and Cascade PI controller (with the Braking Switcher) on our exact corridor problem reveals a clear trade-off. Their analytical zone planner and PI loops execute in just $21.2\text{ }\mu\text{s}$ per step and outperform Naive ($19.75\text{ s}$) and Static ($9.79\text{ s}$) baselines with a $4.15\text{ s}$ mean deadline error and $2.9\text{ cm}$ stopping error. However, because RMBTP plans constant-rate trapezoidal ramps ($90\%$ effort) rather than $C^2$ half-cosine S-curves, and because the Braking Switcher disconnects position feedback during deceleration, its smoothness loss is nearly twice as high as our Contract-Shielded PPO ($0.1041$ vs.\ $0.0523$) and its arrival error is $2\times$ larger ($4.15\text{ s}$ vs.\ $1.61\text{--}2.07\text{ s}$).
+    \item \textbf{Sequential Architectural Progression:} Each stage directly resolved the physical limitation exposed by the previous one: Stage 1 solved first-order motor lag overshoot via State-Augmented LTV-MPC and replaced offline polyhedral sets with a learned 99\% Scissor Tube; Stage 2 compressed the horizon to $N_p = 5, N_c = 3$ and added an Online Disturbance Observer for storm gusts; Stage 3 lifted the controller from tracking fixed speed arrays to online multi-station deadline planning \cite{zhong2022,xiao2023} via 8-step passenger mass identification, $C^2$ half-cosine shaping, and Hierarchical Contract Shielding.
+    \item \textbf{How Contract Latching Improves Both Ride Comfort and Energy:} By certifying candidate ramps at initiation and latching gentler backup contracts ($\mathcal{C}_2, \mathcal{C}_4$) across the ramp duration with $+0.06\text{ m/s}$ cruise compensation, the Contract Shield cuts $\text{SmoothLoss}$ by $14.0\%$ (from $0.0606$ to $0.0521$, and $50.0\%$ lower than Bilbao et al.\ \cite{bilbao2025}) and saves $1.74\text{ Wh/t-km}$ of traction energy while intervening on only $7.9\%\text{--}8.8\%$ of macro-steps.
+    \item \textbf{Real-Time Microsecond Inference ($\sim 25\text{ }\mu\text{s}$ Core Step) \& Millimeter-to-Centimeter Docking ($1.0\text{ cm}$):} By replacing generic LAPACK calls and per-step PyTorch tensor dispatch with upper-triangular scalar propagation, a closed-form $3\times 3$ Cramer QP solver, smooth unclamped Taylor linearization, and zero-copy NumPy neural parameter views, our core shaper-plus-MPC step executes in $24.7\text{--}25.5\text{ }\mu\text{s}$ (nearly matching Bilbao et al.'s $20.8\text{ }\mu\text{s}$ PI loop \cite{bilbao2025}), and the complete Contract-Shielded PPO pipeline runs in $40.3\text{--}41.5\text{ }\mu\text{s}$ mean ($66.4\text{--}70.8\text{ }\mu\text{s}$ P99) with $1.0\text{ cm}$ stopping error across all 30 scenarios.
 \end{enumerate}
 
 \begin{thebibliography}{99}
@@ -335,7 +380,10 @@ Station Stop     &  358 & $0.0403\text{ m/s}$ & $\pm 0.0483\text{ m/s}$ & $\pm 0
 \bibitem{adalat2026b} O. Adalat, E. Hamel-De le Court, and F. Belardinelli, ``Contract-enabled Communication for Safe Multi-Agent Reinforcement Learning,'' in \textit{Proc. 26th Int. Conf. on Autonomous Agents and Multiagent Systems (AAMAS)}, 2027.
 \bibitem{agarwal2021} A. Agarwal, S. M. Kakade, J. D. Lee, and G. Mahajan, ``On the Theory of Policy Gradient Methods: Optimality, Approximation, and Distribution Shift,'' \textit{Journal of Machine Learning Research (JMLR)}, vol. 22, no. 98, pp. 1--76, 2021.
 \bibitem{mei2020} J. Mei, C. Xiao, C. Szepesv\'{a}ri, and D. Schuurmans, ``On the Global Convergence Rates of Softmax Policy Gradient Methods,'' in \textit{Proc. 37th Int. Conf. on Machine Learning (ICML)}, PMLR, vol. 119, 2020, pp. 6820--6829.
+\bibitem{zhong2022} W. Zhong, S. Li, H. Xu, and W. Zhang, ``On-line train speed profile generation of high-speed railway with energy-saving: A model predictive control method,'' \textit{IEEE Transactions on Intelligent Transportation Systems}, vol. 23, no. 5, pp. 4063--4074, May 2022.
+\bibitem{xiao2023} Z. Xiao, N. Murgovski, M. Chen, X. Feng, Q. Wang, and P. Sun, ``Eco-driving for metro trains: A computationally efficient approach using convex programming,'' \textit{IEEE Transactions on Vehicular Technology}, vol. 72, no. 8, pp. 10063--10076, Aug. 2023.
 \bibitem{bilbao2025} A. Bilbao-Moreno, I. Elorza, E. Irigoyen, and I. Trojaola, ``ATO system for CBTC-based railways: Planning and disturbance estimation for enhanced automation,'' \textit{Results in Engineering}, vol. 26, p. 105357, 2025.
+\bibitem{sun2024} P. Sun, J. Zhang, K. Yan, B. Yao, and Q. Wang, ``Event-triggered tube model predictive control for high-speed trains trajectory tracking based on robust reachable set,'' in \textit{Proc. SPIE 13064, 3rd Int. Conf. on Electronic Information Engineering, Big Data, and Computer Technology (EIBDCT)}, p. 130640F, 2024.
 \end{thebibliography}
 
 \end{document}

@@ -5,6 +5,7 @@ Dynamic Passenger Weight Changes, and Disjoint Spurious Wind Generator (`railroa
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import numpy as np
 
 
@@ -94,9 +95,13 @@ class RailroadCorridor:
         while greedy braking (`b_shift_down ~ 0.90`) brakes later and steeper.
         """
         v_here = self.get_speed_limit(x_m)
-        b_ratio = float(np.clip(b_shift_down / 0.78, 0.75, 1.25))
-        b_safe = float(np.clip(b_shift_down * 0.76, 0.42, 0.74))
-        j_max_zone = float(0.22 * (b_ratio ** 1.6))
+        b_raw = b_shift_down / 0.78
+        b_ratio = 0.75 if b_raw < 0.75 else (1.25 if b_raw > 1.25 else b_raw)
+        bs_raw = b_shift_down * 0.76
+        b_safe = 0.42 if bs_raw < 0.42 else (0.74 if bs_raw > 0.74 else bs_raw)
+        j_max_zone = 0.22 * (b_ratio ** 1.6)
+        min_drop_dur = 14.0 / b_ratio
+        pi_val = math.pi
 
         for z in self.speed_zones:
             if z.x_start > x_m and z.v_limit_mps < v_here:
@@ -104,16 +109,19 @@ class RailroadCorridor:
                 dv_drop = v_here - z.v_limit_mps
                 v_mean = 0.5 * (v_here + z.v_limit_mps)
                 # Duration required by both comfort deceleration and comfort jerk:
-                t_acc_req = (np.pi * dv_drop) / (2.0 * b_safe)
-                t_jrk_req = np.pi * float(np.sqrt(dv_drop / (2.0 * j_max_zone)))
-                min_drop_dur = float(14.0 / b_ratio)
-                t_drop = max(min_drop_dur, t_acc_req, t_jrk_req)
+                t_acc_req = (pi_val * dv_drop) / (2.0 * b_safe)
+                t_jrk_req = pi_val * math.sqrt(dv_drop / (2.0 * j_max_zone))
+                t_drop = min_drop_dur if min_drop_dur >= t_acc_req else t_acc_req
+                if t_jrk_req > t_drop:
+                    t_drop = t_jrk_req
                 dx_drop = v_mean * t_drop
 
                 if dx_to_zone < dx_drop and dx_drop > 1.0:
-                    u_s = float(np.clip(1.0 - (dx_to_zone / dx_drop), 0.0, 1.0))
-                    v_cos_zone = z.v_limit_mps + dv_drop * 0.5 * (1.0 + float(np.cos(np.pi * u_s)))
-                    v_here = min(v_here, v_cos_zone)
+                    u_raw = 1.0 - (dx_to_zone / dx_drop)
+                    u_s = 0.0 if u_raw < 0.0 else (1.0 if u_raw > 1.0 else u_raw)
+                    v_cos_zone = z.v_limit_mps + dv_drop * 0.5 * (1.0 + math.cos(pi_val * u_s))
+                    if v_cos_zone < v_here:
+                        v_here = v_cos_zone
         return float(v_here)
 
 

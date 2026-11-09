@@ -112,22 +112,39 @@ Bilbao-Moreno et al. structure the CBTC-ATO system into three layers (Figs. 1–
     - **Disturbance Observer Replanning Trigger (Sec. 3.4, Eqs. 33–37, Fig. 14):** Triggers online RMBTP replanning in open track (`rem_dist > 1200 m`) when traction saturates with velocity lag (`|u| >= 0.85` and `vel_dev > 0.95 m/s`) or when external wind/resistance shifts significantly (lines 334–345).
   - [`dynamic_railroad_mpc.py` (`step_bilbao_cbtc_ato`, lines 514–689 & `method_specs`, line 1335)](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/dynamic_railroad_mpc.py#L514-L689): Steps `BilbaoCBTCATOController` on the exact same `true_physics` plant, weather/wind profiles, and energy/smoothness evaluation metrics, and plots it across all panels of [`rl_cosine_mpc.png`](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/rl_cosine_mpc.png).
 
-### Change 6 — Updated LaTeX Project Report (`Report.tex`)
-- **Intention:** Provide a complete, well-flowing LaTeX report following the 3-stage progression of the project report while incorporating the generalized 1–5 station weather/mass benchmark, fair traction/regenerative energy accounting, contract-latching analysis, and the Bilbao-Moreno et al. (2025) benchmark comparison in clear, accessible language.
+### Change 6 — Updated LaTeX Project Report (`Report.tex`) & Architecture Diagram
+- **Intention:** Present a clear, sequential narrative of our own 3-stage control architecture (Stage 1: Actuator-Lifted MPC & Scissor Tube $\to$ Stage 2: Short-Horizon MPC & Gust Observer $\to$ Stage 3: Online Multi-Station PPO Pilot + Hierarchical Differential Shielding + Assume-Guarantee Contracts), illustrated by a dedicated schematic diagram ([`contracts_hierarchical_shielding_arch.png`](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/contracts_hierarchical_shielding_arch.png)), with Bilbao-Moreno et al. (2025) and Sun et al. (2024) (`130640F.pdf`) serving as supporting validation benchmarks.
 - **Where & How Implemented:**
+  - [`generate_architecture_diagram.py`](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/generate_architecture_diagram.py) $\to$ generates [`contracts_hierarchical_shielding_arch.png`](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/contracts_hierarchical_shielding_arch.png).
   - [`Report.tex`](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/Report.tex) (also mirrored at [`/home/giorge/Desktop/ProjectTh/Report.tex`](file:///home/giorge/Desktop/ProjectTh/Report.tex)).
+
+### Change 7 — $3.7\times$ Inference Latency Optimization (`~146 µs` $\to$ `~25 µs` Core Step / `~39.6–41.0 µs` Total)
+- **Problem Diagnosed:**
+  - Per-step inference (`~145 µs` mean) was dominated by Python/C++ dispatch overhead rather than control math: (1) `PureLiuMPC` allocated new NumPy arrays and called LAPACK `np.linalg.solve` on a $3\times 3$ matrix at every step, (2) `CosineTrajectoryShaper` and `RailroadCorridor` called NumPy scalar ufuncs (`np.cos`, `np.sqrt`, `np.clip`) inside loops, and (3) `GoodallTrajectoryShield` and `CosineTrajectoryRLPolicy` invoked single-sample PyTorch C++ forward passes (`self.emulator.net` and `self.actor_mean`/`self.critic`) at every step.
+- **Where & How Implemented:**
+  - [`pure_mpc_controller.py` (lines 63–240)](file:///home/giorge/Desktop/ProjectTh/pure_mpc_controller.py#L63-L240): Replaced $2\times 2$ matrix multiplications with upper-triangular scalar recurrence into pre-allocated buffers (`_F, _Phi, _Psi`) and replaced LAPACK `np.linalg.solve` with an exact closed-form $3\times 3$ symmetric cofactor/Cramer solver + scalar projected-gradient clamping.
+  - [`railroad_corridor.py` (lines 90–126)](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/railroad_corridor.py#L90-L126) & [`cosine_trajectory_shaper.py` (lines 20–285)](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/cosine_trajectory_shaper.py#L20-L285): Replaced NumPy scalar ufuncs with native IEEE-754 `math.cos`, `math.sin`, `math.sqrt`, and scalar clamping into a pre-allocated 5-step horizon buffer.
+  - [`goodall_trajectory_shield.py` (lines 80–175)](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/goodall_trajectory_shield.py#L80-L175) & [`dynamic_railroad_mpc.py` (lines 140–210, 737–785)](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/dynamic_railroad_mpc.py#L737-L785): Cached frozen NumPy weights for the SiLU neural physics emulator (`_emu_w1..3`) and Tanh PPO actor (`_np_actor_cache`), and renamed the console table header from `MPC Only` to `Core Step`.
+
+### Change 8 — Terminal Station Docking Taylor Linearization & Standstill Guard Fix (`|StopErr|` `2.7 cm` $\to$ `1.0 cm`)
+- **Problem Diagnosed:**
+  1. In [`pure_mpc_controller.py`](file:///home/giorge/Desktop/ProjectTh/pure_mpc_controller.py), `linearize_step` previously computed $r_k = f_{\text{nonlinear}}(x_0, u_0) - A x_0 - B u_0$ where $f_{\text{nonlinear}}$ clamped $v_{\text{next}} \ge 0$ *before* `disturbance_accel` ($\hat{d}_k$) was added at line 340. During low-speed station landing under a tailwind ($\hat{d}_k > 0$), $f_{\text{nonlinear}}(x_0, u_0)$ clamped to $0.0$, causing $A x_0 + B u_0$ to cancel out of $v_{k+1}^{\text{pred}}$ and creating an artificial positive offset when $\Delta t \cdot \hat{d}_k$ was added, which triggered premature full braking (`0.15–0.30 m` before the mark).
+  2. Conversely, at standstill/docking (`v_ref[0] == 0`) under a headwind ($\hat{d}_k < 0$), the linear MPC predicted negative velocity and commanded positive throttle (`u_opt > 0`), dragging the train past the station in `Ep 24 Leg 4`.
+- **Where & How Implemented:**
+  - [`pure_mpc_controller.py` (lines 135–145, 368–370)](file:///home/giorge/Desktop/ProjectTh/pure_mpc_controller.py#L135-L145): Computed the Taylor affine offset $r_k$ from the smooth unclamped step before adding `disturbance_accel`, and added a zero-reference throttle guard (`if ref_0 <= 1e-3 and u_opt > 0.0: u_opt = 0.0`).
+  - [`dynamic_railroad_mpc.py` (lines 504–509)](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/dynamic_railroad_mpc.py#L504-L509): Aligned the terminal stop distance threshold (`rem_dist <= 0.035`) with `cosine_trajectory_shaper.py` (`rem_dist_now <= 0.03`).
 
 ---
 
 ## 4. Current 30-Scenario Benchmark Summary (1..5 Stations, Clean + Weather-Disturbed)
 
-| Method | Clean `\|TimeErr\|` | Weather `\|TimeErr\|` | Combined `\|TimeErr\|` | `\|StopErr\|` | `SmoothLoss` | `SpecEnergy` | `LossScore` | `Shield%` | Step Latency (Mean) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **1. Max-Speed Greedy Cosine + MPC** | `3.73 s` | `2.95 s` | `3.34 s` | `0.032 m` | `0.0733` | `50.86 Wh/tk` | `5.2362` | `0.0%` | `101.8 us` |
-| **2. Naive Pace (No Cruise Overshoot) + MPC** | `19.20 s` | `20.29 s` | `19.75 s` | `0.013 m` | `0.0547` | `43.60 Wh/tk` | `21.1335` | `0.0%` | `94.9 us` |
-| **3. Static Plan (No Wind/Mass Replan) + MPC** | `9.50 s` | `10.07 s` | `9.79 s` | `0.015 m` | `0.0596` | `43.60 Wh/tk` | `11.2213` | `0.0%` | `94.9 us` |
-| **4. Multi-Property PPO Pilot (Unshielded)** | **`1.05 s`** | **`2.17 s`** | **`1.61 s`** | `0.028 m` | `0.0606` | `46.66 Wh/tk` | **`3.3172`** | `0.0%` | `105.2 us` |
-| **5. Contract-Shielded PPO (Switch MPS)** | `1.18 s` | `2.45 s` | `1.82 s` | `0.028 m` | `0.0538` | `45.27 Wh/tk` | `3.4770` | `7.9%` | `145.4 us` |
-| **6. Contract-Shielded PPO (1-Step DCBF)** | `1.38 s` | `2.58 s` | `1.98 s` | **`0.027 m`** | **`0.0523`** | **`44.92 Wh/tk`** | `3.6083` | `7.9%` | `144.5 us` |
-| **7. Contract-Shielded PPO (UCB-DMPS Rollout)** | `1.48 s` | `2.66 s` | `2.07 s` | **`0.027 m`** | `0.0533` | `45.07 Wh/tk` | `3.7081` | `8.8%` | `146.4 us` |
-| **8. Bilbao (2025) CBTC-ATO (RMBTP + PI)** | `4.96 s` | `3.34 s` | `4.15 s` | `0.029 m` | `0.1041` | `45.52 Wh/tk` | `5.9302` | `0.0%` | **`21.2 us`** |
+| Method | Clean `\|TimeErr\|` | Weather `\|TimeErr\|` | Combined `\|TimeErr\|` | `\|StopErr\|` | `SmoothLoss` | `SpecEnergy` | `LossScore` | `Shield%` | Core Step | Total (Mean / P99) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1. Max-Speed Greedy Cosine + MPC** | `3.73 s` | `3.13 s` | `3.43 s` | **`0.006 m`** | `0.0733` | `50.86 Wh/tk` | `4.9308` | `0.0%` | `24.8 us` | `28.0 / 42.8 us` |
+| **2. Naive Pace (No Cruise Overshoot) + MPC** | `19.20 s` | `20.43 s` | `19.82 s` | `0.007 m` | `0.0546` | `43.61 Wh/tk` | `21.1171` | `0.0%` | `24.4 us` | `27.4 / 39.8 us` |
+| **3. Static Plan (No Wind/Mass Replan) + MPC** | `9.50 s` | `10.35 s` | `9.92 s` | `0.008 m` | `0.0594` | `43.61 Wh/tk` | `11.2571` | `0.0%` | `24.7 us` | `28.2 / 43.4 us` |
+| **4. Multi-Property PPO Pilot (Unshielded)** | **`1.10 s`** | **`2.03 s`** | **`1.57 s`** | `0.011 m` | `0.0606` | `46.69 Wh/tk` | **`3.0165`** | `0.0%` | `24.7 us` | `29.0 / 45.5 us` |
+| **5. Contract-Shielded PPO (Switch MPS)** | `1.27 s` | `2.20 s` | `1.74 s` | `0.011 m` | `0.0536` | `45.29 Wh/tk` | `3.1337` | `7.9%` | `25.5 us` | `40.4 / 66.4 us` |
+| **6. Contract-Shielded PPO (1-Step DCBF)** | `1.45 s` | `2.36 s` | `1.91 s` | `0.010 m` | **`0.0521`** | **`44.95 Wh/tk`** | `3.2886` | `7.9%` | `25.4 us` | `40.3 / 68.5 us` |
+| **7. Contract-Shielded PPO (UCB-DMPS Rollout)** | `1.52 s` | `2.47 s` | `2.00 s` | `0.010 m` | `0.0530` | `45.09 Wh/tk` | `3.3796` | `8.8%` | `25.5 us` | `41.5 / 70.8 us` |
+| **8. Bilbao (2025) CBTC-ATO (RMBTP + PI)** | `4.96 s` | `3.34 s` | `4.15 s` | `0.029 m` | `0.1041` | `45.52 Wh/tk` | `5.9302` | `0.0%` | **`20.8 us`** | **`20.8 / 26.7 us`** |
