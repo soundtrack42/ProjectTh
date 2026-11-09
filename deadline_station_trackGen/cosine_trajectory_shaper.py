@@ -253,14 +253,19 @@ class CosineTrajectoryShaper:
         sim_x = float(x_curr)
         sim_v = float(v_curr)
         land_thresh = 1.15 * max(80.0, dx_brake_now)
+        station_x_m = self.corridor.station_x_m
 
         for i in range(n_p):
             u_i = min(1.0, self.ramp_u_phase + i * du_ramp)
             cos_prog = 0.5 * (1.0 - math.cos(pi_val * u_i))
             v_cos = self.ramp_v_start + (self.ramp_v_goal - self.ramp_v_start) * cos_prog
 
-            local_ceil = self.corridor.compute_smooth_spatial_ceiling(sim_x, b_land_cos)
-            rem_i = max(0.0, self.corridor.station_x_m - sim_x)
+            local_ceil = (
+                v_smooth_ceil
+                if i == 0
+                else self.corridor.compute_smooth_spatial_ceiling(sim_x, b_land_cos)
+            )
+            rem_i = max(0.0, station_x_m - sim_x)
             if rem_i <= land_thresh:
                 v_land_env = math.sqrt(max(0.0, (4.0 * b_eff_now * rem_i) / pi_val))
             else:

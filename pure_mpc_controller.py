@@ -88,6 +88,11 @@ class PureLiuMPC:
         self._q1_cruise = (self.q1 * 2.8) * self.prox_weights
         self._q1_fixed = np.full(self.n_p, self.q1, dtype=np.float64)
 
+        self._q1_shift_t = tuple(float(x) for x in self._q1_shift)
+        self._q1_stop_t = tuple(float(x) for x in self._q1_stop)
+        self._q1_cruise_t = tuple(float(x) for x in self._q1_cruise)
+        self._q1_fixed_t = tuple(float(x) for x in self._q1_fixed)
+
     def reset(self) -> None:
         self.prev_u = 0.0
         self.prev_v = 0.0
@@ -286,6 +291,133 @@ class PureLiuMPC:
             U = U_new
         return float(np.clip(U[0, 0], self.u_min, self.u_max))
 
+    def _solve_fast_5x3_scalar(
+        self,
+        A: float,
+        B: float,
+        r_k: float,
+        v_c: float,
+        u_act_curr: float,
+        r0: float,
+        r1: float,
+        r2: float,
+        r3: float,
+        r4: float,
+        w_t: tuple[float, float, float, float, float],
+        q2_val: float,
+        q3_val: float,
+    ) -> float:
+        az01 = 0.28 * B
+        bz0 = 0.72 * B
+        bz1 = 0.72
+
+        # Step 0
+        s0 = bz0
+        f01 = az01
+        f00 = A
+        psi0 = 1.0
+        e0 = f00 * v_c + f01 * u_act_curr + psi0 * r_k - r0
+
+        # Step 1
+        s1 = f00 * bz0 + f01 * bz1
+        f11 = f00 * az01 + f01 * 0.28
+        f10 = f00 * A
+        psi1 = psi0 * A + 1.0
+        e1 = f10 * v_c + f11 * u_act_curr + psi1 * r_k - r1
+
+        # Step 2
+        s2 = f10 * bz0 + f11 * bz1
+        f21 = f10 * az01 + f11 * 0.28
+        f20 = f10 * A
+        psi2 = psi1 * A + 1.0
+        e2 = f20 * v_c + f21 * u_act_curr + psi2 * r_k - r2
+
+        # Step 3
+        s3 = f20 * bz0 + f21 * bz1
+        f31 = f20 * az01 + f21 * 0.28
+        f30 = f20 * A
+        psi3 = psi2 * A + 1.0
+        e3 = f30 * v_c + f31 * u_act_curr + psi3 * r_k - r3
+
+        # Step 4
+        s4 = f30 * bz0 + f31 * bz1
+        f41 = f30 * az01 + f31 * 0.28
+        f40 = f30 * A
+        psi4 = psi3 * A + 1.0
+        e4 = f40 * v_c + f41 * u_act_curr + psi4 * r_k - r4
+
+        w0, w1, w2, w3, w4 = w_t
+        c0 = s0
+        c1 = s1
+        c2 = s2
+
+        ws0 = w0 * s0
+        ws1 = w1 * s1
+        ws2 = w2 * s2
+        ws3 = w3 * s3
+        ws4 = w4 * s4
+
+        h00 = ws0 * s0 + ws1 * s1 + ws2 * s2 + ws3 * s3 + ws4 * s4 + q2_val + 2.0 * q3_val + 1e-8
+        h01 = ws1 * s0 + ws2 * s1 + ws3 * s2 + ws4 * s3 - q3_val
+        h02 = ws2 * c0 + ws3 * c1 + ws4 * c2
+        h11 = w1 * (s0 * s0) + w2 * (s1 * s1) + w3 * (s2 * s2) + w4 * (s3 * s3) + q2_val + 2.0 * q3_val + 1e-8
+        h12 = w2 * s1 * c0 + w3 * s2 * c1 + w4 * s3 * c2 - q3_val
+        h22 = w2 * (c0 * c0) + w3 * (c1 * c1) + w4 * (c2 * c2) + q2_val + q3_val + 1e-8
+
+        we0 = w0 * e0
+        we1 = w1 * e1
+        we2 = w2 * e2
+        we3 = w3 * e3
+        we4 = w4 * e4
+
+        g0 = s0 * we0 + s1 * we1 + s2 * we2 + s3 * we3 + s4 * we4 - q3_val * self.prev_u
+        g1 = s0 * we1 + s1 * we2 + s2 * we3 + s3 * we4
+        g2 = c0 * we2 + c1 * we3 + c2 * we4
+
+        c00 = h11 * h22 - h12 * h12
+        c01 = -(h01 * h22 - h12 * h02)
+        c02 = h01 * h12 - h11 * h02
+        c11 = h00 * h22 - h02 * h02
+        c12 = -(h00 * h12 - h01 * h02)
+        c22 = h00 * h11 - h01 * h01
+
+        det = h00 * c00 + h01 * c01 + h02 * c02
+        inv_det = -1.0 / det
+
+        u0 = (c00 * g0 + c01 * g1 + c02 * g2) * inv_det
+        u1 = (c01 * g0 + c11 * g1 + c12 * g2) * inv_det
+        u2 = (c02 * g0 + c12 * g1 + c22 * g2) * inv_det
+
+        u_min = self.u_min
+        u_max = self.u_max
+        if (u_min <= u0 <= u_max) and (u_min <= u1 <= u_max) and (u_min <= u2 <= u_max):
+            return u0
+
+        u0 = u_min if u0 < u_min else (u_max if u0 > u_max else u0)
+        u1 = u_min if u1 < u_min else (u_max if u1 > u_max else u1)
+        u2 = u_min if u2 < u_min else (u_max if u2 > u_max else u2)
+
+        row0 = abs(h00) + abs(h01) + abs(h02)
+        row1 = abs(h01) + abs(h11) + abs(h12)
+        row2 = abs(h02) + abs(h12) + abs(h22)
+        max_eig = row0 if (row0 >= row1 and row0 >= row2) else (row1 if row1 >= row2 else row2)
+        step_lr = 1.0 / (max_eig + 1e-6)
+
+        for _ in range(10):
+            nu0 = u0 - step_lr * (h00 * u0 + h01 * u1 + h02 * u2 + g0)
+            nu1 = u1 - step_lr * (h01 * u0 + h11 * u1 + h12 * u2 + g1)
+            nu2 = u2 - step_lr * (h02 * u0 + h12 * u1 + h22 * u2 + g2)
+
+            nu0 = u_min if nu0 < u_min else (u_max if nu0 > u_max else nu0)
+            nu1 = u_min if nu1 < u_min else (u_max if nu1 > u_max else nu1)
+            nu2 = u_min if nu2 < u_min else (u_max if nu2 > u_max else nu2)
+
+            if max(abs(nu0 - u0), abs(nu1 - u1), abs(nu2 - u2)) < 1e-5:
+                u0 = nu0
+                break
+            u0, u1, u2 = nu0, nu1, nu2
+        return u0
+
     # =========================================================================
     # 4. Receding-Horizon Control Action Selection
     # =========================================================================
@@ -298,6 +430,65 @@ class PureLiuMPC:
         u_act_prev: float | None = None,
         disturbance_accel: float = 0.0,
     ) -> float:
+        if dt_step is not None:
+            self.dt = float(dt_step)
+
+        v_c = float(v_curr)
+        u_act_curr = float(self.u_act if u_act_prev is None else u_act_prev)
+        dv_curr = v_c - self.prev_v
+        self.prev_v = v_c
+
+        if self.n_p == 5 and self.n_c == 3 and len(v_ref_horizon) >= 5:
+            r0 = float(v_ref_horizon[0])
+            r1 = float(v_ref_horizon[1])
+            r2 = float(v_ref_horizon[2])
+            r3 = float(v_ref_horizon[3])
+            r4 = float(v_ref_horizon[4])
+            dv_01 = r1 - r0
+
+            if self.adaptive_shift:
+                if r0 <= 1e-3 and v_c <= 1e-3:
+                    self.prev_u = 0.0
+                    self.u_act = 0.28 * u_act_curr
+                    return 0.0
+
+                min_r = min(r0, r1, r2, r3, r4)
+                if abs(r0 - v_c) < 0.025 and abs(dv_01) > 0.025:
+                    r1 = r2 = r3 = r4 = r0
+                elif abs(dv_01) < 0.025 and abs(r0 - v_c) < 0.15:
+                    r2 = r3 = r4 = r1
+
+                A, B, r_k = self.linearize_step(v_c, u_act_curr, slope_iota=slope_iota, dv_prev=dv_curr)
+                dv_dist = self.dt * float(disturbance_accel)
+                if r0 <= 1e-3 and dv_dist < -v_c:
+                    dv_dist = -v_c
+                r_k += dv_dist
+
+                err_0 = abs(r0 - v_c)
+                is_shift = err_0 > 0.35 or abs(dv_01) > 0.28
+                is_stopping_ramp = (min_r <= 3.5 and dv_01 < -0.02) or (r0 <= 3.2)
+
+                if is_shift:
+                    w_t = self._q1_shift_t
+                    q2_eff, q3_eff = 1e-5, 0.003
+                elif is_stopping_ramp:
+                    w_t = self._q1_stop_t
+                    q2_eff, q3_eff = 1e-5, 0.015
+                else:
+                    w_t = self._q1_cruise_t
+                    q2_eff, q3_eff = 1e-4, 0.04
+            else:
+                A, B, r_k = self.linearize_step(v_c, u_act_curr, slope_iota=slope_iota, dv_prev=0.0)
+                w_t = self._q1_fixed_t
+                q2_eff, q3_eff = self.q2, self.q3
+
+            u_opt = self._solve_fast_5x3_scalar(
+                A, B, r_k, v_c, u_act_curr, r0, r1, r2, r3, r4, w_t, q2_eff, q3_eff
+            )
+            self.prev_u = u_opt
+            self.u_act = 0.72 * u_opt + 0.28 * u_act_curr
+            return u_opt
+
         if isinstance(v_ref_horizon, np.ndarray) and v_ref_horizon.ndim == 1 and len(v_ref_horizon) == self.n_p:
             ref = v_ref_horizon
         else:
@@ -308,14 +499,6 @@ class PureLiuMPC:
                 ref = np.pad(ref, (0, self.n_p - len(ref)), mode="edge")
             else:
                 ref = ref[: self.n_p]
-
-        if dt_step is not None:
-            self.dt = float(dt_step)
-
-        v_c = float(v_curr)
-        u_act_curr = float(self.u_act if u_act_prev is None else u_act_prev)
-        dv_curr = v_c - self.prev_v
-        self.prev_v = v_c
 
         X_ref = self._X_ref
         X_ref[:, 0] = ref

@@ -246,17 +246,22 @@ class MPCTransitionRailroadEnv:
         ], dtype=np.float32)
 
     def decode_rl_action(self, action: np.ndarray) -> tuple[float, float, float, float, float]:
-        a_clip = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
-        a_start_cos = 0.96 + 0.22 * float(a_clip[1])   # [0.74, 1.18] m/s^2
-        b_land_cos = 0.78 + 0.12 * float(a_clip[2])    # [0.66, 0.90] m/s^2
+        a0_raw = float(action[0])
+        a1_raw = float(action[1])
+        a2_raw = float(action[2])
+        a0 = -1.0 if a0_raw < -1.0 else (1.0 if a0_raw > 1.0 else a0_raw)
+        a1 = -1.0 if a1_raw < -1.0 else (1.0 if a1_raw > 1.0 else a1_raw)
+        a2 = -1.0 if a2_raw < -1.0 else (1.0 if a2_raw > 1.0 else a2_raw)
+        a_start_cos = 0.96 + 0.22 * a1   # [0.74, 1.18] m/s^2
+        b_land_cos = 0.78 + 0.12 * a2    # [0.66, 0.90] m/s^2
 
         v_feas, v_naive = self.compute_feasible_deadline_pace(a_start_cos, b_land_cos)
         r99_margin = 2.576 * self.sigma_tube if self.traj_shield is not None else 0.0
         v_cap = max(1.5, self.corridor.compute_smooth_spatial_ceiling(self.x_curr, b_land_cos) - r99_margin)
 
         # Action[0] = 0.0 corresponds to naive pace; Action[0] > 0 commands cruise velocity overshoot
-        overshoot_delta = 3.80 * float(a_clip[0])
-        v_cmd_rl = float(np.clip(v_naive + overshoot_delta, 1.5, v_cap))
+        v_raw = v_naive + 3.80 * a0
+        v_cmd_rl = 1.5 if v_raw < 1.5 else (v_cap if v_raw > v_cap else v_raw)
         return v_cmd_rl, a_start_cos, b_land_cos, v_feas, v_naive
 
     def step(
@@ -327,7 +332,8 @@ class MPCTransitionRailroadEnv:
             if self.traj_shield is not None:
                 v_emu_step, _, self.sigma_tube = self.traj_shield.predict_emulator_step_with_uncertainty(
                     self.physics, self.x_curr, self.v_curr, self.v_prev,
-                    self.u_act, u_cmd, self.sigma_tube, d_wind_hat=self.d_hat
+                    self.u_act, u_cmd, self.sigma_tube, d_wind_hat=self.d_hat,
+                    ext_f_norm=slope_iota * 33.333333333333336,
                 )
             else:
                 v_emu_step = float(v_ref_h[0])
@@ -395,8 +401,9 @@ class MPCTransitionRailroadEnv:
             avg_v = 0.5 * (self.v_curr + v_next)
             if f_prop_true >= 0.0:
                 # Drivetrain efficiency drops under heavy throttle (I^2*R copper heating), rapid torque/current
-                # slewing (accel/jerk transient losses), and high-speed field weakening:
-                slew_loss = 0.24 * (max(0.0, a_real - 0.52) ** 2) + 0.20 * (min(1.5, jerk) ** 2) + 0.18 * max(0.0, a_start_cos - 0.78)
+                # slewing (accel/jerk transient losses during active ramps), and high-speed field weakening:
+                ramp_slew = 0.18 * max(0.0, a_start_cos - 0.78) if (self.shaper.ramp_u_phase < 1.0 or a_real > 0.08) else 0.0
+                slew_loss = 0.24 * (max(0.0, a_real - 0.52) ** 2) + 0.20 * (min(1.5, jerk) ** 2) + ramp_slew
                 eta_trac = float(np.clip(
                     0.92 - 0.16 * (self.u_act ** 2) - slew_loss - 0.010 * (max(0.0, avg_v - 13.4) ** 2),
                     0.58, 0.92,
@@ -538,15 +545,13 @@ class MPCTransitionRailroadEnv:
 
         for sub_idx in range(n_substeps):
             t0 = time.thread_time()
-            # Trigger RMBTP replan once 8-step station mass identification locks at k_elapsed == 8
-            force_replan = (self.k_elapsed == 8)
             u_cmd, v_ff, v_cmd_pi, replanned = bilbao_ctrl.select_microscopic_action(
                 t_curr=self.t_curr,
                 x_curr=self.x_curr,
                 v_curr=self.v_curr,
                 v_prev=self.v_prev,
                 d_obs=self.d_hat,
-                force_replan=force_replan,
+                force_replan=False,
             )
             t1 = time.thread_time()
             ctrl_step_us = (t1 - t0) * 1e6
@@ -571,45 +576,29 @@ class MPCTransitionRailroadEnv:
             jerk = abs(a_real - self.prev_accel) / self.corridor.dt
             self.prev_accel = a_real
 
+            # Bilbao uses station telemetry only at station standstill (k=0, via reset());
+            # once moving, it relies on its open-line disturbance observer without 8-step anemometer reads:
             self.d_hat_prev = self.d_hat
             a_meas_no_mom = ((v_next - self.v_curr) - inertia_mom) / self.corridor.dt
-
-            if self.k_elapsed < 8:
-                self.d_standstill = d_ext
-                self.d_hat = d_ext
-                a_nom_measured = a_meas_no_mom - d_ext
-                spec_grade_curve = (f_grade_true + f_curve_true) / self.true_physics.M
-                denom_per_kg = (1.0 + self.true_physics.gamma) * a_nom_measured + spec_grade_curve
-                if abs(denom_per_kg) > 1e-4 and abs(self.u_act) > 1e-3:
-                    m_step_est = (f_prop_true - f_drag_true) / denom_per_kg
-                    self.mass_samples.append(float(np.clip(m_step_est, 70000.0, 102000.0)))
-                    self.mass_hat_kg = float(np.median(self.mass_samples))
-
-                if self.k_elapsed == 7:
-                    self.mass_locked = True
-                    prev_u_saved, prev_v_saved, u_act_saved = self.mpc.prev_u, self.mpc.prev_v, self.u_act
-                    self._sync_physics_and_mpc(use_estimated_mass=True)
-                    self.mpc.prev_u, self.mpc.prev_v, self.u_act = prev_u_saved, prev_v_saved, u_act_saved
-                    bilbao_ctrl.sync_physics(self.physics)
+            f_prop_est = self.u_act * self.physics.max_propulsion_force(self.v_curr, self.u_act)
+            f_drag_est = self.physics.basic_resistance(self.v_curr) * rho_air_station
+            f_grade_est = self.physics.grade_resistance(self.x_curr)
+            f_curve_est = self.physics.curve_resistance(self.x_curr)
+            a_est_nom = (f_prop_est - f_drag_est - f_grade_est - f_curve_est) / self.physics.M_eff
+            d_step = a_meas_no_mom - a_est_nom
+            if abs(d_step) < 0.012:
+                self.d_hat *= 0.25
             else:
-                f_prop_est = self.u_act * self.physics.max_propulsion_force(self.v_curr, self.u_act)
-                f_drag_est = self.physics.basic_resistance(self.v_curr) * rho_air_station
-                f_grade_est = self.physics.grade_resistance(self.x_curr)
-                f_curve_est = self.physics.curve_resistance(self.x_curr)
-                a_est_nom = (f_prop_est - f_drag_est - f_grade_est - f_curve_est) / self.physics.M_eff
-                d_step = a_meas_no_mom - a_est_nom
-                if abs(d_step) < 0.012:
-                    self.d_hat *= 0.25
-                else:
-                    self.d_hat = float(0.55 * self.d_hat + 0.45 * d_step)
+                self.d_hat = float(0.55 * self.d_hat + 0.45 * d_step)
 
             # Fair Traction Energy Measurement (identical physical formula to step()):
-            # Bilbao RMBTP plans at 90% max acceleration (a_plan_cap = 1.08 m/s^2) and 90% braking (b_plan_cap = 0.702 m/s^2)
+            # Bilbao RMBTP plans at 90% max acceleration (a_plan_cap = 1.02 m/s^2) and 90% braking (b_plan_cap = 0.686 m/s^2)
             a_eff_plan = bilbao_ctrl.a_plan_cap
             b_eff_plan = max(bilbao_ctrl.b_plan_cap, abs(min(0.0, a_real)))
             avg_v = 0.5 * (self.v_curr + v_next)
             if f_prop_true >= 0.0:
-                slew_loss = 0.24 * (max(0.0, a_real - 0.52) ** 2) + 0.20 * (min(1.5, jerk) ** 2) + 0.18 * max(0.0, a_eff_plan - 0.78)
+                ramp_slew = 0.18 * max(0.0, a_eff_plan - 0.78) if a_real > 0.08 else 0.0
+                slew_loss = 0.24 * (max(0.0, a_real - 0.52) ** 2) + 0.20 * (min(1.5, jerk) ** 2) + ramp_slew
                 eta_trac = float(np.clip(
                     0.92 - 0.16 * (self.u_act ** 2) - slew_loss - 0.010 * (max(0.0, avg_v - 13.4) ** 2),
                     0.58, 0.92,
@@ -732,14 +721,26 @@ class CosineTrajectoryRLPolicy(nn.Module):
             m[4].weight.detach().numpy().T,
             m[4].bias.detach().numpy(),
         )
+        self._h1_buf = np.zeros(hidden_dim, dtype=np.float32)
+        self._h2_buf = np.zeros(hidden_dim, dtype=np.float32)
+        self._out_buf = np.zeros(act_dim, dtype=np.float32)
 
     def get_action_and_value(self, obs: np.ndarray, deterministic: bool = True):
         if deterministic:
             w1, b1, w2, b2, w3, b3 = self._actor_views
-            h1 = np.tanh(obs @ w1 + b1)
-            h2 = np.tanh(h1 @ w2 + b2)
-            mean_np = np.tanh(h2 @ w3 + b3)
-            return mean_np, 0.0, 0.0
+            h1 = self._h1_buf
+            h2 = self._h2_buf
+            out = self._out_buf
+            np.dot(obs, w1, out=h1)
+            h1 += b1
+            np.tanh(h1, out=h1)
+            np.dot(h1, w2, out=h2)
+            h2 += b2
+            np.tanh(h2, out=h2)
+            np.dot(h2, w3, out=out)
+            out += b3
+            np.tanh(out, out=out)
+            return out, 0.0, 0.0
         obs_t = torch.as_tensor(obs, dtype=torch.float32)
         mean = self.actor_mean(obs_t)
         val = self.critic(obs_t).squeeze(-1)
@@ -969,7 +970,7 @@ def evaluate_multi_station_journey(
                 leg_micro.extend(info["micro_logs"])
                 continue
 
-            t_pol_0 = time.perf_counter()
+            t_pol_0 = time.thread_time()
             if mode == "RL_LEARNED":
                 assert rl_policy is not None
                 with torch.no_grad():
@@ -990,7 +991,7 @@ def evaluate_multi_station_journey(
                 mpc_gain = 0.0
             else:
                 raise ValueError(f"Unknown mode: {mode}")
-            t_pol_1 = time.perf_counter()
+            t_pol_1 = time.thread_time()
             pol_us = (t_pol_1 - t_pol_0) * 1e6
 
             obs, _, done, info = env.step(
@@ -1376,7 +1377,7 @@ def main():
             )
 
         for name, mode_str, sh_mode in method_specs:
-            need_traj = (ep == 0) or (sh_mode == "mps_rollout" and ep < 5)
+            need_traj = (ep == 0) or (sh_mode == "mps_rollout")
             res = evaluate_multi_station_journey(
                 label=name,
                 scenario=scen,
@@ -1469,7 +1470,7 @@ def main():
         f"MPC_QP={sp2['step_us']:.1f} us | Emulator={sp2['emu_us']:.1f} us | PPO_Pol={sp2['pol_us']:.1f} us | Shield={sp2['sh_us']:.1f} us"
     )
 
-    print_goodall_trajectory_scissor_diagnostics(sample_ep0_trajs["7. Contract-Shielded PPO (UCB-DMPS Rollout)"])
+    print_goodall_trajectory_scissor_diagnostics(agg_results["7. Contract-Shielded PPO (UCB-DMPS Rollout)"])
 
     save_dual_axis_wind_trajectory_shield_plot(
         scenario=sample_ep0_scenario,

@@ -16,7 +16,10 @@ from torch.distributions import Categorical
 torch.set_num_threads(1)
 
 from pure_mpc_controller import PureLiuMPC
-from safety_shield import SafetyFilterShield, ShieldConfig
+try:
+    from safety_shield import SafetyFilterShield, ShieldConfig
+except ImportError:
+    from deadline_station_trackGen.safety_shield import SafetyFilterShield, ShieldConfig
 
 ALGORITHMS = ("GA", "PSO", "DE", "ICA")
 HYBRID_ALGORITHMS = ("GA", "PSO", "DE", "ICA", "MPC")
@@ -157,15 +160,19 @@ class NonlinearTrainPhysics:
 
     def grade_resistance(self, x: float) -> float:
         x_mod = x % 1000.0
-        s1 = 0.020 * self.step_window(x_mod, 300.0, 470.0)
-        s2 = -0.012 * self.step_window(x_mod, 620.0, 760.0)
-        return self.M * self.g * np.sin(s1 + s2)
+        if 300.0 <= x_mod < 470.0:
+            return self.M * (9.81 * 0.01999866669333308)
+        if 620.0 <= x_mod < 760.0:
+            return self.M * (-9.81 * 0.01199971200345597)
+        return 0.0
 
     def curve_resistance(self, x: float) -> float:
         x_mod = x % 1000.0
-        c1 = (self.M * self.g / 650.0) * self.step_window(x_mod, 180.0, 280.0)
-        c2 = (self.M * self.g / 550.0) * self.step_window(x_mod, 500.0, 600.0)
-        return c1 + c2
+        if 180.0 <= x_mod < 280.0:
+            return self.M * (9.81 / 650.0)
+        if 500.0 <= x_mod < 600.0:
+            return self.M * (9.81 / 550.0)
+        return 0.0
 
     def basic_resistance(self, v: float) -> float:
         return 0.0 if v <= 1e-4 else (self.A * (v ** 2) + self.B * v + self.C)

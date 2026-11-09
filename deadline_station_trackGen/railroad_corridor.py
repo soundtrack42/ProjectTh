@@ -95,6 +95,15 @@ class RailroadCorridor:
         while greedy braking (`b_shift_down ~ 0.90`) brakes later and steeper.
         """
         v_here = self.get_speed_limit(x_m)
+        zones = self.speed_zones
+        has_near_drop = False
+        for z in zones:
+            if z.x_start > x_m and z.v_limit_mps < v_here and (z.x_start - x_m) < 380.0:
+                has_near_drop = True
+                break
+        if not has_near_drop:
+            return float(v_here)
+
         b_raw = b_shift_down / 0.78
         b_ratio = 0.75 if b_raw < 0.75 else (1.25 if b_raw > 1.25 else b_raw)
         bs_raw = b_shift_down * 0.76
@@ -103,9 +112,11 @@ class RailroadCorridor:
         min_drop_dur = 14.0 / b_ratio
         pi_val = math.pi
 
-        for z in self.speed_zones:
+        for z in zones:
             if z.x_start > x_m and z.v_limit_mps < v_here:
                 dx_to_zone = z.x_start - x_m
+                if dx_to_zone >= 380.0:
+                    continue
                 dv_drop = v_here - z.v_limit_mps
                 v_mean = 0.5 * (v_here + z.v_limit_mps)
                 # Duration required by both comfort deceleration and comfort jerk:
