@@ -90,11 +90,8 @@ class CosineTrajectoryShaper:
         d_wind_hat: float = 0.0,
     ) -> tuple[float, float, float, float]:
         """
-        Computes the dynamic half-cosine braking spot `x_brake` based on:
-          - Current velocity `v_curr` (+ 99% Scissor radius `v_scissor_rad`),
-          - Vehicle mass braking capability & active wind `d_wind_hat`,
-          - Remaining time to deadline `t_rem_deadline` (adapts `b_eff` inside the
-            comfortable range [0.64, 0.92] m/s^2 so landing duration matches `t_rem`!).
+        Computes the dynamic half-cosine braking spot `x_brake` from current velocity,
+        vehicle braking capacity, active wind `d_wind_hat`, and remaining time `t_rem_deadline`.
         """
         v_scis = v_scissor_rad if v_scissor_rad > 0.0 else 0.0
         v_eff = v_curr + v_scis
@@ -112,8 +109,7 @@ class CosineTrajectoryShaper:
         b_raw = b_land_cmd - 0.12 * w_pos
         b_target = b_comf_lo if b_raw < b_comf_lo else (b_comf_hi if b_raw > b_comf_hi else float(b_raw))
 
-        # Deadline-synchronized landing rate: if near the braking zone, modulate b_target
-        # within [b_comf_lo, b_comf_hi] so T_land = pi * v / (2 * b) aligns with remaining time!
+        # Deadline-synchronized landing rate within [b_comf_lo, b_comf_hi]
         if t_rem_deadline is not None and 10.0 < t_rem_deadline < 45.0:
             b_for_exact_time = (math.pi * v_eff) / (2.0 * t_rem_deadline)
             b_blend = 0.75 * b_for_exact_time + 0.25 * b_target
@@ -134,15 +130,11 @@ class CosineTrajectoryShaper:
         d_wind_hat: float,
     ) -> None:
         """
-        Advances a true C^2-smooth half-cosine S-curve for EVERY speed change:
+        Advances a C^2 half-cosine S-curve for speed transitions:
             v(u) = v_start + (v_goal - v_start) * 0.5 * (1 - cos(pi * u)),  u in [0, 1]
-        Enforces both Order-2 acceleration limits and Order-3 jerk limits:
-            T_ramp = max( pi * |dv| / (2 * a_rate),  pi * sqrt(|dv| / (2 * j_comf)),  min_dur )
-        and advances `u` strictly by `dt / T_ramp` so the sinusoid is never short-circuited!
+        subject to Order-2 acceleration and Order-3 jerk bounds.
         """
         is_departing_from_rest = (v_curr < 1.35 and self.ramp_v_start < 1.0)
-        # During mid-cruise shifts, use a wider threshold (0.32 m/s) so minor macro-step
-        # pace updates smoothly adjust the endpoint without resetting `u = 0` mid-wave!
         retrigger_tol = 0.15 if self.ramp_u_phase >= 0.98 else 0.45
 
         if abs(v_goal_now - self.ramp_v_goal) > retrigger_tol:
@@ -229,13 +221,7 @@ class CosineTrajectoryShaper:
         v_ref = self._v_ref_buf if n_p == 5 else np.zeros(n_p, dtype=np.float64)
 
         if self.in_landing:
-            # True Phase-Tracked & Wind-Updated Half-Cosine Landing S-Curve:
-            # 1. Invert current remaining distance ratio `rem_dist_now / dx_land_ref` for spatial phase `u_now`
             u_now = self.invert_cosine_distance_phase(rem_dist_now / self.dx_land_ref)
-
-            # 2. Dynamically update `v_entry_dyn` and `t_land_dyn` from current speed `v_curr`
-            #    so if wind pushes or drags the train during landing, the cosine curve adapts smoothly
-            #    without ever jumping or dumping speed in the final step!
             tilde_v = max(0.04, 0.5 * (1.0 + math.cos(pi_val * u_now)))
             if u_now < 0.88 and v_curr > 0.6:
                 v_entry_implied = v_curr / tilde_v

@@ -149,7 +149,7 @@ def generate_disjoint_wind_events(
         peak = sign * float(rng.uniform(0.62, 0.82))
         w_raw += peak * np.exp(-0.5 * ((t_grid - center_s) / width_s) ** 2)
 
-    # Smooth C^1 deadband thresholding (no artificial departure taper at t=0!)
+    # Smooth C^1 deadband thresholding
     wind_profile = np.where(
         np.abs(w_raw) > calm_deadband_mps2,
         np.sign(w_raw) * (np.abs(w_raw) - calm_deadband_mps2) * 1.25,
@@ -253,7 +253,7 @@ def generate_multi_station_scenario(
     """
     rng = np.random.default_rng(seed)
     if n_legs is None or n_legs <= 0:
-        n_legs = int(rng.integers(1, 6))  # Randomly sample 1 to 5 stations per scenario!
+        n_legs = int(rng.integers(1, 6))
 
     tare_mass_kg = 72000.0
     max_train_capacity = 360
@@ -291,10 +291,9 @@ def generate_multi_station_scenario(
         untracked_pass_holders = int(rng.poisson(14.0))               # Untracked pass/evader riders
         curr_tickets = int(np.clip(curr_passengers + missed_train_pax - untracked_pass_holders, 30, max_train_capacity))
 
-        # Mean weight per passenger varies (e.g., heavier luggage on Leg 3 Airport Express, or overweight crowd)
         avg_pax_weight_kg = float(rng.normal(82.0 if leg_idx == 2 else 75.5, 4.5))
         leg_mass_kg = float(tare_mass_kg + curr_passengers * avg_pax_weight_kg)
-        ticket_est_mass_kg = float(tare_mass_kg + curr_tickets * 75.0)  # Controller only knows sold tickets * 75kg!
+        ticket_est_mass_kg = float(tare_mass_kg + curr_tickets * 75.0)
 
         mass_time_adder = max(0.0, (leg_mass_kg - 85000.0) / 2200.0) + (4.0 if mu_adhesion < 0.85 else 0.0)
         eff_min_feas_s = min_feas_s + mass_time_adder
@@ -309,7 +308,6 @@ def generate_multi_station_scenario(
         leg_deadline_s = t_clock + leg_budget_s
         dwell_s = 25.0 if leg_idx < n_legs - 1 else 0.0
 
-        # Use scenario RNG (at leg_idx == 0) to decide Clean vs Weather-Disturbed (no seed-modulo pattern!)
         if leg_idx == 0:
             is_scenario_weather = (wind_mode != "none") and (
                 True if wind_mode in ("disjoint", "continuous") else ( (seed // 29) % 2 == 0 )

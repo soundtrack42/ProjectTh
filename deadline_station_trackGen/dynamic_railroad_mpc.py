@@ -1,17 +1,6 @@
 """
-Module 4 (Main Runner): Multi-Property Derivative-Pressure PPO + Contract-Based Hierarchical
-Shielding across a 3-Station (~16.5 km) Railroad with Passenger Mass Changes, Regenerative
-Braking Energy Recovery, and Dynamic Dwell-Time Recovery (`dynamic_railroad_mpc.py`).
-
-Fixes & Key Additions:
-  1. Logarithmic Convergence Horizon: Default `--epochs 220` matches the theoretical
-     O(log(1/eps)) convergence rate (Agarwal et al. 2021; Mei et al. 2020).
-  2. Accurate Micro-Step Shield Logging & Zero False Alarms: `shield_intervened` is logged
-     only on the exact step of intervention, and `DeadlineCone` checks true projected arrival
-     time drift rather than fighting PPO's learned cruise velocity (dropping Shield % from 62% -> ~5-9%).
-  3. Multi-Property PPO Loss Function: Incorporates Cano et al. (2026) Derivative Pressure
-     penalties `rho_1(vel), rho_2(acc), rho_3(jerk)` + net traction energy (with 35% regenerative
-     braking recovery) + multi-station punctuality.
+Multi-Property Derivative-Pressure PPO and Contract-Based Hierarchical Shielding
+for Multi-Station Automatic Train Operation (`dynamic_railroad_mpc.py`).
 """
 from __future__ import annotations
 
@@ -265,7 +254,7 @@ class MPCTransitionRailroadEnv:
         r99_margin = 2.576 * self.sigma_tube if self.traj_shield is not None else 0.0
         v_cap = max(1.5, self.corridor.compute_smooth_spatial_ceiling(self.x_curr, b_land_cos) - r99_margin)
 
-        # Action[0] = 0.0 -> Naive Pace (no overshoot); Action[0] > 0 -> Cruise Velocity Overshoot!
+        # Action[0] = 0.0 corresponds to naive pace; Action[0] > 0 commands cruise velocity overshoot
         overshoot_delta = 3.80 * float(a_clip[0])
         v_cmd_rl = float(np.clip(v_naive + overshoot_delta, 1.5, v_cap))
         return v_cmd_rl, a_start_cos, b_land_cos, v_feas, v_naive
@@ -369,15 +358,11 @@ class MPCTransitionRailroadEnv:
             jerk = abs(a_real - self.prev_accel) / self.corridor.dt
             self.prev_accel = a_real
 
-            # 2. Online 8-Step Mass Identification Using Station Telemetry:
-            #    During the first 8 steps (k_elapsed < 8) at station departure, the station wayside
-            #    sensors measure wind (d_ext), temperature (rho_air_station), and rail adhesion (station_mu).
-            #    Thus the ONLY unknown in F = M_eff * a_nom is the passenger mass M!
+            # Online 8-step mass identification using station wayside telemetry (k_elapsed < 8)
             self.d_hat_prev = self.d_hat
             a_meas_no_mom = ((v_next - self.v_curr) - inertia_mom) / self.corridor.dt
 
             if self.k_elapsed < 8:
-                # Station wayside sensor provides the exact wind d_ext during the 8-step station departure:
                 self.d_standstill = d_ext
                 self.d_hat = d_ext
                 a_nom_measured = a_meas_no_mom - d_ext
@@ -394,8 +379,7 @@ class MPCTransitionRailroadEnv:
                     self._sync_physics_and_mpc(use_estimated_mass=True)
                     self.mpc.prev_u, self.mpc.prev_v, self.u_act = prev_u_saved, prev_v_saved, self.u_act
             else:
-                # Step >= 8: Train has left the station sensor zone; M_hat is locked, and all
-                # subsequent acceleration residuals measure open-line weather/wind disturbances d_hat!
+                # Open-line disturbance observer (k_elapsed >= 8) with locked mass estimate M_hat
                 f_prop_est = self.u_act * self.physics.max_propulsion_force(self.v_curr, self.u_act)
                 f_drag_est = self.physics.basic_resistance(self.v_curr) * rho_air_station
                 f_grade_est = self.physics.grade_resistance(self.x_curr)
@@ -481,7 +465,6 @@ class MPCTransitionRailroadEnv:
                     "scissor_rad": scis_rad,
                     "env_rad": scis_rad + env_margin,
                     "regime": reg_name,
-                    # Log intervention strictly on sub_idx == 0 so micro-step counts are never inflated 8x!
                     "shield_intervened": bool(shield_intervened and (sub_idx == 0)),
                     "violated_prop": violated_prop if (sub_idx == 0) else "none",
                     "rho_1": rho_1_vel,
@@ -514,7 +497,6 @@ class MPCTransitionRailroadEnv:
         if done:
             sched_err = abs(self.t_curr - self.corridor.deadline_s)
             stop_err = abs(self.x_curr - self.corridor.station_x_m)
-            # Cap the unachievable delay penalty so the gradient doesn't blow up:
             effective_sched_err = min(sched_err, 4.0 if self.corridor.is_infeasible_challenge else 30.0)
             terminal_rew = (
                 35.0 * float(np.exp(-0.30 * effective_sched_err))
@@ -978,7 +960,7 @@ def evaluate_multi_station_journey(
 
         done = False
         leg_micro = []
-        gc.disable()  # Prevent Python Garbage Collector pauses from creating artificial 1.5ms spikes during real-time loop!
+        gc.disable()
 
         while not done:
             if mode == "BILBAO_CBTC_ATO":
@@ -994,7 +976,6 @@ def evaluate_multi_station_journey(
                     act, _, _ = rl_policy.get_action_and_value(obs, deterministic=True)
                 mpc_gain = 0.95
             elif mode == "MAX_SPEED_GREEDY":
-                # Maximizes speed with aggressive ramp rates until ahead of schedule, then synchronizes landing:
                 v_feas_g, v_naive_g = env.compute_feasible_deadline_pace(1.18, 0.90)
                 a0_greedy = 1.0 if (v_naive_g >= v_feas_g - 0.85 or env.v_curr < v_feas_g) else float(np.clip((v_feas_g + 0.65 - v_naive_g) / 3.80, 0.25, 1.0))
                 act = np.array([a0_greedy, 1.0, 1.0], dtype=np.float32)
@@ -1006,7 +987,7 @@ def evaluate_multi_station_journey(
                 v_naive_now = max(0.0, env.corridor.station_x_m - env.x_curr) / max(0.5, env.corridor.deadline_s - env.t_curr)
                 a0_stat = float(np.clip((v_static_target - v_naive_now) / 3.80, -1.0, 1.0))
                 act = np.array([a0_stat, 0.0, 0.0], dtype=np.float32)
-                mpc_gain = 0.0  # Static plan has NO online weather/wind observer feed-forward!
+                mpc_gain = 0.0
             else:
                 raise ValueError(f"Unknown mode: {mode}")
             t_pol_1 = time.perf_counter()
@@ -1064,8 +1045,7 @@ def evaluate_multi_station_journey(
             for k_pr in peak_pressures:
                 peak_pressures[k_pr] = max(peak_pressures[k_pr], sh_obj.peak_pressures[k_pr])
 
-        # Contract C3 Dwell-Time Recovery: if a leg arrived late (e.g., due to an infeasible break-test
-        # deadline), shorten the 25s station dwell down to a minimum of 19s to recover timetable slack!
+        # Contract C3 dwell-time recovery: shorten station dwell down to 19s when arriving late
         nominal_dwell_s = leg["dwell_s"]
         if nominal_dwell_s > 0.0:
             arrival_delay = max(0.0, info["t_curr"] - leg["deadline_s"])
@@ -1354,7 +1334,7 @@ def main():
         torch.save(emulator.state_dict(), emu_ckpt_path)
 
     if args.load_checkpoint and os.path.exists(args.load_checkpoint):
-        print(f"\n=== 2. Loading Pre-Trained PPO Pilot Checkpoint from '{args.load_checkpoint}' (Skipping {args.epochs} Epochs!) ===", flush=True)
+        print(f"\n=== 2. Loading Pre-Trained PPO Pilot Checkpoint from '{args.load_checkpoint}' ===", flush=True)
         rl_policy = CosineTrajectoryRLPolicy(obs_dim=15, act_dim=3, hidden_dim=64)
         rl_policy.load_state_dict(torch.load(args.load_checkpoint, map_location="cpu"))
         rl_policy.eval()
@@ -1436,7 +1416,6 @@ def main():
         )
     print("=" * 156)
 
-    # Print Clean (No-Weather), Weather-Disturbed, and Combined Once Each (NO duplicate table!):
     for subset_title, filter_fn in [
         ("1. NO-WEATHER (CLEAN) SCENARIOS ONLY", lambda r: not r.get("is_weather_disturbed", False)),
         ("2. WEATHER-DISTURBED (WIND / RAIN / SNOW / COLD) SCENARIOS ONLY", lambda r: r.get("is_weather_disturbed", True)),
@@ -1483,7 +1462,7 @@ def main():
     sp1, sp2 = all_spikes_sorted[0], all_spikes_sorted[1]
     macro_pct = 100.0 * float(np.mean([1.0 if r["worst_spike"]["is_macro_entry"] else 0.0 for r in dmps_runs]))
     print(
-        f"\n[INFERENCE SPIKE PROFILER across 30 Runs] {macro_pct:.0f}% of Max Spikes occurred on Macro-Step Entry (sub_idx == 0)!\n"
+        f"\n[INFERENCE SPIKE PROFILER across 30 Runs] {macro_pct:.0f}% of Max Spikes occurred on Macro-Step Entry (sub_idx == 0)\n"
         f"  -> #1 Most Expensive Step ({sp1['total_step_us']:.1f} us at x={sp1['x']:.0f}m, regime='{sp1['regime']}'): "
         f"MPC_QP={sp1['step_us']:.1f} us | Emulator={sp1['emu_us']:.1f} us | PPO_Pol={sp1['pol_us']:.1f} us | Shield={sp1['sh_us']:.1f} us\n"
         f"  -> #2 2nd Expensive Step  ({sp2['total_step_us']:.1f} us at x={sp2['x']:.0f}m, regime='{sp2['regime']}'): "

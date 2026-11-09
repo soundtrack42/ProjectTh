@@ -217,9 +217,7 @@ class GoodallTrajectoryShield:
         rho_1 = (v_cmd_cand + r99_now) / max(1.0, v_ceil + 0.01)
         h_speed = (v_ceil + 0.01) - (v_cmd_cand + r99_now)
 
-        # 2. Order-2 Acceleration/Braking Smoothness Certifier:
-        #    Triggers at departure initiation (k_elapsed in {0, 8}) or when a new speed shift starts
-        #    (|v_cmd - v_curr| > 1.65 m/s while ramp_u_phase > 0.92) to latch smooth ramp bounds!
+        # 2. Order-2 Acceleration/Braking Smoothness Certifier
         x_rem = max(0.0, self.corridor.station_x_m - env.x_curr)
         dv_actual = abs(min(v_cmd_cand, v_ceil) - env.v_curr)
         is_ramp_init = (env.k_elapsed in (0, 8)) or (dv_actual > 1.65 and env.shaper.ramp_u_phase > 0.92)
@@ -238,9 +236,7 @@ class GoodallTrajectoryShield:
         rho_3 = jerk_est / self.cfg.max_jerk_mps3
         h_jerk = self.cfg.max_jerk_mps3 - jerk_est
 
-        # 4. Predictive Eco-Coasting Certifier (C4_ECO_REGEN_COAST):
-        #    Triggers right ahead of a slower speed zone OR at the station pre-landing entry window
-        #    so the train coasts early and harvests 100% electrodynamic regenerative braking!
+        # 4. Predictive Eco-Coasting Certifier (C4_ECO_REGEN_COAST)
         km_done = max(0.80, env.x_curr / 1000.0)
         mass_used_kg = getattr(env, "mass_hat_kg", self.corridor.mass_kg)
         kinetic_kwh = (0.5 * mass_used_kg * 1.08 * (env.v_curr ** 2)) / 3.6e6
@@ -268,8 +264,7 @@ class GoodallTrajectoryShield:
         else:
             h_energy = 0.50
 
-        # 5. Deadline Gust-Compensation Certifier (C3_DEADLINE_RECOVERY):
-        #    Activates ONLY inside strong weather gusts (|d_hat| > 0.30 m/s^2) when x_rem > 900m!
+        # 5. Deadline Gust-Compensation Certifier (C3_DEADLINE_RECOVERY)
         if x_rem > 900.0 and env.d_hat < -0.30 and (v_cmd_cand < v_pace_feasible + 0.25):
             dv_mismatch = (v_pace_feasible + 0.25) - v_cmd_cand
         elif x_rem > 900.0 and env.d_hat > 0.30 and (v_cmd_cand > v_pace_feasible - 0.15):
@@ -330,8 +325,6 @@ class GoodallTrajectoryShield:
             return np.array([v_max_w1, a_w2, b_w2], dtype=np.float64)
 
         if contract_name == "C2_COMFORT_JERK_DAMP":
-            # Gently damps ramp acceleration/braking to cut SmoothLoss & Jerk while adding +0.06 m/s
-            # cruise compensation so the gentler departure ramp never loses a single tenth of a second!
             v_comp = float(np.clip(v_ppo_safe + 0.06, 1.5, v_max_w1))
             return np.array([v_comp, 0.74, 0.66], dtype=np.float64)
 

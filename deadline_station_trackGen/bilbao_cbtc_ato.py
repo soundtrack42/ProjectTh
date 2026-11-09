@@ -350,9 +350,7 @@ class BilbaoCBTCATOController:
         e_pos = x_ref - x_curr
         dv_pos_raw = self.kp_pos * e_pos + self.ki_pos * self.int_pos
 
-        # 2. Braking Switcher (Eq. 32, Fig. 11):
-        # Disconnects positive position-loop speed boost during braking ramps (a_ff < -0.05)
-        # or when on the spatial ATP/braking ceiling so schedule lag never causes overspeed!
+        # 2. Braking Switcher (Eq. 32, Fig. 11)
         in_braking_phase = (a_ff < -0.05) or (v_ff >= v_bw_ceil - 0.15) or (rem_dist < 210.0)
         if in_braking_phase and dv_pos_raw > 0.0:
             dv_pos = 0.0

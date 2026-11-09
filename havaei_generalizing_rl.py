@@ -483,7 +483,6 @@ class PathAgnosticHavaeiEnv:
             v_seq[0] = self.v_real
         a_spatial = (v_seq[1:] ** 2 - v_seq[:-1] ** 2) / (2.0 * self.d)
         a_temporal = (v_seq[1:] - v_seq[:-1]) / (2.5 * self.dt)
-        # Blend temporal and spatial acceleration so standstill departures are never invisible!
         return 0.55 * a_spatial + 0.45 * a_temporal
 
     def compute_past_A(self, k: int | None = None) -> np.ndarray:
@@ -589,7 +588,7 @@ class PathAgnosticHavaeiEnv:
         vel_rate = (self.v_real - self.v_prev) / self.dt
         ref_rate = dv_target / self.dt
 
-        # Bleed integral windup on error sign-flip or flat plateau arrival (fixes k~600 hump)
+        # Leaky integral anti-windup on error sign flip or plateau arrival
         if (self.int_err * err_now) < 0.0:
             int_decay = 0.20  # Sign flip (overshoot): flush 80% of stale history immediately
         elif abs(dv_target) < 0.03 and abs(err_now) < 0.25:
@@ -635,8 +634,7 @@ class PathAgnosticHavaeiEnv:
 
         v_nonlinear = float(max(0.0, self.v_real + self.dt * (a_nl_nom + d_ext) + inertia_momentum))
 
-        # Online Moving-Average Disturbance Observer:
-        # Flush immediately when the gust ends (|d_step| < 0.02) so no post-disturbance tail remains!
+        # Online moving-average disturbance observer
         if self.v_real > 1e-3 or v_nonlinear > 1e-3:
             a_meas = ((v_nonlinear - self.v_real) - inertia_momentum) / self.dt
             d_step = a_meas - a_nl_nom

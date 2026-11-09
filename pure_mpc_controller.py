@@ -324,14 +324,13 @@ class PureLiuMPC:
         dv_01 = ref_1 - ref_0
 
         if self.adaptive_shift:
-            # 1. Standstill guard: never creep before the scheduled departure step!
+            # Standstill guard
             if ref_0 <= 1e-3 and v_c <= 1e-3:
                 self.prev_u = 0.0
                 self.u_act = 0.28 * u_act_curr
                 return 0.0
 
-            # 2. Strict causal plateau guard: if step k+1 (ref[0]) is still flat,
-            # clamp lookahead so MPC never anticipates an upcoming shift 1 step early!
+            # Causal plateau guard
             if abs(ref_0 - v_c) < 0.025 and abs(dv_01) > 0.025:
                 X_ref[1:, 0] = ref_0
             elif abs(dv_01) < 0.025 and abs(ref_0 - v_c) < 0.15:

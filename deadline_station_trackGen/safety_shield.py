@@ -283,7 +283,6 @@ class SafetyFilterShield:
             with torch.no_grad():
                 out = env.learned_model.net(self._feat_buf)
                 dv_res = float(out[0, 0].item())
-                # Option A: Read learned log-variance directly from the 2nd output neuron!
                 if out.shape[-1] >= 2:
                     log_var = float(np.clip(out[0, 1].item(), -10.5, -3.2))
                     sigma_delta = float(np.exp(0.5 * log_var))
@@ -420,8 +419,6 @@ class SafetyFilterShield:
     def _execute_intervention_scheme(
         self, w_task: np.ndarray, w_fb: np.ndarray, candidates: list[np.ndarray], eval_fn
     ) -> tuple[np.ndarray, float]:
-        # Evaluate the exact 1-step transition (h=0) to test if the proposed action is safe;
-        # only invoke the multi-step recovery rollout if step 0 violates the barrier!
         margin_task, _ = eval_fn(w_task, 1)
         if margin_task >= 0.0:
             self.last_intervention_mag = 0.0
@@ -524,8 +521,6 @@ class SafetyFilterShield:
         scis_lo = max(0.0, v_emu_next - r99_k)
         scis_hi = v_emu_next + r99_k
 
-        # Active disturbance indicator: tighten to Yellow Scissor Band during gusts,
-        # and relax to Green Safe Envelope as soon as the gust ends!
         d_now = float(getattr(env, "d_raw", 0.0))
         if abs(d_now) > 0.05:
             hi_bound, lo_bound = scis_hi, scis_lo
@@ -722,7 +717,6 @@ def compute_and_print_shield_scissor_band(
 
         v_min_safe[idx] = vmin_k
         v_max_safe[idx] = vmax_k
-        # Use upper-side radius (vmax_k - v_curr_emu) so v >= 0 clamping at standstill never divides by 2!
         max_env_rad[idx] = max(vmax_k - v_curr_emu, v_curr_emu - vmin_k)
 
         step_err_arr[idx] = abs(v_traj_arr[idx] - v_curr_emu)
