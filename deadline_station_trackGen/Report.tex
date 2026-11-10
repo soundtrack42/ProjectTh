@@ -219,8 +219,8 @@ Because a $C^2$ half-cosine S-curve fixes its duration $T_{\text{ramp}}$ at the 
 
 The three shielding modes evaluated in Table~\ref{tab:stage3_main} represent progressively richer intervention mechanisms over $\mathcal{L}_{\text{cert}}$:
 \begin{enumerate}
-    \item \textbf{Switch MPS (Hard Single-Contract Switching \cite{banerjee2024,goodall2026}):} Maps the most-violated barrier $i^\star = \arg\min_i h_i(p_{\text{task}})$ deterministically to its single designated recovery contract $p_{\text{fb}} = \mathcal{C}_{i^\star}$ and replaces the action outright ($p_{\text{safe}} = p_{\text{fb}}$). Because it follows a fixed 1-to-1 lookup rule without comparing alternative contracts, it does not use UCB.
-    \item \textbf{1-Step DCBF (Minimal-Intervention Barrier Projection \cite{hsu2024,wang2023}):} Also uses the single deterministic recovery contract $p_{\text{fb}} = \mathcal{C}_{i^\star}$, but performs a 4-step bisection line search along the segment $p(\lambda) = (1 - \lambda)p_{\text{task}} + \lambda p_{\text{fb}}$ to find the smallest intervention weight $\lambda^\star \in [0, 1]$ satisfying $h_{i^\star}(p(\lambda^\star)) \ge 0$, $h_1 \ge 0$, and $h_2 \ge 0$. Because the projection direction is restricted to the single line between $p_{\text{task}}$ and $p_{\text{fb}}$, no multi-contract selection (UCB) is needed.
+    \item \textbf{Switch MPS (Hard Single-Contract Switching \cite{banerjee2024,goodall2026}):} Maps the most-violated barrier $i^\star = \arg\min_i h_i(p_{\text{task}})$ deterministically to its single designated recovery contract $p_{\text{fb}} = \mathcal{C}_{i^\star}$ and replaces the action outright ($p_{\text{safe}} = p_{\text{fb}}$).
+    \item \textbf{1-Step DCBF (Minimal-Intervention Barrier Projection \cite{hsu2024,wang2023}):} Also uses the single deterministic recovery contract $p_{\text{fb}} = \mathcal{C}_{i^\star}$, but performs a 4-step bisection line search along the segment $p(\lambda) = (1 - \lambda)p_{\text{task}} + \lambda p_{\text{fb}}$ to find the smallest intervention weight $\lambda^\star \in [0, 1]$ satisfying $h_{i^\star}(p(\lambda^\star)) \ge 0$, $h_1 \ge 0$, and $h_2 \ge 0$.
     \item \textbf{UCB-DMPS Rollout (Upper Confidence Bound Multi-Contract Portfolio + 2-Step Rollout \cite{adalat2026a,banerjee2024}):} Here, \textbf{UCB} stands for \textbf{Upper Confidence Bound} (specifically, a recency-weighted \textit{Discounted-UCB} multi-armed bandit selector with forgetting factor $\eta = 0.992$). Rather than being locked to a single recovery rule $\mathcal{C}_{i^\star}$, the shield treats $\mathcal{L}_{\text{cert}}$ as a compositional portfolio where multiple contracts can resolve a violation with different comfort, energy, and schedule trade-offs (for example, when approaching a slower speed zone, $\mathcal{C}_4$ Eco-Regen Coast may satisfy safety while saving more traction energy than $\mathcal{C}_2$ alone). For each candidate contract $\mathcal{C} \in \mathcal{L}_{\text{cert}}$, the shield tracks its discounted cumulative reward $S_{\mathcal{C}}$ and discounted pull count $N_{\mathcal{C}}$ ($S_{\mathcal{C}} \leftarrow \eta S_{\mathcal{C}} + r_t,\; N_{\mathcal{C}} \leftarrow \eta N_{\mathcal{C}} + 1$) and computes the Upper Confidence Bound score:
     \begin{equation}
         \text{UCB}(\mathcal{C}) = \underbrace{\frac{S_{\mathcal{C}}}{N_{\mathcal{C}}}}_{\text{empirical contract performance}} + \underbrace{\beta_{\text{ucb}}\sqrt{\frac{\ln\!\big(1 + \sum_{\mathcal{C}' \in \mathcal{L}_{\text{cert}}} N_{\mathcal{C}'}\big)}{N_{\mathcal{C}}}}}_{\text{upper confidence exploration bonus}}, \qquad \beta_{\text{ucb}} = 0.35
@@ -293,6 +293,7 @@ Third, relative to the Event-Triggered Tube MPC (ETTMPC) of Sun et al.\ \cite{su
 \centering
 \caption{Aggregated Hierarchical Differential and Contract Shield Diagnostics Across All 30 Generalized Multi-Station Scenarios ($430.9\text{ km}$ Total Distance, $69,745$ Micro-Steps, Overall Emu-to-Real $\text{RMSE} = 0.0205\text{ m/s}$, Empirical 99th-Percentile Error $= 0.0559\text{ m/s}$, Physical Tube Containment $= 99.96\%$).}
 \label{tab:scissor_diag}
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{lcccccc}
 \toprule
 \textbf{Driving Regime} & \textbf{Total Steps (Mean/Run)} & \textbf{Emu-Real RMSE} & \textbf{Learned 99\% Scissor} & \textbf{Safe Envelope} & \textbf{Regime P99 / MaxErr} & \textbf{Interventions} \\
@@ -302,7 +303,8 @@ Shift (Ramp) & $4,208\text{ }(140.3/\text{run})$ & $0.0162\text{ m/s}$ & $\pm 0.
 Braking & $5,815\text{ }(193.8/\text{run})$ & $0.0240\text{ m/s}$ & $\pm 0.0849\text{ m/s}$ & $\pm 0.2449\text{ m/s}$ & $0.0625 / 0.0699\text{ m/s}$ & $95\text{ }(1.6\%)$ \\
 Station Stop & $7,201\text{ }(240.0/\text{run})$ & $0.0277\text{ m/s}$ & $\pm 0.0508\text{ m/s}$ & $\pm 0.1167\text{ m/s}$ & $0.0838 / 0.3338\text{ m/s}$ & $168\text{ }(2.3\%)$ \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table}
 
 \begin{figure}[H]
