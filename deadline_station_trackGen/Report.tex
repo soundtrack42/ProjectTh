@@ -254,36 +254,36 @@ Third, relative to the Event-Triggered Tube MPC (ETTMPC) of Sun et al.\ \cite{su
 \midrule
 \multicolumn{9}{l}{\textbf{Part A: No-Weather (Clean) Scenarios Only (15 Scenarios | 1..5 Stations)}} \\
 \midrule
-1. Max-Speed Greedy Cosine + MPC & $3.73\text{ s}$ & $0.004\text{ m}$ & $0.0729$ & $39.35\text{ Wh/tk}$ & $4.9143$ & $0.0\%$ & $11.1\text{ }\mu\text{s}$ & $13.3 / 22.9\text{ }\mu\text{s}$ \\
-2. Naive Pace (No Cruise Overshoot) + MPC & $19.20\text{ s}$ & $0.003\text{ m}$ & $0.0550$ & $34.56\text{ Wh/tk}$ & $20.2272$ & $0.0\%$ & $10.7\text{ }\mu\text{s}$ & $12.6 / 20.1\text{ }\mu\text{s}$ \\
-3. Static Plan (No Wind/Mass Replan) + MPC & $9.50\text{ s}$ & $0.003\text{ m}$ & $0.0593$ & $35.19\text{ Wh/tk}$ & $10.5484$ & $0.0\%$ & $10.8\text{ }\mu\text{s}$ & $13.3 / 24.5\text{ }\mu\text{s}$ \\
-\textbf{4. Multi-Property PPO Pilot (Unshielded)} & $\mathbf{1.10\text{ s}}$ & $0.005\text{ m}$ & $0.0615$ & $36.80\text{ Wh/tk}$ & $\mathbf{2.2196}$ & $0.0\%$ & $10.9\text{ }\mu\text{s}$ & $14.0 / 25.7\text{ }\mu\text{s}$ \\
-\textbf{5. Contract-Shielded PPO (Switch MPS)} & $1.61\text{ s}$ & $0.004\text{ m}$ & $\mathbf{0.0495}$ & $\mathbf{35.86\text{ Wh/tk}}$ & $2.6608$ & $7.9\%$ & $11.2\text{ }\mu\text{s}$ & $22.6 / 45.0\text{ }\mu\text{s}$ \\
-\textbf{6. Contract-Shielded PPO (1-Step DCBF)} & $1.51\text{ s}$ & $0.005\text{ m}$ & $0.0520$ & $36.05\text{ Wh/tk}$ & $2.5952$ & $6.3\%$ & $11.3\text{ }\mu\text{s}$ & $22.8 / 40.7\text{ }\mu\text{s}$ \\
-\textbf{7. Contract-Shielded PPO (UCB-DMPS Rollout)} & $1.50\text{ s}$ & $0.005\text{ m}$ & $0.0529$ & $35.98\text{ Wh/tk}$ & $2.5753$ & $8.1\%$ & $11.3\text{ }\mu\text{s}$ & $23.3 / 44.8\text{ }\mu\text{s}$ \\
-8. Bilbao et al.\ (2025) CBTC-ATO (RMBTP + PI) \cite{bilbao2025} & $4.73\text{ s}$ & $0.014\text{ m}$ & $0.1092$ & $37.14\text{ Wh/tk}$ & $6.0875$ & $0.0\%$ & $19.9\text{ }\mu\text{s}$ & $19.9 / 24.0\text{ }\mu\text{s}$ \\
+1. Max-Speed Greedy Cosine + MPC       & 3.73 & 0.004 & 0.0729 & 39.35\,Wh/t$\cdot$km & 4.9143  & 0.0\%  & 10.8\,$\mu$s & 13.1 / 21.7 / 34.1\,$\mu$s \\
+2. Naive Pace (No Overshoot) + MPC     & 19.20 & 0.003 & 0.0550 & 34.56\,Wh/t$\cdot$km & 20.2272 & 0.0\%  & 10.6\,$\mu$s & 12.6 / 19.8 / 52.0\,$\mu$s \\
+3. Static Plan (No Replan) + MPC       & 9.50  & 0.003 & 0.0593 & 35.19\,Wh/t$\cdot$km & 10.5484 & 0.0\%  & 10.7\,$\mu$s & 13.2 / 22.5 / 63.8\,$\mu$s \\
+4. \textbf{Multi-Property PPO (Unshielded)}     & 1.10  & 0.005 & 0.0615 & 36.80\,Wh/t$\cdot$km & 2.2196  & 0.0\%  & 10.9\,$\mu$s & 13.9 / 25.4 / 75.0\,$\mu$s \\
+5. \textbf{Contract-Shielded PPO (Switch MPS)}  & 2.86  & 0.005 & 0.0696 & 36.31\,Wh/t$\cdot$km & 3.9707  & 23.8\% & 11.2\,$\mu$s & 22.2 / 38.8 / 121.1\,$\mu$s \\
+6. \textbf{Contract-Shielded PPO (1-Step DCBF)} & 1.18  & 0.005 & 0.0621 & 36.74\,Wh/t$\cdot$km & 2.2923  & 3.9\%  & 11.2\,$\mu$s & 22.2 / 39.7 / 60.7\,$\mu$s \\
+7. \textbf{Contract-Shielded PPO (UCB-DMPS)}    & 1.50  & 0.005 & \textbf{0.0529} & 35.98\,Wh/t$\cdot$km & 2.5753  & 8.1\%  & 11.3\,$\mu$s & 23.3 / 44.8 / 172.0\,$\mu$s \\
+8. Bilbao (2025) CBTC-ATO (RMBTP+PI)   & 4.73  & 0.014 & 0.1092 & 37.14\,Wh/t$\cdot$km & 6.0875  & 0.0\%  & 19.6\,$\mu$s & 19.6 / 22.2 / 387.9\,$\mu$s \\
 \midrule
 \multicolumn{9}{l}{\textbf{Part B: Weather-Disturbed (Wind / Rain / Snow / Cold) Scenarios Only (15 Scenarios | 1..5 Stations)}} \\
 \midrule
-1. Max-Speed Greedy Cosine + MPC & $3.13\text{ s}$ & $0.008\text{ m}$ & $0.0738$ & $57.12\text{ Wh/tk}$ & $4.8163$ & $0.0\%$ & $11.0\text{ }\mu\text{s}$ & $13.3 / 22.5\text{ }\mu\text{s}$ \\
-2. Naive Pace (No Cruise Overshoot) + MPC & $20.43\text{ s}$ & $0.010\text{ m}$ & $0.0542$ & $49.87\text{ Wh/tk}$ & $21.9367$ & $0.0\%$ & $10.8\text{ }\mu\text{s}$ & $12.8 / 20.7\text{ }\mu\text{s}$ \\
-3. Static Plan (No Wind/Mass Replan) + MPC & $10.35\text{ s}$ & $0.013\text{ m}$ & $0.0596$ & $49.31\text{ Wh/tk}$ & $11.8981$ & $0.0\%$ & $10.8\text{ }\mu\text{s}$ & $13.3 / 22.5\text{ }\mu\text{s}$ \\
-\textbf{4. Multi-Property PPO Pilot (Unshielded)} & $\mathbf{2.03\text{ s}}$ & $0.017\text{ m}$ & $0.0597$ & $52.76\text{ Wh/tk}$ & $\mathbf{3.7189}$ & $0.0\%$ & $11.2\text{ }\mu\text{s}$ & $14.3 / 26.7\text{ }\mu\text{s}$ \\
-\textbf{5. Contract-Shielded PPO (Switch MPS)} & $2.53\text{ s}$ & $0.016\text{ m}$ & $\mathbf{0.0503}$ & $51.98\text{ Wh/tk}$ & $4.1775$ & $9.9\%$ & $11.3\text{ }\mu\text{s}$ & $22.7 / 39.6\text{ }\mu\text{s}$ \\
-\textbf{6. Contract-Shielded PPO (1-Step DCBF)} & $2.45\text{ s}$ & $0.017\text{ m}$ & $0.0517$ & $52.09\text{ Wh/tk}$ & $4.1086$ & $9.1\%$ & $11.3\text{ }\mu\text{s}$ & $23.0 / 39.4\text{ }\mu\text{s}$ \\
-\textbf{7. Contract-Shielded PPO (UCB-DMPS Rollout)} & $2.48\text{ s}$ & $0.015\text{ m}$ & $0.0525$ & $51.99\text{ Wh/tk}$ & $4.1088$ & $9.7\%$ & $11.4\text{ }\mu\text{s}$ & $23.6 / 40.6\text{ }\mu\text{s}$ \\
-8. Bilbao et al.\ (2025) CBTC-ATO (RMBTP + PI) \cite{bilbao2025} & $3.36\text{ s}$ & $0.047\text{ m}$ & $0.0981$ & $49.93\text{ Wh/tk}$ & $5.5146$ & $0.0\%$ & $20.0\text{ }\mu\text{s}$ & $20.0 / 25.3\text{ }\mu\text{s}$ \\
+1. Max-Speed Greedy Cosine + MPC       & 3.13  & 0.008 & 0.0738 & 57.12\,Wh/t$\cdot$km & 4.8163  & 0.0\%  & 11.0\,$\mu$s & 13.2 / 22.3 / 38.9\,$\mu$s \\
+2. Naive Pace (No Overshoot) + MPC     & 20.43 & 0.010 & 0.0542 & 49.87\,Wh/t$\cdot$km & 21.9367 & 0.0\%  & 10.8\,$\mu$s & 12.7 / 20.7 / 74.8\,$\mu$s \\
+3. Static Plan (No Replan) + MPC       & 10.35 & 0.013 & 0.0596 & 49.31\,Wh/t$\cdot$km & 11.8981 & 0.0\%  & 10.9\,$\mu$s & 13.4 / 23.5 / 105.7\,$\mu$s \\
+4. \textbf{Multi-Property PPO (Unshielded)}     & 2.03  & 0.017 & 0.0597 & 52.76\,Wh/t$\cdot$km & 3.7189  & 0.0\%  & 11.0\,$\mu$s & 14.1 / 25.5 / 141.7\,$\mu$s \\
+5. \textbf{Contract-Shielded PPO (Switch MPS)}  & 3.99  & 0.017 & 0.0681 & 51.99\,Wh/t$\cdot$km & 5.6849  & 26.1\% & 11.2\,$\mu$s & 22.4 / 39.0 / 128.6\,$\mu$s \\
+6. \textbf{Contract-Shielded PPO (1-Step DCBF)} & 2.26  & 0.016 & 0.0629 & 53.57\,Wh/t$\cdot$km & 3.9644  & 9.8\%  & 11.3\,$\mu$s & 22.6 / 39.6 / 220.8\,$\mu$s \\
+7. \textbf{Contract-Shielded PPO (UCB-DMPS)}    & 2.48  & 0.015 & \textbf{0.0525} & 51.98\,Wh/t$\cdot$km & 4.1088  & 9.7\%  & 11.3\,$\mu$s & 23.5 / 39.7 / 132.7\,$\mu$s \\
+8. Bilbao (2025) CBTC-ATO (RMBTP+PI)   & 3.36  & 0.047 & 0.0981 & 49.93\,Wh/t$\cdot$km & 5.5146  & 0.0\%  & 19.6\,$\mu$s & 19.6 / 25.5 / 349.2\,$\mu$s \\
 \midrule
 \multicolumn{9}{l}{\textbf{Part C: United Benchmark: All Generalized Scenarios Combined (30 Scenarios | 1..5 Stations)}} \\
 \midrule
-1. Max-Speed Greedy Cosine + MPC & $3.43\text{ s}$ & $\mathbf{0.006\text{ m}}$ & $0.0733$ & $48.24\text{ Wh/tk}$ & $4.8653$ & $0.0\%$ & $11.1\text{ }\mu\text{s}$ & $13.3 / 22.7\text{ }\mu\text{s}$ \\
-2. Naive Pace (No Cruise Overshoot) + MPC & $19.82\text{ s}$ & $0.007\text{ m}$ & $0.0546$ & $42.22\text{ Wh/tk}$ & $21.0819$ & $0.0\%$ & $\mathbf{10.7\text{ }\mu\text{s}}$ & $\mathbf{12.7 / 20.4\text{ }\mu\text{s}}$ \\
-3. Static Plan (No Wind/Mass Replan) + MPC & $9.92\text{ s}$ & $0.008\text{ m}$ & $0.0594$ & $42.25\text{ Wh/tk}$ & $11.2232$ & $0.0\%$ & $10.8\text{ }\mu\text{s}$ & $13.3 / 23.5\text{ }\mu\text{s}$ \\
-\textbf{4. Multi-Property PPO Pilot (Unshielded)} & $\mathbf{1.57\text{ s}}$ & $0.011\text{ m}$ & $0.0606$ & $44.78\text{ Wh/tk}$ & $\mathbf{2.9693}$ & $0.0\%$ & $11.0\text{ }\mu\text{s}$ & $14.2 / 26.2\text{ }\mu\text{s}$ \\
-\textbf{5. Contract-Shielded PPO (Switch MPS)} & $2.07\text{ s}$ & $0.010\text{ m}$ & $\mathbf{0.0499}$ & $\mathbf{43.92\text{ Wh/tk}}$ & $3.4191$ & $8.9\%$ & $11.2\text{ }\mu\text{s}$ & $22.7 / 42.3\text{ }\mu\text{s}$ \\
-\textbf{6. Contract-Shielded PPO (1-Step DCBF)} & $1.98\text{ s}$ & $0.011\text{ m}$ & $0.0519$ & $44.07\text{ Wh/tk}$ & $3.3519$ & $7.7\%$ & $11.3\text{ }\mu\text{s}$ & $22.9 / 40.0\text{ }\mu\text{s}$ \\
-\textbf{7. Contract-Shielded PPO (UCB-DMPS Rollout)} & $1.99\text{ s}$ & $0.010\text{ m}$ & $0.0527$ & $43.98\text{ Wh/tk}$ & $3.3420$ & $8.9\%$ & $11.4\text{ }\mu\text{s}$ & $23.5 / 42.7\text{ }\mu\text{s}$ \\
-8. Bilbao et al.\ (2025) CBTC-ATO (RMBTP + PI) \cite{bilbao2025} & $4.05\text{ s}$ & $0.031\text{ m}$ & $0.1037$ & $43.53\text{ Wh/tk}$ & $5.8010$ & $0.0\%$ & $19.9\text{ }\mu\text{s}$ & $19.9 / 24.6\text{ }\mu\text{s}$ \\
+1. Max-Speed Greedy Cosine + MPC       & 3.43  & 0.006 & 0.0733 & 48.24\,Wh/t$\cdot$km & 4.8653  & 0.0\%  & 10.9\,$\mu$s & 13.1 / 22.0 / 38.9\,$\mu$s \\
+2. Naive Pace (No Overshoot) + MPC     & 19.82 & 0.007 & 0.0546 & 42.22\,Wh/t$\cdot$km & 21.0819 & 0.0\%  & 10.7\,$\mu$s & 12.7 / 20.2 / 74.8\,$\mu$s \\
+3. Static Plan (No Replan) + MPC       & 9.92  & 0.008 & 0.0594 & 42.25\,Wh/t$\cdot$km & 11.2232 & 0.0\%  & 10.8\,$\mu$s & 13.3 / 23.0 / 105.7\,$\mu$s \\
+4. \textbf{Multi-Property PPO (Unshielded)}     & 1.57  & 0.011 & 0.0606 & 44.78\,Wh/t$\cdot$km & 2.9693  & 0.0\%  & 10.9\,$\mu$s & 14.0 / 25.4 / 141.7\,$\mu$s \\
+5. \textbf{Contract-Shielded PPO (Switch MPS)}  & 3.43  & 0.011 & 0.0689 & 44.15\,Wh/t$\cdot$km & 4.8278  & 24.9\% & 11.2\,$\mu$s & 22.3 / 38.9 / 128.6\,$\mu$s \\
+6. \textbf{Contract-Shielded PPO (1-Step DCBF)} & 1.72  & 0.010 & 0.0625 & 45.15\,Wh/t$\cdot$km & 3.1284  & 6.8\%  & 11.3\,$\mu$s & 22.4 / 39.7 / 220.8\,$\mu$s \\
+7. \textbf{Contract-Shielded PPO (UCB-DMPS)}    & 1.99  & 0.010 & \textbf{0.0527} & 43.98\,Wh/t$\cdot$km & 3.3420  & 8.9\%  & 11.3\,$\mu$s & 23.4 / 42.3 / 172.0\,$\mu$s \\
+8. Bilbao (2025) CBTC-ATO (RMBTP+PI)   & 4.05  & 0.031 & 0.1037 & 43.53\,Wh/t$\cdot$km & 5.8010  & 0.0\%  & 19.6\,$\mu$s & 19.6 / 23.8 / 387.9\,$\mu$s \\
 \bottomrule
 \end{tabular}%
 }

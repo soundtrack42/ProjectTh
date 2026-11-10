@@ -243,12 +243,15 @@ class GoodallTrajectoryShield:
         rho_1 = (v_cmd_cand + r99_now) / max(1.0, v_ceil + 0.01)
         h_speed = (v_ceil + 0.01) - (v_cmd_cand + r99_now)
 
-        # 2. Order-2 Acceleration/Braking Smoothness Certifier
+        # 2. Order-2 Acceleration/Braking Smoothness Certifier:
+        #    Proactive ramp-initiation damping (0.82 / 0.72) is exclusive to Contract-DMPS ("mps_rollout");
+        #    Switch and 1-Step DCBF only enforce the hard comfort boundary (1.20 / 0.92)!
         x_rem = max(0.0, self.corridor.station_x_m - env.x_curr)
         dv_actual = abs(min(v_cmd_cand, v_ceil) - env.v_curr)
-        is_ramp_init = (env.k_elapsed in (0, 8)) or (dv_actual > 1.65 and env.shaper.ramp_u_phase > 0.92)
-        a_comf_hi = 0.82 if is_ramp_init else (self.corridor.comfort_accel_max * 1.02)
-        b_comf_hi = 0.72 if is_ramp_init else (self.corridor.comfort_braking_max * 1.02)
+        is_ucb_dmps = (self.cfg.mode == "mps_rollout")
+        is_ramp_init = is_ucb_dmps and ((env.k_elapsed in (0, 8)) or (dv_actual > 1.65 and env.shaper.ramp_u_phase > 0.92))
+        a_comf_hi = 0.82 if is_ramp_init else (self.corridor.comfort_accel_max * 1.01)
+        b_comf_hi = 0.72 if is_ramp_init else (self.corridor.comfort_braking_max * 1.01)
         rho_2 = max(a_start_cand / a_comf_hi, b_land_cand / b_comf_hi, 0.62 / max(0.30, b_land_cand))
         h_smooth = min(a_comf_hi - a_start_cand, b_comf_hi - b_land_cand, b_land_cand - 0.62) * 2.5
 
@@ -262,7 +265,8 @@ class GoodallTrajectoryShield:
         rho_3 = jerk_est / self.cfg.max_jerk_mps3
         h_jerk = self.cfg.max_jerk_mps3 - jerk_est
 
-        # 4. Predictive Eco-Coasting Certifier (C4_ECO_REGEN_COAST)
+        # 4. Predictive Eco-Coasting Certifier (C4_ECO_REGEN_COAST):
+        #    Exclusively active in UCB-DMPS ("mps_rollout") as a multi-property contract!
         if rho_E_pre is not None:
             rho_E = rho_E_pre
         else:
@@ -273,28 +277,32 @@ class GoodallTrajectoryShield:
             e_budget_kwh = (55.0 * (mass_used_kg / 1000.0) * km_done) / 1000.0
             rho_E = min(1.08, dissipated_kwh / max(1.0, e_budget_kwh))
 
-        v_lim_280 = (
-            v_lim_280_pre
-            if v_lim_280_pre is not None
-            else self.corridor.get_speed_limit(min(self.corridor.station_x_m, env.x_curr + 280.0))
-        )
-        can_zone_coast = (
-            (env.v_curr > 14.0)
-            and (v_lim_280 < env.v_curr - 1.0)
-            and (v_cmd_cand > v_lim_280 + 0.45)
-            and (env.d_hat >= -0.05)
-        )
-        can_pre_land_coast = (
-            (220.0 < x_rem < 285.0)
-            and (env.v_curr > 11.8)
-            and (b_land_cand > 0.72)
-            and (env.d_hat >= -0.04)
-        )
-        if can_zone_coast:
-            h_energy = -(v_cmd_cand - (v_lim_280 + 0.40))
-        elif can_pre_land_coast:
-            h_energy = -(b_land_cand - 0.70)
+        if is_ucb_dmps:
+            v_lim_280 = (
+                v_lim_280_pre
+                if v_lim_280_pre is not None
+                else self.corridor.get_speed_limit(min(self.corridor.station_x_m, env.x_curr + 280.0))
+            )
+            can_zone_coast = (
+                (env.v_curr > 14.0)
+                and (v_lim_280 < env.v_curr - 1.0)
+                and (v_cmd_cand > v_lim_280 + 0.45)
+                and (env.d_hat >= -0.05)
+            )
+            can_pre_land_coast = (
+                (220.0 < x_rem < 285.0)
+                and (env.v_curr > 11.8)
+                and (b_land_cand > 0.72)
+                and (env.d_hat >= -0.04)
+            )
+            if can_zone_coast:
+                h_energy = -(v_cmd_cand - (v_lim_280 + 0.40))
+            elif can_pre_land_coast:
+                h_energy = -(b_land_cand - 0.70)
+            else:
+                h_energy = 0.50
         else:
+            # Switch MPS and 1-Step DCBF do not use predictive eco-coasting contracts:
             h_energy = 0.50
 
         # 5. Deadline Gust-Compensation Certifier (C3_DEADLINE_RECOVERY)
@@ -406,7 +414,8 @@ class GoodallTrajectoryShield:
         if min_margin >= 0.0:
             self.active_contract = "C0_NOMINAL_BALANCED"
             self.update_contract_ucb_statistics("C0_NOMINAL_BALANCED", 1.0 - max(pressures.values()))
-            if self.latch_steps_rem > 0:
+            # Only UCB-DMPS ("mps_rollout") maintains a multi-step contract horizon latch:
+            if self.cfg.mode == "mps_rollout" and self.latch_steps_rem > 0:
                 self.latch_steps_rem -= 1
                 r99_now = self.cfg.z_sigma * self.sigma_tube_curr
                 v_max_latch = max(1.5, v_ceil_cached - r99_now - 0.02)
@@ -424,6 +433,41 @@ class GoodallTrajectoryShield:
         self.total_interventions += 1
         self.property_counts[worst_prop] += 1
 
+        p_task = np.array([v_cmd_task, a_start_task, b_land_task], dtype=np.float64)
+
+        if self.cfg.mode == "switch":
+            # Classic Switch MPS: hard safety/deadline fallback with nominal ramps (no Eco/Jerk contracts, no latch)
+            r99_now = self.cfg.z_sigma * self.sigma_tube_curr
+            v_max_w1 = max(1.5, v_ceil_cached - r99_now - 0.02)
+            v_sw = float(np.clip(v_pace_feasible - 0.25 * env.d_hat, 1.5, v_max_w1))
+            p_sw = np.array([v_sw, 0.96, 0.78], dtype=np.float64)
+            diff = float(np.sum(np.abs(p_sw - p_task)))
+            return float(p_sw[0]), float(p_sw[1]), float(p_sw[2]), True, diff, worst_prop
+
+        if self.cfg.mode == "cbf_opt":
+            # 1-Step DCBF: minimal 1-step simplex bisection onto the safety boundary (no latch, no Eco contract)
+            r99_now = self.cfg.z_sigma * self.sigma_tube_curr
+            v_max_w1 = max(1.5, v_ceil_cached - r99_now - 0.02)
+            v_cbf_fb = float(np.clip(v_pace_feasible - 0.28 * env.d_hat, 1.5, v_max_w1))
+            p_cbf_fb = np.array([v_cbf_fb, min(a_start_task, 0.92), min(b_land_task, 0.76)], dtype=np.float64)
+            lo, hi = 0.0, 1.0
+            for _ in range(4):
+                mid = 0.5 * (lo + hi)
+                p_mid = (1.0 - mid) * p_task + mid * p_cbf_fb
+                m_mid, _ = self.evaluate_hierarchical_pressures_and_margins(
+                    env, float(p_mid[0]), float(p_mid[1]), float(p_mid[2]),
+                    v_pace_feasible, v_ceil_pre=v_ceil_cached,
+                    v_lim_280_pre=v_lim_280_cached, rho_E_pre=rho_E_cached,
+                )
+                if m_mid[worst_prop] >= -1e-4 and m_mid["speed_limit"] >= -1e-4:
+                    hi = mid
+                else:
+                    lo = mid
+            p_safe = (1.0 - hi) * p_task + hi * p_cbf_fb
+            diff = float(np.sum(np.abs(p_safe - p_task)))
+            return float(p_safe[0]), float(p_safe[1]), float(p_safe[2]), True, diff, worst_prop
+
+        # Mode 3 ("mps_rollout"): Full Assume-Guarantee Contract Library L_cert + UCB Selector + Latch
         prop_to_contract = {
             "speed_limit": "C1_SPEED_SCISSOR_CLAMP",
             "smoothness": "C2_COMFORT_JERK_DAMP",
@@ -434,39 +478,9 @@ class GoodallTrajectoryShield:
         }
         primary_contract = prop_to_contract.get(worst_prop, "C3_DEADLINE_RECOVERY")
         self.active_contract = primary_contract
-
-        p_task = np.array([v_cmd_task, a_start_task, b_land_task], dtype=np.float64)
         p_fb = self.execute_contract_backup_policy(
             env, primary_contract, v_cmd_task, a_start_task, b_land_task, v_pace_feasible, v_ceil_pre=v_ceil_cached
         )
-
-        if self.cfg.mode == "switch":
-            self.latched_a_cap, self.latched_b_cap, self.latch_steps_rem = float(p_fb[1]), float(p_fb[2]), 14
-            diff = float(np.sum(np.abs(p_fb - p_task)))
-            return float(p_fb[0]), float(p_fb[1]), float(p_fb[2]), True, diff, worst_prop
-
-        if self.cfg.mode == "cbf_opt":
-            lo, hi = 0.0, 1.0
-            for _ in range(4):
-                mid = 0.5 * (lo + hi)
-                p_mid = (1.0 - mid) * p_task + mid * p_fb
-                m_mid, _ = self.evaluate_hierarchical_pressures_and_margins(
-                    env, float(p_mid[0]), float(p_mid[1]), float(p_mid[2]),
-                    v_pace_feasible, v_ceil_pre=v_ceil_cached,
-                    v_lim_280_pre=v_lim_280_cached, rho_E_pre=rho_E_cached,
-                )
-                if (
-                    m_mid[worst_prop] >= -1e-4
-                    and m_mid["speed_limit"] >= -1e-4
-                    and m_mid["smoothness"] >= -1e-4
-                ):
-                    hi = mid
-                else:
-                    lo = mid
-            p_safe = (1.0 - hi) * p_task + hi * p_fb
-            self.latched_a_cap, self.latched_b_cap, self.latch_steps_rem = float(p_safe[1]), float(p_safe[2]), 14
-            diff = float(np.sum(np.abs(p_safe - p_task)))
-            return float(p_safe[0]), float(p_safe[1]), float(p_safe[2]), True, diff, worst_prop
 
         # Mode 3 ("mps_rollout"): Deduplicated UCB Contract Selector + Lazy 2-Step Rollout Certification
         total_n = max(1.0, sum(self.contract_counts.values()))
