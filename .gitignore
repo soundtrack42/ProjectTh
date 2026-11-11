@@ -2,3 +2,4 @@ Env/
 __pycache__/
 *.pyc
 *.png
+*.csv
