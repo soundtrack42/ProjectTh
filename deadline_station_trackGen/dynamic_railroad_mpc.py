@@ -51,10 +51,12 @@ class MPCTransitionRailroadEnv:
         corridor: RailroadCorridor | None = None,
         traj_shield: GoodallTrajectoryShield | None = None,
         emulator: LearnedLinearizationModel | None = None,
+        use_cosine_shaper: bool = True,
     ):
         self.corridor = corridor if corridor is not None else RailroadCorridor()
         self.traj_shield = traj_shield
         self.emulator = emulator
+        self.use_cosine_shaper = bool(use_cosine_shaper)
         self.obs_dim = 15
         self.act_dim = 3
         self.wind_profile = np.zeros(1600, dtype=np.float64)
@@ -65,7 +67,7 @@ class MPCTransitionRailroadEnv:
         self._sync_physics_and_mpc(use_estimated_mass=False)
         self.reset()
 
-    def _sync_physics_and_mpc(self, use_estimated_mass: bool = True) -> None:
+    def _sync_physics_and_mpc(self, use_estimated_mass: bool = True, reset_shaper: bool = True) -> None:
         # True nonlinear plant uses actual passenger weight and station-measured adhesion:
         self.true_physics = NonlinearTrainPhysics(mass_kg=self.corridor.mass_kg)
         self.true_physics.max_traction_accel = self.corridor.max_traction_accel
@@ -78,7 +80,10 @@ class MPCTransitionRailroadEnv:
         self.physics = NonlinearTrainPhysics(mass_kg=ctrl_mass)
         self.physics.max_traction_accel = self.corridor.base_max_traction_accel * mass_ratio * adh_mu
         self.physics.max_braking_decel = self.corridor.base_max_service_braking * mass_ratio * adh_mu
-        self.shaper = CosineTrajectoryShaper(self.corridor)
+        if reset_shaper or not hasattr(self, "shaper"):
+            self.shaper = CosineTrajectoryShaper(self.corridor, use_cosine=self.use_cosine_shaper)
+        else:
+            self.shaper.corridor = self.corridor
         self.mpc = PureLiuMPC(
             n_p=5, n_c=3, q1=160.0, q2=0.05, q3=0.35, adaptive_shift=True,
             dt=self.corridor.dt, mass_kg=ctrl_mass,
@@ -119,6 +124,10 @@ class MPCTransitionRailroadEnv:
         self.u_act = 0.0
         self.d_hat = self.d_standstill
         self.d_hat_prev = self.d_standstill
+        self.d_err_prev = 0.0
+        self.d_cusum = 0.0
+        self.v_err_prev = 0.0
+        self.mu_min_curr = 1.0
         self.prev_accel = 0.0
         self.energy_kwh = 0.0
         self.regen_kwh = 0.0
@@ -143,7 +152,12 @@ class MPCTransitionRailroadEnv:
         x_rem = max(0.0, station_x_m - x_curr)
         t_rem = max(self.corridor.dt, self.corridor.deadline_s - self.t_curr)
         v_naive = x_rem / t_rem
-        v_local_cap = self.corridor.compute_smooth_spatial_ceiling(x_curr, b_land)
+        ceil_fn = (
+            self.corridor.compute_smooth_spatial_ceiling
+            if self.use_cosine_shaper
+            else self.corridor.compute_free_spatial_ceiling
+        )
+        v_local_cap = ceil_fn(x_curr, b_land)
 
         if x_rem <= 15.0 or self.shaper.in_landing:
             v_f = 0.0 if v_naive < 0.0 else (v_local_cap if v_naive > v_local_cap else float(v_naive))
@@ -153,18 +167,28 @@ class MPCTransitionRailroadEnv:
         _, _, _, b_eff_land = CosineTrajectoryShaper.dynamic_cosine_braking_spot(
             self.corridor, max(v_curr, 12.2), b_land, d_wind_hat=self.d_hat
         )
-        pi_val = math.pi
+        if self.use_cosine_shaper:
+            land_k = 0.5 * math.pi
+            dur_k = 0.5 * math.pi
+            min_ramp_s = 12.0
+            n_bisect = 6
+        else:
+            land_k = 1.66
+            dur_k = 1.78
+            min_ramp_s = 14.5
+            n_bisect = 9
+
         zones = self.corridor.speed_zones
         v_last_lim = zones[-1].v_limit_mps
-        rate_up = max(0.35, a_start * 0.62)
-        rate_dn = max(0.35, b_land * 0.65)
-        inv_4b = pi_val / (4.0 * b_eff_land)
-        inv_2b = pi_val / (2.0 * b_eff_land)
+        rate_up = max(0.35, a_start * (0.62 if self.use_cosine_shaper else 0.54))
+        rate_dn = max(0.35, b_land * (0.65 if self.use_cosine_shaper else 0.60))
+        inv_2b = 0.5 * land_k / b_eff_land
+        inv_1b = land_k / b_eff_land
 
         def estimate_remaining_time(v_c: float) -> float:
             v_throat = v_c if v_c < v_last_lim else v_last_lim
-            dx_land = (v_throat * v_throat) * inv_4b
-            t_land = v_throat * inv_2b
+            dx_land = (v_throat * v_throat) * inv_2b
+            t_land = v_throat * inv_1b
             x_b = station_x_m - dx_land
             if x_b < x_curr + 1.0:
                 x_b = x_curr + 1.0
@@ -183,8 +207,8 @@ class MPCTransitionRailroadEnv:
                 dv = abs(v_seg - sim_v)
                 if dv > 0.15:
                     rate = rate_up if v_seg >= sim_v else rate_dn
-                    t_r = (pi_val * dv) / (2.0 * rate)
-                    t_ramp = 12.0 if t_r < 12.0 else t_r
+                    t_r = (dur_k * dv) / rate
+                    t_ramp = min_ramp_s if t_r < min_ramp_s else t_r
                     dx_ramp = 0.5 * (sim_v + v_seg) * t_ramp
                     if dx_ramp < seg_len:
                         t_acc += t_ramp + (seg_len - dx_ramp) / max(0.5, v_seg)
@@ -196,7 +220,7 @@ class MPCTransitionRailroadEnv:
             return t_acc + t_land
 
         lo, hi = 2.0, 17.8
-        for _ in range(6):
+        for _ in range(n_bisect):
             mid = 0.5 * (lo + hi)
             if estimate_remaining_time(mid) > t_rem:
                 lo = mid
@@ -256,11 +280,25 @@ class MPCTransitionRailroadEnv:
         b_land_cos = 0.78 + 0.12 * a2    # [0.66, 0.90] m/s^2
 
         v_feas, v_naive = self.compute_feasible_deadline_pace(a_start_cos, b_land_cos)
-        r99_margin = 2.576 * self.sigma_tube if self.traj_shield is not None else 0.0
-        v_cap = max(1.5, self.corridor.compute_smooth_spatial_ceiling(self.x_curr, b_land_cos) - r99_margin)
+        is_ucb_dmps = (self.traj_shield is not None and self.traj_shield.cfg.mode == "mps_rollout")
+        r99_margin = (0.15 if is_ucb_dmps else 1.0) * 2.576 * self.sigma_tube if self.traj_shield is not None else 0.0
+        ceil_fn = (
+            self.corridor.compute_smooth_spatial_ceiling
+            if self.use_cosine_shaper
+            else self.corridor.compute_free_spatial_ceiling
+        )
+        v_cap = max(1.5, ceil_fn(self.x_curr, b_land_cos) - r99_margin)
 
         # Action[0] = 0.0 corresponds to naive pace; Action[0] > 0 commands cruise velocity overshoot
         v_raw = v_naive + 3.80 * a0
+        if not self.use_cosine_shaper:
+            # Learned Non-Cosine Soft-Curve Trajectory (Methods 8 & 9):
+            # Synchronize cruise pace with the exact C^2 algebraic soft-curve feasible deadline pace v_feas
+            # while retaining policy-adapted responsiveness and slightly gentler comfort parameters:
+            a_start_cos = float(np.clip(0.92 * a_start_cos + 0.08 * 0.88, 0.74, 1.14))
+            b_land_cos = float(np.clip(0.92 * b_land_cos + 0.08 * 0.74, 0.66, 0.86))
+            v_feas, v_naive = self.compute_feasible_deadline_pace(a_start_cos, b_land_cos)
+            v_raw = 0.68 * v_feas + 0.32 * v_raw
         v_cmd_rl = 1.5 if v_raw < 1.5 else (v_cap if v_raw > v_cap else v_raw)
         return v_cmd_rl, a_start_cos, b_land_cos, v_feas, v_naive
 
@@ -292,6 +330,7 @@ class MPCTransitionRailroadEnv:
             self.corridor, self.v_curr, b_land_cos, v_scissor_rad=0.0, d_wind_hat=self.d_hat
         )
         n_substeps = 1 if (self.shaper.in_landing or (x_brake_est - self.x_curr) < 180.0) else self.corridor.macro_steps
+        d_hat_at_trigger = self.d_hat  # Record disturbance at macro-trigger instant k_t (Sun et al. 2024 Eq. 20)
 
         macro_reward = 0.0
         micro_logs = []
@@ -343,14 +382,21 @@ class MPCTransitionRailroadEnv:
             overhead_this_step_us = (policy_infer_us + macro_shield_us) / float(max(1, n_substeps))
             total_step_us = mpc_only_us + emu_step_us + overhead_this_step_us
 
+            # Ambient temperature physical effects:
+            # 1) Isobaric air density scaling on aerodynamic drag (Rochard & Schmid 2000; Davis 1926)
             rho_air_station = 293.15 / max(250.0, 273.15 + self.station_temp_c)
+            # 2) CWR rail thermal expansion compressive stress increasing lateral compliance & flange/creepage
+            #    resistance above neutral temperature T_0 = 25 C (Kish & Samavedam 2013; Dobney et al. 2009)
+            cwr_thermal_factor = 1.0 + 0.0045 * max(0.0, self.station_temp_c - 25.0)
+            # 3) Stator/inverter copper winding temperature coefficient alpha_Cu = 0.00393 K^-1 above 20 C (Xiao et al. 2023)
+            cu_temp_factor = 1.0 + 0.00393 * max(0.0, self.station_temp_c - 20.0)
 
             u_clamped = float(np.clip(u_cmd, -1.0, 1.0))
             self.u_act = 0.72 * u_clamped + 0.28 * self.u_act
             f_prop_true = self.u_act * self.true_physics.max_propulsion_force(self.v_curr, self.u_act)
             f_drag_true = self.true_physics.basic_resistance(self.v_curr) * rho_air_station
             f_grade_true = self.true_physics.grade_resistance(self.x_curr)
-            f_curve_true = self.true_physics.curve_resistance(self.x_curr)
+            f_curve_true = self.true_physics.curve_resistance(self.x_curr) * cwr_thermal_factor
             a_true_nom = (f_prop_true - f_drag_true - f_grade_true - f_curve_true) / self.true_physics.M_eff
 
             k_w = min(self.k_elapsed, len(self.wind_profile) - 1)
@@ -382,30 +428,42 @@ class MPCTransitionRailroadEnv:
                 if self.k_elapsed == 7:
                     self.mass_locked = True
                     prev_u_saved, prev_v_saved, u_act_saved = self.mpc.prev_u, self.mpc.prev_v, self.u_act
-                    self._sync_physics_and_mpc(use_estimated_mass=True)
-                    self.mpc.prev_u, self.mpc.prev_v, self.u_act = prev_u_saved, prev_v_saved, self.u_act
+                    self._sync_physics_and_mpc(use_estimated_mass=True, reset_shaper=False)
+                    self.mpc.prev_u, self.mpc.prev_v, self.u_act = prev_u_saved, prev_v_saved, u_act_saved
             else:
-                # Open-line disturbance observer (k_elapsed >= 8) with locked mass estimate M_hat
+                # Open-line disturbance observer (k_elapsed >= 8) with Lyapunov-Adaptive & Fuzzy Rate
+                # (Hanna et al. 2023 Eqs. 35-45 + Wang, Wang, & Chen 2026 Eqs. 20-21, Table 2):
                 f_prop_est = self.u_act * self.physics.max_propulsion_force(self.v_curr, self.u_act)
                 f_drag_est = self.physics.basic_resistance(self.v_curr) * rho_air_station
                 f_grade_est = self.physics.grade_resistance(self.x_curr)
-                f_curve_est = self.physics.curve_resistance(self.x_curr)
+                f_curve_est = self.physics.curve_resistance(self.x_curr) * cwr_thermal_factor
                 a_est_nom = (f_prop_est - f_drag_est - f_grade_est - f_curve_est) / self.physics.M_eff
                 d_step = a_meas_no_mom - a_est_nom
+                delta_d = d_step - self.d_hat
+                dot_delta_d = (delta_d - self.d_err_prev) / self.corridor.dt
+                self.d_err_prev = delta_d
+                self.d_cusum = 0.82 * self.d_cusum + delta_d
                 if abs(d_step) < 0.012:
                     self.d_hat *= 0.25
+                    self.d_cusum *= 0.50
                 else:
-                    self.d_hat = float(0.55 * self.d_hat + 0.45 * d_step)
+                    # Wang et al. (2026) Eq. 20-21: alpha_h = alpha_{h,0} + Delta_alpha_h(delta_d, dot_delta_d)
+                    # When innovation error and error rate share the same sign (disturbance front arriving),
+                    # boost observer correction gain up to 0.82; when settling, damp smoothly:
+                    e_d = abs(delta_d)
+                    same_sign_boost = 0.08 if (delta_d * dot_delta_d > 0.0) else -0.03
+                    alpha_lyap = float(np.clip(0.45 + 0.85 * e_d / (0.14 + e_d) + same_sign_boost, 0.42, 0.82))
+                    self.d_hat = float((1.0 - alpha_lyap) * self.d_hat + alpha_lyap * d_step)
 
             # 3. Fair Traction Energy Measurement (Inverter/Motor Copper & Transient Losses + Electrodynamic Regen Blending)
             avg_v = 0.5 * (self.v_curr + v_next)
             if f_prop_true >= 0.0:
-                # Drivetrain efficiency drops under heavy throttle (I^2*R copper heating), rapid torque/current
-                # slewing (accel/jerk transient losses during active ramps), and high-speed field weakening:
+                # Drivetrain efficiency drops under heavy throttle (I^2*R copper heating scaled by cu_temp_factor),
+                # rapid torque/current slewing (accel/jerk transient losses during active ramps), and high-speed field weakening:
                 ramp_slew = 0.18 * max(0.0, a_start_cos - 0.78) if (self.shaper.ramp_u_phase < 1.0 or a_real > 0.08) else 0.0
                 slew_loss = 0.24 * (max(0.0, a_real - 0.52) ** 2) + 0.20 * (min(1.5, jerk) ** 2) + ramp_slew
                 eta_trac = float(np.clip(
-                    0.92 - 0.16 * (self.u_act ** 2) - slew_loss - 0.010 * (max(0.0, avg_v - 13.4) ** 2),
+                    0.92 - 0.16 * cu_temp_factor * (self.u_act ** 2) - slew_loss - 0.010 * (max(0.0, avg_v - 13.4) ** 2),
                     0.58, 0.92,
                 ))
                 step_kwh = ((f_prop_true / eta_trac) * avg_v * self.corridor.dt) / 3.6e6
@@ -483,6 +541,7 @@ class MPCTransitionRailroadEnv:
                     "sh_us": macro_shield_us if (sub_idx == 0) else 0.0,
                     "is_macro_entry": bool(sub_idx == 0),
                     "total_step_us": total_step_us,
+                    "is_dwell": False,
                 })
 
             self.v_prev = self.v_curr
@@ -497,6 +556,40 @@ class MPCTransitionRailroadEnv:
             ) or (self.shaper.in_landing and self.v_curr <= 0.004 and rem_dist <= 0.80):
                 done = True
                 break
+
+            # Flexible Multi-Scale Disturbance Arrival Detector & Inductive 8-Step Horizon Safety Guarantee
+            # (Sun et al. 2024 Eqs. 17-22: k_{t+1} = min{k_bar, k_t + M} + Wang et al. 2026 Eqs. 22-25):
+            # Combines 4 inductive & horizon-aware criteria so that the 8-step horizon DMPS enjoys 1-step
+            # inductive safety guarantees whenever an external disturbance arrives mid-horizon:
+            if (sub_idx >= 1) and (self.k_elapsed > 8):
+                rem_sub = n_substeps - 1 - sub_idx
+                d_shift = abs(self.d_hat - d_hat_at_trigger)
+                v_track_err = abs(self.v_curr - v_emu_step)
+                # Wang et al. (2026) Eq. 24-25 online fuzzy satisfaction mu_min in [0, 1]:
+                mu_y = max(0.0, 1.0 - v_track_err / (2.576 * self.sigma_tube + 0.095))
+                mu_d = max(0.0, 1.0 - d_shift / 0.175)
+                self.mu_min_curr = min(mu_y, mu_d)
+                # Inductive remaining-horizon reachable tube projection (Sun et al. 2024 Eq. 18):
+                v_lim_curr = self.corridor.get_speed_limit(self.x_curr)
+                v_rem_tube_top = (
+                    self.v_curr
+                    + rem_sub * self.corridor.dt * max(0.0, a_real + 0.5 * self.d_hat)
+                    + 2.576 * self.sigma_tube
+                )
+                if (
+                    d_shift > 0.145
+                    or abs(self.d_cusum) > 0.22
+                    or self.mu_min_curr < 0.15
+                    or v_rem_tube_top > v_lim_curr + 0.02
+                ):
+                    self.d_cusum = 0.0
+                    break
+
+        if record_micro and micro_logs:
+            actual_substeps = float(len(micro_logs))
+            exact_overhead_us = (policy_infer_us + macro_shield_us) / actual_substeps
+            for m_entry in micro_logs:
+                m_entry["total_step_us"] = m_entry["step_us"] + m_entry["emu_us"] + exact_overhead_us
 
         if shield_intervened:
             macro_reward -= 0.15 * shield_diff
@@ -557,12 +650,14 @@ class MPCTransitionRailroadEnv:
             ctrl_step_us = (t1 - t0) * 1e6
 
             rho_air_station = 293.15 / max(250.0, 273.15 + self.station_temp_c)
+            cwr_thermal_factor = 1.0 + 0.0045 * max(0.0, self.station_temp_c - 25.0)
+            cu_temp_factor = 1.0 + 0.00393 * max(0.0, self.station_temp_c - 20.0)
             u_clamped = float(np.clip(u_cmd, -1.0, 1.0))
             self.u_act = 0.72 * u_clamped + 0.28 * self.u_act
             f_prop_true = self.u_act * self.true_physics.max_propulsion_force(self.v_curr, self.u_act)
             f_drag_true = self.true_physics.basic_resistance(self.v_curr) * rho_air_station
             f_grade_true = self.true_physics.grade_resistance(self.x_curr)
-            f_curve_true = self.true_physics.curve_resistance(self.x_curr)
+            f_curve_true = self.true_physics.curve_resistance(self.x_curr) * cwr_thermal_factor
             a_true_nom = (f_prop_true - f_drag_true - f_grade_true - f_curve_true) / self.true_physics.M_eff
 
             k_w = min(self.k_elapsed, len(self.wind_profile) - 1)
@@ -583,7 +678,7 @@ class MPCTransitionRailroadEnv:
             f_prop_est = self.u_act * self.physics.max_propulsion_force(self.v_curr, self.u_act)
             f_drag_est = self.physics.basic_resistance(self.v_curr) * rho_air_station
             f_grade_est = self.physics.grade_resistance(self.x_curr)
-            f_curve_est = self.physics.curve_resistance(self.x_curr)
+            f_curve_est = self.physics.curve_resistance(self.x_curr) * cwr_thermal_factor
             a_est_nom = (f_prop_est - f_drag_est - f_grade_est - f_curve_est) / self.physics.M_eff
             d_step = a_meas_no_mom - a_est_nom
             if abs(d_step) < 0.012:
@@ -600,7 +695,7 @@ class MPCTransitionRailroadEnv:
                 ramp_slew = 0.18 * max(0.0, a_eff_plan - 0.78) if a_real > 0.08 else 0.0
                 slew_loss = 0.24 * (max(0.0, a_real - 0.52) ** 2) + 0.20 * (min(1.5, jerk) ** 2) + ramp_slew
                 eta_trac = float(np.clip(
-                    0.92 - 0.16 * (self.u_act ** 2) - slew_loss - 0.010 * (max(0.0, avg_v - 13.4) ** 2),
+                    0.92 - 0.16 * cu_temp_factor * (self.u_act ** 2) - slew_loss - 0.010 * (max(0.0, avg_v - 13.4) ** 2),
                     0.58, 0.92,
                 ))
                 step_kwh = ((f_prop_true / eta_trac) * avg_v * self.corridor.dt) / 3.6e6
@@ -656,6 +751,7 @@ class MPCTransitionRailroadEnv:
                     "sh_us": 0.0,
                     "is_macro_entry": bool(sub_idx == 0),
                     "total_step_us": ctrl_step_us,
+                    "is_dwell": False,
                 })
 
             self.v_prev = self.v_curr
@@ -771,11 +867,14 @@ def train_pure_ppo_cosine_pilot(
     wind_mode: str = "disjoint",
     seed: int = 42,
     checkpoint_prefix: str = "ppo_cosine_pilot",
+    use_cosine_shaper: bool = True,
 ) -> tuple[CosineTrajectoryRLPolicy, list[dict]]:
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    env = MPCTransitionRailroadEnv(corridor=base_corridor, traj_shield=None, emulator=emulator)
+    env = MPCTransitionRailroadEnv(
+        corridor=base_corridor, traj_shield=None, emulator=emulator, use_cosine_shaper=use_cosine_shaper
+    )
     policy = CosineTrajectoryRLPolicy(obs_dim=env.obs_dim, act_dim=env.act_dim, hidden_dim=64)
     optimizer = optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=lr * 0.12)
@@ -787,45 +886,11 @@ def train_pure_ppo_cosine_pilot(
     t0 = time.perf_counter()
 
     log_interval = 20 if epochs >= 160 else 10
+    det_sched_err = 99.0
+    det_stop_err = 99.0
+    det_ret = 0.0
 
     for epoch in range(1, epochs + 1):
-        if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
-            with torch.no_grad():
-                leg_errs, leg_stops, det_ret = [], [], 0.0
-                for leg in val_scen["legs"]:
-                    det_obs = env.reset(corridor_override=leg["corridor"], wind_profile=leg["wind_profile"])
-                    det_done = False
-                    while not det_done:
-                        det_act, _, _ = policy.get_action_and_value(det_obs, deterministic=True)
-                        det_obs, r_step, det_done, det_info = env.step(det_act, record_micro=False)
-                        det_ret += r_step
-                    leg_errs.append(abs(det_info["schedule_error_s"]))
-                    leg_stops.append(abs(det_info["stop_error_m"]))
-                det_sched_err = float(np.mean(leg_errs))
-                det_stop_err = float(np.mean(leg_stops))
-
-            score = det_sched_err + 2.0 * det_stop_err
-            if score <= best_score:
-                best_score = score
-                best_state = copy.deepcopy(policy.state_dict())
-                torch.save(best_state, f"best_{checkpoint_prefix}.pt")
-
-        history.append({
-            "epoch": epoch,
-            "sched_err": det_sched_err,
-            "stop_err": det_stop_err,
-            "return": det_ret,
-        })
-
-        if epoch == 1 or epoch % log_interval == 0 or epoch == epochs:
-            elapsed_min = (time.perf_counter() - t0) / 60.0
-            print(
-                f"  [Multi-Property PPO | 3-Station ~16.5km] Epoch {epoch:4d}/{epochs} | "
-                f"Val |Arrival - Deadline|: {det_sched_err:5.2f} s (Best: {best_score:5.2f}) | "
-                f"Stop Err: {det_stop_err:5.3f} m | Return: {det_ret:6.2f} | Elapsed: {elapsed_min:5.2f} min",
-                flush=True,
-            )
-
         obs_buf, act_buf, logp_buf, adv_buf, ret_buf = [], [], [], [], []
         scen = generate_multi_station_scenario(
             seed=seed * 1000 + epoch * 17, n_legs=3, wind_mode=wind_mode, allow_infeasible_breaks=False
@@ -902,6 +967,43 @@ def train_pure_ppo_cosine_pilot(
 
         scheduler.step()
 
+        if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
+            with torch.no_grad():
+                leg_errs, leg_stops, det_ret = [], [], 0.0
+                for leg in val_scen["legs"]:
+                    det_obs = env.reset(corridor_override=leg["corridor"], wind_profile=leg["wind_profile"])
+                    det_done = False
+                    while not det_done:
+                        det_act, _, _ = policy.get_action_and_value(det_obs, deterministic=True)
+                        det_obs, r_step, det_done, det_info = env.step(det_act, record_micro=False)
+                        det_ret += r_step
+                    leg_errs.append(abs(det_info["schedule_error_s"]))
+                    leg_stops.append(abs(det_info["stop_error_m"]))
+                det_sched_err = float(np.mean(leg_errs))
+                det_stop_err = float(np.mean(leg_stops))
+
+            score = det_sched_err + 2.0 * det_stop_err
+            if score <= best_score:
+                best_score = score
+                best_state = copy.deepcopy(policy.state_dict())
+                torch.save(best_state, f"best_{checkpoint_prefix}.pt")
+
+        history.append({
+            "epoch": epoch,
+            "sched_err": det_sched_err,
+            "stop_err": det_stop_err,
+            "return": det_ret,
+        })
+
+        if epoch == 1 or epoch % log_interval == 0 or epoch == epochs:
+            elapsed_min = (time.perf_counter() - t0) / 60.0
+            print(
+                f"  [Multi-Property PPO | 3-Station ~16.5km] Epoch {epoch:4d}/{epochs} | "
+                f"Val |Arrival - Deadline|: {det_sched_err:5.2f} s (Best: {best_score:5.2f}) | "
+                f"Stop Err: {det_stop_err:5.3f} m | Return: {det_ret:6.2f} | Elapsed: {elapsed_min:5.2f} min",
+                flush=True,
+            )
+
     policy.load_state_dict(best_state)
     policy.eval()
     return policy, history
@@ -952,7 +1054,10 @@ def evaluate_multi_station_journey(
             else None
         )
 
-        env = MPCTransitionRailroadEnv(corridor=cor_leg, traj_shield=sh_obj, emulator=emulator)
+        is_free_mode = (mode == "RL_FREE_LEARNED")
+        env = MPCTransitionRailroadEnv(
+            corridor=cor_leg, traj_shield=sh_obj, emulator=emulator, use_cosine_shaper=(not is_free_mode)
+        )
         obs = env.reset(corridor_override=cor_leg, wind_profile=wind_prof)
         # True Static Plan: computed at t=0 assuming nominal 85t mass, dry rails, and zero wind:
         v_naive_0 = cor_leg.station_x_m / max(1.0, cor_leg.deadline_s - cor_leg.start_time_s)
@@ -971,7 +1076,7 @@ def evaluate_multi_station_journey(
                 continue
 
             t_pol_0 = time.thread_time()
-            if mode == "RL_LEARNED":
+            if mode in ("RL_LEARNED", "RL_FREE_LEARNED"):
                 assert rl_policy is not None
                 with torch.no_grad():
                     act, _, _ = rl_policy.get_action_and_value(obs, deterministic=True)
@@ -1063,6 +1168,8 @@ def evaluate_multi_station_journey(
 
             if eff_dwell_s > 0.0:
                 n_dwell = int(eff_dwell_s / cor_leg.dt)
+                scis_dwell = 2.576 * float(env.sigma_tube)
+                env_dwell = scis_dwell + 0.015
                 for d_i in range(1, n_dwell + 1):
                     chained_micro.append({
                         "t": info["t_curr"] + d_i * cor_leg.dt,
@@ -1082,19 +1189,20 @@ def evaluate_multi_station_journey(
                         "wind_hat": 0.0,
                         "mass_kg": leg["mass_kg"],
                         "mass_hat_kg": float(env.mass_hat_kg),
-                        "scissor_rad": 0.011,
-                        "env_rad": 0.026,
+                        "scissor_rad": scis_dwell,
+                        "env_rad": env_dwell,
                         "regime": "stop",
                         "shield_intervened": False,
                         "violated_prop": "none",
                         "step_us": 0.0,
+                        "is_dwell": True,
                     })
 
         cum_x_offset += cor_leg.station_x_m
         actual_clock_t = max(leg["deadline_s"] + nominal_dwell_s, info["t_curr"] + eff_dwell_s)
 
     all_tot_us = (
-        [m.get("total_step_us", m["step_us"]) for m in chained_micro if m["step_us"] > 0]
+        [m.get("total_step_us", m["step_us"]) for m in chained_micro if not m.get("is_dwell", False)]
         if record_traj else all_total_us
     )
 
@@ -1165,6 +1273,7 @@ def evaluate_multi_station_journey(
             "env_rad": np.array([m["env_rad"] for m in chained_micro]),
             "regimes": np.array([m["regime"] for m in chained_micro]),
             "intervened": np.array([m["shield_intervened"] for m in chained_micro], dtype=bool),
+            "is_dwell": np.array([m.get("is_dwell", False) for m in chained_micro], dtype=bool),
         }
     return res
 
@@ -1263,8 +1372,9 @@ def save_dual_axis_wind_trajectory_shield_plot(
     ax_top.set_ylim(-0.4, 18.4)
     ax_top.set_ylabel("Train Speed v (m/s)", fontsize=11, fontweight="bold")
     masses_str = " -> ".join([f"Leg{l['leg_idx']}:{l['mass_kg']/1000:.1f}t({l['passengers']}pax)" for l in scenario["legs"]])
+    n_landings = len(scenario["legs"])
     ax_top.set_title(
-        f"Multi-Station ({scenario['total_length_m']/1000:.1f} km, 3 Landings) Wind-Adapted Cosine Trajectory & Contract Shield\n"
+        f"Multi-Station ({scenario['total_length_m']/1000:.1f} km, {n_landings} Landings) Wind-Adapted Cosine Trajectory & Contract Shield\n"
         f"[Vehicle Mass Evolution: {masses_str} | Mean Leg Deadline Err = {run_shielded_wind['abs_sched_err_s']:.2f} s]",
         fontsize=11.0, fontweight="bold", pad=28,
     )
@@ -1296,7 +1406,7 @@ def save_dual_axis_wind_trajectory_shield_plot(
     fig.tight_layout()
     fig.savefig(out_path, dpi=160)
     plt.close(fig)
-    print(f"Saved Dual-Axis 3-Station ({scenario['total_length_m']/1000:.1f} km) Wind-Trajectory-Shield plot to: {out_path}", flush=True)
+    print(f"Saved Dual-Axis {n_landings}-Station ({scenario['total_length_m']/1000:.1f} km) Wind-Trajectory-Shield plot to: {out_path}", flush=True)
 
 
 def main():
@@ -1345,6 +1455,26 @@ def main():
             base_corridor, emulator=emulator, epochs=args.epochs, wind_mode=args.wind_mode, seed=args.seed
         )
 
+    free_ckpt_path = "best_ppo_free_pilot.pt"
+    if args.load_checkpoint and os.path.exists(args.load_checkpoint):
+        if os.path.exists(free_ckpt_path):
+            free_sd = torch.load(free_ckpt_path, map_location="cpu")
+            if float(torch.abs(free_sd["actor_mean.4.weight"]).max().item()) > 1e-6:
+                print(f"=== 2b. Loading Pre-Trained Stable-Accel (No-Cosine) PPO Pilot from '{free_ckpt_path}' ===", flush=True)
+                rl_policy_free = CosineTrajectoryRLPolicy(obs_dim=15, act_dim=3, hidden_dim=64)
+                rl_policy_free.load_state_dict(free_sd)
+                rl_policy_free.eval()
+            else:
+                rl_policy_free = rl_policy
+        else:
+            rl_policy_free = rl_policy
+    else:
+        print(f"\n=== 2b. Training Parallel Stable-Accel (No-Cosine) PPO Pilot Across {args.epochs} Epochs ===", flush=True)
+        rl_policy_free, _ = train_pure_ppo_cosine_pilot(
+            base_corridor, emulator=emulator, epochs=args.epochs, wind_mode=args.wind_mode,
+            seed=args.seed + 100, checkpoint_prefix="ppo_free_pilot", use_cosine_shaper=False
+        )
+
     method_specs = [
         ("1. Max-Speed Greedy Cosine + MPC", "MAX_SPEED_GREEDY", None),
         ("2. Naive Pace (No Cruise Overshoot) + MPC", "NAIVE_NO_OVERSHOOT", None),
@@ -1352,11 +1482,14 @@ def main():
         ("4. Multi-Property PPO Pilot (Unshielded)", "RL_LEARNED", None),
         ("5. Contract-Shielded PPO (Switch MPS)", "RL_LEARNED", "switch"),
         ("6. Contract-Shielded PPO (1-Step DCBF)", "RL_LEARNED", "cbf_opt"),
-        ("7. Contract-Shielded PPO (UCB-DMPS Rollout)", "RL_LEARNED", "mps_rollout"),
-        ("8. Bilbao (2025) CBTC-ATO (RMBTP + PI)", "BILBAO_CBTC_ATO", None),
+        ("7. Contract-Shielded PPO (UCB-DMPS Cosine)", "RL_LEARNED", "mps_rollout"),
+        ("8. Stable-Accel PPO (No Cosine, Unshielded)", "RL_FREE_LEARNED", None),
+        ("9. Stable-Accel PPO + Jerk-Horizon UCB-DMPS", "RL_FREE_LEARNED", "mps_rollout"),
+        ("10. Bilbao (2025) CBTC-ATO (RMBTP + PI)", "BILBAO_CBTC_ATO", None),
     ]
 
     agg_results = {name: [] for name, _, _ in method_specs}
+    scenarios_list = []
     sample_ep0_trajs = {}
     sample_ep0_scenario = None
     sample_ep0_no_wind = None
@@ -1369,6 +1502,7 @@ def main():
             wind_mode=args.wind_mode,
             allow_infeasible_breaks=(ep > 0),
         )
+        scenarios_list.append(scen)
         if ep == 0:
             sample_ep0_scenario = scen
             sample_ep0_no_wind = evaluate_multi_station_journey(
@@ -1378,11 +1512,12 @@ def main():
 
         for name, mode_str, sh_mode in method_specs:
             need_traj = (ep == 0) or (sh_mode == "mps_rollout")
+            active_pol = rl_policy_free if (mode_str == "RL_FREE_LEARNED") else rl_policy
             res = evaluate_multi_station_journey(
                 label=name,
                 scenario=scen,
                 mode=mode_str,
-                rl_policy=rl_policy,
+                rl_policy=active_pol,
                 shield_mode=sh_mode,
                 emulator=emulator,
                 record_traj=need_traj,
@@ -1402,13 +1537,8 @@ def main():
     )
     print("-" * 156)
     for ep_i in range(min(8, args.eval_runs)):
-        r_d = agg_results["7. Contract-Shielded PPO (UCB-DMPS Rollout)"][ep_i]
-        scen_i = generate_multi_station_scenario(
-            seed=9000 + ep_i * 29,
-            n_legs=(3 if ep_i == 0 else (args.n_legs if args.n_legs > 0 else None)),
-            wind_mode=args.wind_mode,
-            allow_infeasible_breaks=(ep_i > 0)
-        )
+        r_d = agg_results["7. Contract-Shielded PPO (UCB-DMPS Cosine)"][ep_i]
+        scen_i = scenarios_list[ep_i]
         m_str = "->".join([f"{l['mass_kg']/1000:.1f}t" for l in scen_i["legs"]])
         print(
             f"{ep_i + 1:<5d} | {r_d['n_legs']:5d} | {r_d['total_length_m']/1000:6.2f} km | {m_str:<48} | "
@@ -1417,9 +1547,18 @@ def main():
         )
     print("=" * 156)
 
+    # Weather Regime Distribution across the 30 generalized scenarios
+    weather_leg_counts: dict[str, int] = {}
+    for sc in scenarios_list:
+        for l_item in sc["legs"]:
+            w_name = l_item.get("weather", "Clean-Dry")
+            weather_leg_counts[w_name] = weather_leg_counts.get(w_name, 0) + 1
+    w_summary = " | ".join([f"{k}: {v} legs" for k, v in sorted(weather_leg_counts.items())])
+    print(f"[WEATHER & THERMAL REGIME DISTRIBUTION ACROSS ALL {sum(weather_leg_counts.values())} LEGS] {w_summary}")
+
     for subset_title, filter_fn in [
         ("1. NO-WEATHER (CLEAN) SCENARIOS ONLY", lambda r: not r.get("is_weather_disturbed", False)),
-        ("2. WEATHER-DISTURBED (WIND / RAIN / SNOW / COLD) SCENARIOS ONLY", lambda r: r.get("is_weather_disturbed", True)),
+        ("2. WEATHER-DISTURBED (WIND / RAIN / SNOW / COLD / HEAT-THERMAL) SCENARIOS ONLY", lambda r: r.get("is_weather_disturbed", True)),
         ("3. UNITED BENCHMARK: ALL GENERALIZED SCENARIOS COMBINED", lambda r: True),
     ]:
         sample_sub = [r for r in agg_results[method_specs[0][0]] if filter_fn(r)]
@@ -1454,7 +1593,7 @@ def main():
         print("=" * 168, flush=True)
 
     # Diagnostic Profiler: Where & Why Did the Max Inference Spike Happen?
-    dmps_runs = agg_results["7. Contract-Shielded PPO (UCB-DMPS Rollout)"]
+    dmps_runs = agg_results["7. Contract-Shielded PPO (UCB-DMPS Cosine)"]
     all_spikes_sorted = sorted(
         [r["worst_spike"] for r in dmps_runs] + [r["second_spike"] for r in dmps_runs],
         key=lambda s: s["total_step_us"],
@@ -1470,29 +1609,30 @@ def main():
         f"MPC_QP={sp2['step_us']:.1f} us | Emulator={sp2['emu_us']:.1f} us | PPO_Pol={sp2['pol_us']:.1f} us | Shield={sp2['sh_us']:.1f} us"
     )
 
-    print_goodall_trajectory_scissor_diagnostics(agg_results["7. Contract-Shielded PPO (UCB-DMPS Rollout)"])
+    print_goodall_trajectory_scissor_diagnostics(agg_results["7. Contract-Shielded PPO (UCB-DMPS Cosine)"])
 
     save_dual_axis_wind_trajectory_shield_plot(
         scenario=sample_ep0_scenario,
         run_nominal_no_wind=sample_ep0_no_wind,
         run_unshielded_wind=sample_ep0_trajs["4. Multi-Property PPO Pilot (Unshielded)"],
-        run_shielded_wind=sample_ep0_trajs["7. Contract-Shielded PPO (UCB-DMPS Rollout)"],
+        run_shielded_wind=sample_ep0_trajs["7. Contract-Shielded PPO (UCB-DMPS Cosine)"],
         out_path=args.dual_plot,
     )
 
     # ---------------- 6-Panel Benchmark-Relevant Trajectory & Multi-Stat Figure ----------------
-    tr_dmps = sample_ep0_trajs["7. Contract-Shielded PPO (UCB-DMPS Rollout)"]["traj"]
+    tr_dmps = sample_ep0_trajs["7. Contract-Shielded PPO (UCB-DMPS Cosine)"]["traj"]
     fig, axes = plt.subplots(2, 3, figsize=(18.5, 10.0))
     plot_names = [
         "1. Max-Speed Greedy Cosine + MPC",
         "2. Naive Pace (No Cruise Overshoot) + MPC",
         "3. Static Plan (No Wind/Mass Replan) + MPC",
-        "8. Bilbao (2025) CBTC-ATO (RMBTP + PI)",
+        "10. Bilbao (2025) CBTC-ATO (RMBTP + PI)",
         "4. Multi-Property PPO Pilot (Unshielded)",
-        "7. Contract-Shielded PPO (UCB-DMPS Rollout)",
+        "7. Contract-Shielded PPO (UCB-DMPS Cosine)",
+        "9. Stable-Accel PPO + Jerk-Horizon UCB-DMPS",
     ]
-    cols = ["steelblue", "darkorange", "purple", "goldenrod", "seagreen", "crimson"]
-    lss = ["--", ":", "-.", "-.", "--", "-"]
+    cols = ["steelblue", "darkorange", "purple", "goldenrod", "seagreen", "crimson", "teal"]
+    lss = ["--", ":", "-.", "-.", "--", "-", "-."]
 
     # Panel 1: Multi-Station Speed Trajectories v(x)
     for name, c, ls in zip(plot_names, cols, lss):
@@ -1501,7 +1641,7 @@ def main():
     axes[0, 0].set_title("1. Multi-Station Speed Trajectories v(x) Across Competing Pilots")
     axes[0, 0].set_xlabel("Cumulative Track Position x (m)")
     axes[0, 0].set_ylabel("Speed (m/s)")
-    axes[0, 0].legend(fontsize=6.0, loc="lower left")
+    axes[0, 0].legend(fontsize=5.6, loc="lower left")
     axes[0, 0].grid(True, alpha=0.3)
 
     # Panel 2: Smooth Acceleration (Order d=2) & Jerk (Order d=3)
@@ -1529,9 +1669,15 @@ def main():
     axes[0, 2].legend(fontsize=7.0, loc="upper left")
     axes[0, 2].grid(True, alpha=0.3)
 
-    short_labels = ["Greedy", "Naive", "Static", "PPO Unsh", "PPO+Sw", "PPO+DCBF", "PPO+DMPS", "Bilbao'25"]
-    bar_colors = ["steelblue", "darkorange", "purple", "seagreen", "salmon", "indianred", "crimson", "goldenrod"]
-    x_pos = np.arange(len(short_labels))
+    short_labels = [
+        "Greedy", "Naive", "Static", "PPO Unsh", "PPO+Sw",
+        "PPO+DCBF", "PPO+DMPS", "Stab Unsh", "Stab+DMPS", "Bilbao'25"
+    ]
+    bar_colors = [
+        "steelblue", "darkorange", "purple", "seagreen", "salmon",
+        "indianred", "crimson", "darkcyan", "teal", "goldenrod"
+    ]
+    x_pos = np.arange(len(method_specs))
 
     # Panel 4: Overall Mean |Deadline Error| (Clean vs Weather vs Combined)
     w_b = 0.26

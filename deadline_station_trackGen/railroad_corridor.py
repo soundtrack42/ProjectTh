@@ -136,6 +136,68 @@ class RailroadCorridor:
         return float(v_here)
 
 
+    def compute_free_spatial_ceiling(self, x_m: float, b_shift_down: float = 0.78, alpha_soft: float = 0.36) -> float:
+        """
+        Shape-Free (Non-Cosine) C^2 Algebraic Soft-Curve spatial ceiling ahead of slower speed zones.
+        Uses a purely algebraic C^2 Hermite-flare deceleration profile (zero trigonometric functions)
+        bounded by Order-2 deceleration comfort and Order-3 jerk comfort.
+        """
+        v_here = self.get_speed_limit(x_m)
+        zones = self.speed_zones
+        has_near_drop = False
+        for z in zones:
+            if z.x_start > x_m and z.v_limit_mps < v_here and (z.x_start - x_m) < 380.0:
+                has_near_drop = True
+                break
+        if not has_near_drop:
+            return float(v_here)
+
+        b_eff = max(0.72, float(b_shift_down))
+        b_raw = b_eff / 0.78
+        b_ratio = 0.75 if b_raw < 0.75 else (1.25 if b_raw > 1.25 else b_raw)
+        bs_raw = b_eff * 0.76
+        b_safe = 0.42 if bs_raw < 0.42 else (0.74 if bs_raw > 0.74 else bs_raw)
+        j_max_zone = 0.22 * (b_ratio ** 1.6)
+        min_drop_dur = 14.0 / b_ratio
+        shape_k = 1.0 / (1.0 - alpha_soft)
+        inv_1ma = shape_k
+
+        for z in zones:
+            if z.x_start > x_m and z.v_limit_mps < v_here:
+                dx_to_zone = z.x_start - x_m
+                if dx_to_zone >= 380.0:
+                    continue
+                dv_drop = v_here - z.v_limit_mps
+                v_mean = 0.5 * (v_here + z.v_limit_mps)
+                # Algebraic C^2 soft-curve duration required by comfort deceleration and peak flare jerk:
+                t_acc_req = (shape_k * dv_drop) / b_safe
+                t_jrk_req = math.sqrt((1.5 * shape_k * dv_drop) / (alpha_soft * j_max_zone))
+                t_drop = min_drop_dur if min_drop_dur >= t_acc_req else t_acc_req
+                if t_jrk_req > t_drop:
+                    t_drop = t_jrk_req
+                dx_drop = v_mean * t_drop
+
+                if dx_to_zone < dx_drop and dx_drop > 1.0:
+                    u_raw = 1.0 - (dx_to_zone / dx_drop)
+                    u_s = 0.0 if u_raw < 0.0 else (1.0 if u_raw > 1.0 else u_raw)
+                    # Evaluate algebraic C^2 soft progression psi_soft(1 - u_s; alpha_soft):
+                    s = 1.0 - u_s
+                    if s < alpha_soft:
+                        tau = s / alpha_soft
+                        tau2 = tau * tau
+                        prog = alpha_soft * inv_1ma * (tau2 * tau - 0.5 * tau2 * tau2)
+                    elif s <= 1.0 - alpha_soft:
+                        prog = (s - 0.5 * alpha_soft) * inv_1ma
+                    else:
+                        tau = (1.0 - s) / alpha_soft
+                        tau2 = tau * tau
+                        prog = 1.0 - alpha_soft * inv_1ma * (tau2 * tau - 0.5 * tau2 * tau2)
+                    v_alg_zone = z.v_limit_mps + dv_drop * prog
+                    if v_alg_zone < v_here:
+                        v_here = v_alg_zone
+        return float(v_here)
+
+
 def generate_disjoint_wind_events(
     total_duration_s: float = 600.0,
     dt: float = 0.50,
@@ -338,8 +400,8 @@ def generate_multi_station_scenario(
                 w_prof, w_desc, w_meta = generate_disjoint_wind_events(
                     leg_budget_s + 150.0, 0.50, calm_deadband_mps2=0.22, seed=seed * 31 + leg_idx
                 )
-            # Sample unseen weather regime (Windy-Dry, Rain-WetRail, Cold-Humid, or Snow-Slush):
-            w_type = int(rng.choice([0, 1, 2, 3], p=[0.30, 0.30, 0.20, 0.20]))
+            # Sample unseen weather regime (Windy-Dry, Rain-WetRail, Cold-Humid, Snow-Slush, or Heat-Thermal):
+            w_type = int(rng.choice([0, 1, 2, 3, 4], p=[0.22, 0.24, 0.18, 0.18, 0.18]))
             if w_type == 0:
                 weather_name, mu_adhesion, temp_c = "Windy-Dry", 1.00, 16.0
             elif w_type == 1:
@@ -348,9 +410,13 @@ def generate_multi_station_scenario(
             elif w_type == 2:
                 weather_name, mu_adhesion, temp_c = "Cold-Humid", 0.92, -6.0
                 w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.12, 0.0)
-            else:
+            elif w_type == 3:
                 weather_name, mu_adhesion, temp_c = "Snow-Slush", 0.80, -3.0
                 w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.20, 0.0)
+            else:
+                # High-Temperature / Heatwave (CWR rail thermal expansion T_rail ~ 56 C, oxide-softened dry adhesion):
+                weather_name, mu_adhesion, temp_c = "Heat-Thermal", 0.94, 38.0
+                w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.05, 0.0)
 
         # Wayside station sensor at departure (t=0):
         station_wind_reading = float(w_prof[0] + rng.normal(0.0, 0.01)) if is_weather_active else 0.0
@@ -392,6 +458,7 @@ def generate_multi_station_scenario(
             "ticket_mass_kg": ticket_est_mass_kg,
             "weather": weather_name,
             "adhesion_mu": mu_adhesion,
+            "temp_c": temp_c,
             "is_infeasible": is_break,
             "wind_profile": w_prof,
             "wind_desc": w_desc,

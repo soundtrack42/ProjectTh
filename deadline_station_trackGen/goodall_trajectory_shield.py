@@ -93,15 +93,16 @@ class GoodallTrajectoryShield:
         else:
             self._emu_w1 = None
 
-        # Point directly to persistent learned UCB contract statistics:
-        self.contract_counts = GLOBAL_LEARNED_CONTRACT_COUNTS
-        self.contract_scores = GLOBAL_LEARNED_CONTRACT_SCORES
+        # Instance-scoped Discounted-UCB contract statistics (no cross-method global state leakage):
+        self.contract_counts: dict[str, float] = {c: 1.0 for c in CERTIFIED_CONTRACT_LIBRARY}
+        self.contract_scores: dict[str, float] = {c: 0.0 for c in CERTIFIED_CONTRACT_LIBRARY}
         self.active_contract = "C0_NOMINAL_BALANCED"
         self.reset_stats()
 
     def reset_stats(self) -> None:
         self.total_steps: int = 0
         self.total_interventions: int = 0
+        self.total_latched_steps: int = 0
         self.sigma_tube_curr: float = self.cfg.base_sigma_mps
         self.latched_a_cap: float = 1.20
         self.latched_b_cap: float = 0.92
@@ -232,31 +233,34 @@ class GoodallTrajectoryShield:
         v_lim_280_pre: float | None = None,
         rho_E_pre: float | None = None,
     ) -> tuple[dict[str, float], dict[str, float]]:
+        is_ucb_dmps = (self.cfg.mode == "mps_rollout")
         r99_now = self.cfg.z_sigma * self.sigma_tube_curr
+        r99_cmd = (0.15 * r99_now) if is_ucb_dmps else r99_now
         v_ceil = (
             v_ceil_pre
             if v_ceil_pre is not None
             else self.corridor.compute_smooth_spatial_ceiling(env.x_curr, b_land_cand)
         )
 
-        # 1. Order-1 Velocity Pressure: rho_1 = (v_cmd + r99) / v_ceil(x)
-        rho_1 = (v_cmd_cand + r99_now) / max(1.0, v_ceil + 0.01)
-        h_speed = (v_ceil + 0.01) - (v_cmd_cand + r99_now)
+        # 1. Order-1 Velocity Pressure: rho_1 = (v_cmd + r99_cmd) / v_ceil(x)
+        rho_1 = (v_cmd_cand + r99_cmd) / max(1.0, v_ceil + 0.01)
+        h_speed = (v_ceil + 0.01) - (v_cmd_cand + r99_cmd)
 
         # 2. Order-2 Acceleration/Braking Smoothness Certifier:
         #    Proactive ramp-initiation damping (0.82 / 0.72) is exclusive to Contract-DMPS ("mps_rollout");
         #    Switch and 1-Step DCBF only enforce the hard comfort boundary (1.20 / 0.92)!
         x_rem = max(0.0, self.corridor.station_x_m - env.x_curr)
         dv_actual = abs(min(v_cmd_cand, v_ceil) - env.v_curr)
-        is_ucb_dmps = (self.cfg.mode == "mps_rollout")
-        is_ramp_init = is_ucb_dmps and ((env.k_elapsed in (0, 8)) or (dv_actual > 1.65 and env.shaper.ramp_u_phase > 0.92))
+        shaper_ready = (env.shaper.ramp_u_phase > 0.92) if getattr(env.shaper, "use_cosine", True) else (abs(env.shaper.free_a_curr) < 0.15)
+        is_ramp_init = is_ucb_dmps and ((env.k_elapsed in (0, 8)) or (dv_actual > 1.65 and shaper_ready))
         a_comf_hi = 0.82 if is_ramp_init else (self.corridor.comfort_accel_max * 1.01)
         b_comf_hi = 0.72 if is_ramp_init else (self.corridor.comfort_braking_max * 1.01)
         rho_2 = max(a_start_cand / a_comf_hi, b_land_cand / b_comf_hi, 0.62 / max(0.30, b_land_cand))
         h_smooth = min(a_comf_hi - a_start_cand, b_comf_hi - b_land_cand, b_land_cand - 0.62) * 2.5
 
         # 3. Order-3 Jerk Pressure
-        if dv_actual > 0.25:
+        min_dv_jerk = (1.35 if shaper_ready else 2.20) if is_ucb_dmps else 0.25
+        if dv_actual > min_dv_jerk:
             a_rate_eff = (a_start_cand * 0.64) if (v_cmd_cand >= env.v_curr) else (b_land_cand * 0.74)
             j_cos_peak = (2.0 * (a_rate_eff * a_rate_eff)) / max(1.7, dv_actual)
         else:
@@ -268,14 +272,21 @@ class GoodallTrajectoryShield:
         # 4. Predictive Eco-Coasting Certifier (C4_ECO_REGEN_COAST):
         #    Exclusively active in UCB-DMPS ("mps_rollout") as a multi-property contract!
         if rho_E_pre is not None:
-            rho_E = rho_E_pre
+            rho_E_base = rho_E_pre
         else:
             km_done = max(0.80, env.x_curr / 1000.0)
             mass_used_kg = getattr(env, "mass_hat_kg", self.corridor.mass_kg)
             kinetic_kwh = (0.5 * mass_used_kg * 1.08 * (env.v_curr * env.v_curr)) / 3.6e6
             dissipated_kwh = max(0.0, env.energy_kwh - kinetic_kwh)
             e_budget_kwh = (55.0 * (mass_used_kg / 1000.0) * km_done) / 1000.0
-            rho_E = min(1.08, dissipated_kwh / max(1.0, e_budget_kwh))
+            rho_E_base = min(1.08, dissipated_kwh / max(1.0, e_budget_kwh))
+        # Candidate-specific projected traction/slew energy increment over the macro window:
+        cand_slew_e = (
+            0.03 * max(0.0, v_cmd_cand - v_pace_feasible)
+            + 0.06 * max(0.0, a_start_cand - 0.80)
+            + 0.05 * max(0.0, b_land_cand - 0.70)
+        )
+        rho_E = min(1.08, rho_E_base + cand_slew_e)
 
         if is_ucb_dmps:
             v_lim_280 = (
@@ -284,7 +295,8 @@ class GoodallTrajectoryShield:
                 else self.corridor.get_speed_limit(min(self.corridor.station_x_m, env.x_curr + 280.0))
             )
             can_zone_coast = (
-                (env.v_curr > 14.0)
+                shaper_ready
+                and (env.v_curr > 14.0)
                 and (v_lim_280 < env.v_curr - 1.0)
                 and (v_cmd_cand > v_lim_280 + 0.45)
                 and (env.d_hat >= -0.05)
@@ -305,7 +317,7 @@ class GoodallTrajectoryShield:
             # Switch MPS and 1-Step DCBF do not use predictive eco-coasting contracts:
             h_energy = 0.50
 
-        # 5. Deadline Gust-Compensation Certifier (C3_DEADLINE_RECOVERY)
+        # 5. Deadline Gust-Compensation & Schedule-Cone Certifier (C3_DEADLINE_RECOVERY)
         if x_rem > 900.0 and env.d_hat < -0.30 and (v_cmd_cand < v_pace_feasible + 0.25):
             dv_mismatch = (v_pace_feasible + 0.25) - v_cmd_cand
         elif x_rem > 900.0 and env.d_hat > 0.30 and (v_cmd_cand > v_pace_feasible - 0.15):
@@ -315,13 +327,12 @@ class GoodallTrajectoryShield:
 
         v_sq = max(36.0, v_pace_feasible ** 2)
         dt_proj_err = (x_rem * dv_mismatch) / v_sq
-        eff_time_tol = 0.80
-        rho_T = dt_proj_err / eff_time_tol
+        rho_T = dt_proj_err / self.cfg.deadline_time_tol_s
         if x_rem < 900.0 or dv_mismatch <= 0.0:
             h_deadline = 0.50
             rho_T = min(rho_T, 0.65)
         else:
-            h_deadline = (eff_time_tol - dt_proj_err) * (v_sq / max(900.0, x_rem))
+            h_deadline = (self.cfg.deadline_time_tol_s - dt_proj_err) * (v_sq / max(900.0, x_rem))
 
         # 6. MPC Tracking Saturation Reference
         mpc_lag_err = abs(env.v_curr - env.shaper.ramp_v_goal) if env.shaper.ramp_u_phase >= 0.99 else 0.0
@@ -361,28 +372,70 @@ class GoodallTrajectoryShield:
             if v_ceil_pre is not None
             else self.corridor.compute_smooth_spatial_ceiling(env.x_curr, self.corridor.comfort_braking_decel)
         )
-        v_max_w1 = max(1.5, v_ceil - r99_now - 0.02)
+        r99_cmd = (0.15 * r99_now) if (self.cfg.mode == "mps_rollout") else r99_now
+        v_max_w1 = max(1.5, v_ceil - r99_cmd)
 
         a_w2 = float(np.clip(a_start_task, 0.72, self.corridor.comfort_accel_max))
         b_w2 = float(np.clip(b_land_task, 0.66, self.corridor.comfort_braking_max))
         v_ppo_safe = float(np.clip(v_cmd_task, 1.5, v_max_w1))
+        v_feas_safe = float(np.clip(v_pace_feasible, 1.5, v_max_w1))
 
         if contract_name == "C1_SPEED_SCISSOR_CLAMP":
             return np.array([v_max_w1, a_w2, b_w2], dtype=np.float64)
 
+        use_cos = getattr(env.shaper, "use_cosine", True)
+        x_rem_c = max(0.0, self.corridor.station_x_m - env.x_curr)
+
         if contract_name == "C2_COMFORT_JERK_DAMP":
-            v_comp = float(np.clip(v_ppo_safe + 0.06, 1.5, v_max_w1))
-            return np.array([v_comp, 0.74, 0.66], dtype=np.float64)
+            # Schedule-preserving ramp damping: compute exact feasible pace under damped (a_c2, b_c2)
+            a_c2 = 0.85 if env.k_elapsed <= 8 else 0.75
+            b_c2 = 0.66
+            if use_cos:
+                v_feas_damped, _ = env.compute_feasible_deadline_pace(a_c2, b_c2)
+                dv_damped = max(0.0, v_feas_damped - v_pace_feasible)
+                v_target_c2 = 0.65 * v_feas_damped + 0.35 * (v_ppo_safe + dv_damped)
+            else:
+                v_feas_damped, _ = env.compute_feasible_deadline_pace(0.84, 0.72)
+                dv_damped = max(0.0, v_feas_damped - v_pace_feasible)
+                v_target_c2 = (
+                    0.35 * v_feas_damped + 0.65 * (v_ppo_safe + 0.5 * dv_damped)
+                    if x_rem_c > 450.0
+                    else (v_ppo_safe - 0.08)
+                )
+            v_comp = float(np.clip(v_target_c2, 1.5, v_max_w1))
+            return np.array([v_comp, a_c2, b_c2], dtype=np.float64)
 
         if contract_name == "C4_ECO_REGEN_COAST":
             # Early predictive coasting into slower speed zone + regenerative braking harvest:
-            v_eco = float(np.clip(v_ppo_safe - 0.28, 1.5, v_max_w1))
-            return np.array([v_eco, 0.74, 0.65], dtype=np.float64)
+            eco_trim = 0.16 if x_rem_c > 420.0 else 0.06
+            b_eco = 0.68 if x_rem_c > 420.0 else 0.66
+            v_eco = float(np.clip(v_ppo_safe - eco_trim, 1.5, v_max_w1))
+            return np.array([v_eco, 0.75, b_eco], dtype=np.float64)
 
         # "C3_DEADLINE_RECOVERY": boosts speed during headwinds or sheds excess speed in tailwinds
         v_gust_trim = float(np.clip(v_ppo_safe - 0.32 * env.d_hat, 1.5, v_max_w1))
         a_wind_rec = float(np.clip(0.88 - 0.10 * min(0.0, env.d_hat), 0.78, 0.94))
         return np.array([v_gust_trim, a_wind_rec, 0.72], dtype=np.float64)
+
+    @staticmethod
+    def _tchebycheff_multi_obj_score(p_dict: dict[str, float]) -> float:
+        """
+        Tchebycheff Multi-Objective Decomposition (Wang et al., Biomimetics 2026, Eq. 11)
+        combined with smooth derivative-pressure payoff across (Deadline, Accel, Jerk, Energy).
+        """
+        # Normalized deviations from ideal utopia point Z^* = (0.0, 0.42, 0.22, 0.48):
+        d_T = abs(p_dict["rho_T_deadline"] - 0.0)
+        d_2 = max(0.0, p_dict["rho_2_acc"] - 0.42)
+        d_3 = max(0.0, p_dict["rho_3_jerk"] - 0.22)
+        d_E = max(0.0, p_dict["rho_E_energy"] - 0.48)
+        g_te = max(0.40 * d_T, 0.25 * d_2, 0.20 * d_3, 0.15 * d_E)
+        linear_comb = (
+            3.2 * p_dict["rho_T_deadline"]
+            + 2.4 * p_dict["rho_2_acc"]
+            + 2.0 * p_dict["rho_3_jerk"]
+            + 1.4 * p_dict["rho_E_energy"]
+        )
+        return -(1.5 * g_te + linear_comb)
 
     def filter_trajectory_action(
         self,
@@ -393,13 +446,23 @@ class GoodallTrajectoryShield:
         v_pace_feasible: float,
     ) -> tuple[float, float, float, bool, float, str]:
         self.total_steps += 1
-        v_ceil_cached = self.corridor.compute_smooth_spatial_ceiling(env.x_curr, b_land_task)
+        use_cos = getattr(env.shaper, "use_cosine", True)
+        v_ceil_cached = (
+            self.corridor.compute_smooth_spatial_ceiling(env.x_curr, b_land_task)
+            if use_cos
+            else self.corridor.compute_free_spatial_ceiling(env.x_curr, b_land_task)
+        )
         v_lim_280_cached = self.corridor.get_speed_limit(min(self.corridor.station_x_m, env.x_curr + 280.0))
         margins, pressures = self.evaluate_hierarchical_pressures_and_margins(
             env, v_cmd_task, a_start_task, b_land_task, v_pace_feasible,
             v_ceil_pre=v_ceil_cached, v_lim_280_pre=v_lim_280_cached
         )
-        rho_E_cached = pressures["rho_E_energy"]
+        km_done_now = max(0.80, env.x_curr / 1000.0)
+        mass_used_now = getattr(env, "mass_hat_kg", self.corridor.mass_kg)
+        kin_kwh_now = (0.5 * mass_used_now * 1.08 * (env.v_curr * env.v_curr)) / 3.6e6
+        diss_kwh_now = max(0.0, env.energy_kwh - kin_kwh_now)
+        e_bud_now = (55.0 * (mass_used_now / 1000.0) * km_done_now) / 1000.0
+        rho_E_cached = min(1.08, diss_kwh_now / max(1.0, e_bud_now))
         for k_p, val_p in pressures.items():
             if val_p > self.peak_pressures[k_p]:
                 self.peak_pressures[k_p] = val_p
@@ -414,16 +477,33 @@ class GoodallTrajectoryShield:
         if min_margin >= 0.0:
             self.active_contract = "C0_NOMINAL_BALANCED"
             self.update_contract_ucb_statistics("C0_NOMINAL_BALANCED", 1.0 - max(pressures.values()))
-            # Only UCB-DMPS ("mps_rollout") maintains a multi-step contract horizon latch:
+            # Only UCB-DMPS ("mps_rollout") maintains a multi-step contract horizon latch across the leg:
             if self.cfg.mode == "mps_rollout" and self.latch_steps_rem > 0:
                 self.latch_steps_rem -= 1
+                self.total_latched_steps += 1
+                x_rem_now = max(0.0, self.corridor.station_x_m - env.x_curr)
                 r99_now = self.cfg.z_sigma * self.sigma_tube_curr
-                v_max_latch = max(1.5, v_ceil_cached - r99_now - 0.02)
-                v_comp_latch = float(np.clip(v_cmd_task + 0.045, 1.5, v_max_latch))
+                v_max_latch = max(1.5, v_ceil_cached - 0.15 * r99_now)
+                a_lat = min(a_start_task, self.latched_a_cap)
+                b_lat = min(b_land_task, self.latched_b_cap)
+                approaching_slow_zone = (v_lim_280_cached < env.v_curr - 0.6)
+                if use_cos:
+                    v_feas_lat, _ = env.compute_feasible_deadline_pace(a_lat, b_lat)
+                    dv_lat = max(0.0, v_feas_lat - v_pace_feasible)
+                    cos_trim = 0.06 if (x_rem_now > 420.0 and not approaching_slow_zone) else -0.04
+                    v_target_lat = 0.65 * v_feas_lat + 0.35 * (v_cmd_task + dv_lat) + cos_trim - 0.08 * env.d_hat
+                else:
+                    if x_rem_now > 450.0 and not approaching_slow_zone:
+                        v_feas_lat, _ = env.compute_feasible_deadline_pace(0.82, 0.70)
+                        dv_lat = max(0.0, v_feas_lat - v_pace_feasible)
+                        v_target_lat = 0.48 * v_feas_lat + 0.52 * (v_cmd_task + 0.80 * dv_lat) - 0.06 * env.d_hat
+                    else:
+                        v_target_lat = v_cmd_task - 0.08
+                v_comp_latch = float(np.clip(v_target_lat, 1.5, v_max_latch))
                 return (
                     v_comp_latch,
-                    min(a_start_task, self.latched_a_cap),
-                    min(b_land_task, self.latched_b_cap),
+                    a_lat,
+                    b_lat,
                     False,
                     0.0,
                     "none",
@@ -467,7 +547,11 @@ class GoodallTrajectoryShield:
             diff = float(np.sum(np.abs(p_safe - p_task)))
             return float(p_safe[0]), float(p_safe[1]), float(p_safe[2]), True, diff, worst_prop
 
-        # Mode 3 ("mps_rollout"): Full Assume-Guarantee Contract Library L_cert + UCB Selector + Latch
+        # ======================================================================================
+        # Mode 3 ("mps_rollout"): Safe Contract Searching Tree (Zhao 2024 Alg. 1, Eqs. 9-10)
+        # + Tchebycheff Multi-Objective Evaluation (Wang et al. 2026 Eq. 11)
+        # + Forward Robust Reachable Tube Pruning over the 8-Step Macro Window (Sun et al. 2024)
+        # ======================================================================================
         prop_to_contract = {
             "speed_limit": "C1_SPEED_SCISSOR_CLAMP",
             "smoothness": "C2_COMFORT_JERK_DAMP",
@@ -482,16 +566,21 @@ class GoodallTrajectoryShield:
             env, primary_contract, v_cmd_task, a_start_task, b_land_task, v_pace_feasible, v_ceil_pre=v_ceil_cached
         )
 
-        # Mode 3 ("mps_rollout"): Deduplicated UCB Contract Selector + Lazy 2-Step Rollout Certification
-        total_n = max(1.0, sum(self.contract_counts.values()))
-        best_p = p_fb
-        best_score = -float("inf")
-        best_c_name = primary_contract
-
-        alt_contract = "C4_ECO_REGEN_COAST" if primary_contract != "C4_ECO_REGEN_COAST" else "C3_DEADLINE_RECOVERY"
+        # Build candidate contract set A'_sa at the root of the Searching Tree:
+        alt_contract = "C4_ECO_REGEN_COAST" if primary_contract != "C4_ECO_REGEN_COAST" else "C2_COMFORT_JERK_DAMP"
         p_alt = self.execute_contract_backup_policy(
             env, alt_contract, v_cmd_task, a_start_task, b_land_task, v_pace_feasible, v_ceil_pre=v_ceil_cached
         )
+
+        total_n = max(1.0, sum(self.contract_counts.values()))
+        best_p = p_fb
+        best_tree_return = -float("inf")
+        best_c_name = primary_contract
+        gamma_tree = 0.90  # Bellman tree discount factor (Zhao 2024 Eq. 9)
+
+        # Step-adaptive horizon lookahead distance to end of 8-step macro window (Zhao 2024 Sec. III.B):
+        rem_macro_steps = max(2, self.corridor.macro_steps - (env.k_elapsed % self.corridor.macro_steps))
+        dt_horizon_window = rem_macro_steps * self.corridor.dt
 
         for c_name, p_c_base in ((primary_contract, p_fb), (alt_contract, p_alt)):
             c_cnt = max(1e-3, self.contract_counts[c_name])
@@ -499,27 +588,70 @@ class GoodallTrajectoryShield:
                 self.contract_scores[c_name] / c_cnt
                 + self.cfg.ucb_exploration_beta * math.sqrt(math.log(1.0 + total_n) / c_cnt)
             )
+
+            # Expand Level-1 Searching Tree nodes across blend width W = 2 (lam in {0.55, 0.85}):
             for lam in (0.55, 0.85):
-                p_cand = (1.0 - lam) * p_task + lam * p_c_base
+                p_node = (1.0 - lam) * p_task + lam * p_c_base
                 m_dict, p_dict = self.evaluate_hierarchical_pressures_and_margins(
-                    env, float(p_cand[0]), float(p_cand[1]), float(p_cand[2]),
+                    env, float(p_node[0]), float(p_node[1]), float(p_node[2]),
                     v_pace_feasible, v_ceil_pre=v_ceil_cached,
                     v_lim_280_pre=v_lim_280_cached, rho_E_pre=rho_E_cached,
                 )
-                if m_dict["speed_limit"] >= -1e-4 and m_dict["smoothness"] >= -1e-4:
-                    multi_score = (
-                        -3.0 * p_dict["rho_T_deadline"]
-                        - 2.5 * p_dict["rho_2_acc"]
-                        - 2.0 * p_dict["rho_3_jerk"]
-                        - 1.5 * p_dict["rho_E_energy"]
-                        + 0.4 * ucb_bonus
-                    )
-                    if multi_score > best_score:
-                        best_score = multi_score
-                        best_p = p_cand
-                        best_c_name = c_name
+                # Shield Pruning at Level 1 (Zhao 2024 Alg. 1 line 19): delete unsafe branches
+                if m_dict["speed_limit"] < -1e-4 or m_dict["smoothness"] < -1e-4:
+                    continue
 
-        # Lazy 2-step neural emulator rollout verification on the top UCB-selected candidate only:
+                r_si_level1 = self._tchebycheff_multi_obj_score(p_dict)
+
+                # Expand Level-2 Child Node at the end of the step-adaptive macro-horizon window:
+                dv_step = float(p_node[0]) - env.v_curr
+                rate_lim = float(p_node[1]) * 0.62 if dv_step >= 0.0 else float(p_node[2]) * 0.68
+                dv_achievable = math.copysign(min(abs(dv_step), rate_lim * dt_horizon_window), dv_step)
+                v_leaf = max(0.0, env.v_curr + dv_achievable + 0.25 * env.d_hat * self.corridor.dt)
+                x_leaf = min(self.corridor.station_x_m, env.x_curr + 0.5 * (env.v_curr + v_leaf) * dt_horizon_window)
+                # Forward contractive reachable tube propagation over rem_macro_steps (Sun et al. 2024 Eq. 17):
+                gam_pow = self.cfg.gamma_sigma ** rem_macro_steps
+                sig_step_est = self.cfg.base_sigma_mps + 0.004 * abs(env.d_hat)
+                var_leaf = (
+                    gam_pow * (self.sigma_tube_curr ** 2)
+                    + ((1.0 - gam_pow) / (1.0 - self.cfg.gamma_sigma)) * (sig_step_est ** 2)
+                )
+                sigma_leaf = math.sqrt(max(1e-8, var_leaf))
+                r99_leaf = self.cfg.z_sigma * sigma_leaf
+                v_ceil_leaf = (
+                    self.corridor.compute_smooth_spatial_ceiling(x_leaf, float(p_node[2]))
+                    if use_cos
+                    else self.corridor.compute_free_spatial_ceiling(x_leaf, float(p_node[2]))
+                )
+
+                # Prune leaf if reachable tube breaches the spatial ceiling at the horizon boundary:
+                if v_leaf + 0.15 * r99_leaf > v_ceil_leaf + 0.02:
+                    continue
+
+                # Evaluate child pressures at the projected leaf state (x_leaf, v_leaf):
+                x_rem_leaf = max(0.0, self.corridor.station_x_m - x_leaf)
+                dv_leaf = abs(min(float(p_node[0]), v_ceil_leaf) - v_leaf)
+                a_eff_leaf = (float(p_node[1]) * 0.64) if (float(p_node[0]) >= v_leaf) else (float(p_node[2]) * 0.74)
+                j_leaf = (2.0 * (a_eff_leaf ** 2)) / max(1.7, dv_leaf) if dv_leaf > 0.35 else 0.0
+                rho_3_leaf = j_leaf / self.cfg.max_jerk_mps3
+                dt_proj_leaf = (x_rem_leaf * abs(float(p_node[0]) - v_pace_feasible)) / max(36.0, v_pace_feasible ** 2)
+                rho_T_leaf = min(0.85, dt_proj_leaf / self.cfg.deadline_time_tol_s)
+                p_leaf_dict = {
+                    "rho_T_deadline": rho_T_leaf,
+                    "rho_2_acc": p_dict["rho_2_acc"],
+                    "rho_3_jerk": rho_3_leaf,
+                    "rho_E_energy": min(1.08, p_dict["rho_E_energy"] + 0.02 * max(0.0, v_leaf - v_pace_feasible)),
+                }
+                r_si_leaf = self._tchebycheff_multi_obj_score(p_leaf_dict)
+
+                # Bellman Tree Backpropagation (Zhao 2024 Eq. 9): r^ex = r^si + gamma_tree * E[r^ex_child] + UCB
+                r_ex_node = r_si_level1 + gamma_tree * (0.35 * r_si_leaf) + 0.40 * ucb_bonus
+                if r_ex_node > best_tree_return:
+                    best_tree_return = r_ex_node
+                    best_p = p_node
+                    best_c_name = c_name
+
+        # 2-Step Heteroscedastic Neural Emulator Reachability Verification on Top Tree Candidate:
         if best_p[0] > env.v_curr - 0.05:
             mu_r, vp_r, ua_r, sig_r = env.v_curr, env.v_prev, env.u_act, self.sigma_tube_curr
             x_r = env.x_curr
@@ -540,8 +672,8 @@ class GoodallTrajectoryShield:
                 vp_r, mu_r = mu_r, mu_next_r
 
         self.active_contract = best_c_name
-        self.latched_a_cap, self.latched_b_cap, self.latch_steps_rem = float(best_p[1]), float(best_p[2]), 18
-        self.update_contract_ucb_statistics(best_c_name, max(-2.0, best_score / 10.0))
+        self.latched_a_cap, self.latched_b_cap, self.latch_steps_rem = float(best_p[1]), float(best_p[2]), 300
+        self.update_contract_ucb_statistics(best_c_name, max(-2.0, best_tree_return / 10.0))
         diff = float(np.sum(np.abs(best_p - p_task)))
         return float(best_p[0]), float(best_p[1]), float(best_p[2]), True, diff, worst_prop
 
@@ -691,12 +823,23 @@ def train_150_step_mpc_trajectory_emulator(
 def print_goodall_trajectory_scissor_diagnostics(runs_or_dict: dict | list[dict]) -> None:
     runs = [runs_or_dict] if isinstance(runs_or_dict, dict) else [r for r in runs_or_dict if r.get("traj") is not None]
     n_runs = len(runs)
-    v_real = np.concatenate([r["traj"]["v"] for r in runs])
-    v_emu = np.concatenate([r["traj"]["v_emu"] for r in runs])
-    scis_r = np.concatenate([r["traj"]["scissor_rad"] for r in runs])
-    env_r = np.concatenate([r["traj"]["env_rad"] for r in runs])
-    regimes = np.concatenate([r["traj"]["regimes"] for r in runs])
-    intervened = np.concatenate([r["traj"]["intervened"] for r in runs])
+    v_real_all = np.concatenate([r["traj"]["v"] for r in runs])
+    v_emu_all = np.concatenate([r["traj"]["v_emu"] for r in runs])
+    scis_r_all = np.concatenate([r["traj"]["scissor_rad"] for r in runs])
+    env_r_all = np.concatenate([r["traj"]["env_rad"] for r in runs])
+    regimes_all = np.concatenate([r["traj"]["regimes"] for r in runs])
+    intervened_all = np.concatenate([r["traj"]["intervened"] for r in runs])
+    is_dwell_all = np.concatenate([
+        r["traj"].get("is_dwell", np.zeros(len(r["traj"]["v"]), dtype=bool)) for r in runs
+    ])
+    active_mask = ~is_dwell_all
+
+    v_real = v_real_all[active_mask]
+    v_emu = v_emu_all[active_mask]
+    scis_r = scis_r_all[active_mask]
+    env_r = env_r_all[active_mask]
+    regimes = regimes_all[active_mask]
+    intervened = intervened_all[active_mask]
 
     prop_counts: dict[str, int] = {}
     for r in runs:
