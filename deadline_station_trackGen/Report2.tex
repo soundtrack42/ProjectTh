@@ -60,8 +60,9 @@ To evaluate robustness under realistic meteorological disturbances, half of the 
 \begin{table}[h!]
 \centering
 \scriptsize
-\caption{Physical Parameterization and Literature Sources for Modified Weather Statistics in the Disturbed Multi-Station Environment (`railroad\_corridor.py` and `dynamic\_railroad\_mpc.py`).}
+\caption{Physical Parameterization and Literature Sources for Modified Weather Statistics in the Disturbed Multi-Station Environment (\texttt{railroad\_corridor.py} and \texttt{dynamic\_railroad\_mpc.py}).}
 \label{tab:weather_regimes}
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{p{1.9cm}ccccp{5.9cm}p{2.3cm}}
 \toprule
 \textbf{Weather Regime (Prob.)} & \textbf{$T_{\text{amb}}$ ($^\circ\text{C}$)} & \textbf{Air Density $\rho_{\text{air}}(T_{\text{amb}})$} & \textbf{Adhesion $\mu_{\text{adh}}$} & \textbf{Gust / CWR / Cu Multipliers} & \textbf{Physical Mechanism and Impact on Longitudinal Forces} & \textbf{Literature Sources} \\
@@ -78,7 +79,8 @@ To evaluate robustness under realistic meteorological disturbances, half of the 
 \midrule
 \textbf{5. Heat-Thermal} ($p = 0.18$) & $38.0^\circ\text{C}$ ($T_{\text{rail}}\approx 56^\circ\text{C}$) & $0.942$ ($-5.8\%$) & $0.94$ ($-6\%$) & $\kappa_{\text{wind}}=1.05\times$ $\kappa_{\text{cwr}}=1.0585$ $\kappa_{\text{Cu}}=1.0707$ & (i) Thermal air expansion lowers aerodynamic drag by $-5.8\%$; (ii) CWR compressive thermal stress above $T_0=25^\circ\text{C}$ increases lateral track compliance and flange/creepage curve resistance by $+5.85\%$ ($\kappa_{\text{cwr}}=1.0585$); (iii) elevated contact temperature softens third-body oxide layers ($\mu_{\text{adh}}=0.94$); (iv) stator copper resistance rises by $+7.07\%$ ($\alpha_{\text{Cu}}=0.00393\,\text{K}^{-1}$), increasing $I^2R$ traction loss in $\eta_{\text{trac}}$. & Kish \& Samavedam \cite{ref27}; Dobney et al. \cite{ref28}; Polach \cite{ref24}; Xiao et al. \cite{ref16}; Rochard \& Schmid \cite{ref23} \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table}
 
 \section{Stage 1: Actuator-Lifted LTV-MPC and Heteroscedastic Scissor Shielding}
@@ -112,6 +114,7 @@ This defines the 99th-percentile scissor band as $\hat{v}_{\text{emu}}(k) \pm 2.
 \footnotesize
 \caption{Stage 1 Zero-Shot Performance Across 30 Unseen Random Trajectories ($T = 1000$ Steps, Modes 1--6, No Wind, Mean $\pm$ Std).}
 \label{tab:stage1}
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{lccccccc}
 \toprule
 \textbf{Controller Method} & \textbf{MeanErr (m/s)} & \textbf{BrakeErr} & \textbf{ShiftOS} & \textbf{ShiftAvg} & \textbf{StopErr (m)} & \textbf{PaperScore} & \textbf{StepInfer} \\
@@ -127,7 +130,8 @@ Shielded Hybrid RL-MPC (Switch MPS) & $0.0038 \pm 0.0017$ & 0.0062 & 0.0350 & 0.
 Shielded Hybrid RL-MPC (1-Step DCBF) & $0.0040 \pm 0.0015$ & 0.0066 & 0.0231 & 0.0085 & 0.0822 & $0.0249 \pm 0.0208$ & $103.72\,\mu\text{s}$ \\
 Shielded Hybrid RL-MPC (DMPS Rollout) & $0.0038 \pm 0.0017$ & 0.0063 & 0.0350 & 0.0062 & 0.0819 & $0.0266 \pm 0.0200$ & $106.03\,\mu\text{s}$ \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table}
 
 \section{Stage 2: Short-Horizon LTV-MPC, Disturbance Observer, and Fast Solver}
@@ -147,6 +151,7 @@ When a sudden storm front ($|d_{\text{raw}}| > 0.05\,\text{m/s}^2$) threatens to
 \footnotesize
 \caption{Stage 2 Benchmark Across 30 Unseen $[0, 1000]$ Trajectories with Storm Gusts (Peak $1.03\,\text{m/s}^2$, Mean $\pm$ Std).}
 \label{tab:stage2}
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{lccccccc}
 \toprule
 \textbf{Controller Method} & \textbf{MeanErr (m/s)} & \textbf{BrakeErr} & \textbf{ShiftOS} & \textbf{ShiftAvg} & \textbf{StopErr (m)} & \textbf{PaperScore} & \textbf{StepInfer} \\
@@ -159,7 +164,8 @@ Shielded Adaptive MPC (Switch MPS) & $0.0069 \pm 0.0044$ & 0.0143 & 0.0537 & 0.0
 Shielded Adaptive MPC (1-Step DCBF) & $0.0077 \pm 0.0050$ & 0.0159 & 0.0564 & 0.0169 & 0.1141 & $0.0422 \pm 0.0386$ & $72.13\,\mu\text{s}$ \\
 Shielded Adaptive MPC (DMPS Rollout) & $0.0079 \pm 0.0053$ & 0.0191 & 0.0526 & 0.0183 & 0.1141 & $0.0424 \pm 0.0422$ & $84.70\,\mu\text{s}$ \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table}
 
 \subsection{Low-Latency Solver Design for Onboard Execution}
@@ -178,7 +184,7 @@ To guarantee zero jerk at the start and end of every speed transition and statio
 v(\tau) = \frac{v_{\text{eff}}}{2}\left(1 + \cos\left(\frac{\pi \tau}{T_{\text{land}}}\right)\right), \qquad T_{\text{land}}(v_{\text{eff}}, b_{\text{eff}}) = \frac{\pi v_{\text{eff}}}{2\,b_{\text{eff}}}, \qquad \Delta x_{\text{brake}}(v_{\text{eff}}, b_{\text{eff}}) = \frac{\pi v_{\text{eff}}^2}{4\,b_{\text{eff}}}
 \label{eq:cosine_land}
 \end{equation}
-To construct a trajectory that does \emph{not} use trigonometric functions by construction while achieving an even softer curvature transition than a standard piecewise-quadratic trapezoidal ramp, we formulate a \textbf{Learned Non-Cosine $C^2$ Algebraic Soft-Curve Generator} (`step\_free\_reference\_horizon`, Methods 8 and 9). A naive piecewise-quadratic velocity progression exhibits discontinuous step jumps in third-order jerk ($\Delta j \neq 0$) at the flare boundaries $u = \alpha$ and $u = 1-\alpha$. Instead, we synthesize a $C^2$-continuous Hermite cubic-acceleration flare (quartic velocity progression) whose acceleration $a(u) \propto 3\tau^2 - 2\tau^3$ and jerk $j(u) \propto 6\tau(1-\tau)$ vanish smoothly at both the outer endpoints ($u \in \{0, 1\}$) and the interior plateau junctions ($u \in \{\alpha, 1-\alpha\}$):
+To construct a trajectory that does \emph{not} use trigonometric functions by construction while achieving an even softer curvature transition than a standard piecewise-quadratic trapezoidal ramp, we formulate a \textbf{Learned Non-Cosine $C^2$ Algebraic Soft-Curve Generator} (\texttt{step\_free\_reference\_horizon}, Methods 8 and 9). A naive piecewise-quadratic velocity progression exhibits discontinuous step jumps in third-order jerk ($\Delta j \neq 0$) at the flare boundaries $u = \alpha$ and $u = 1-\alpha$. Instead, we synthesize a $C^2$-continuous Hermite cubic-acceleration flare (quartic velocity progression) whose acceleration $a(u) \propto 3\tau^2 - 2\tau^3$ and jerk $j(u) \propto 6\tau(1-\tau)$ vanish smoothly at both the outer endpoints ($u \in \{0, 1\}$) and the interior plateau junctions ($u \in \{\alpha, 1-\alpha\}$):
 \begin{equation}
 \psi_{\text{soft}}(u; \alpha) = \begin{cases}
 \dfrac{\alpha}{1-\alpha}\left(\left(\dfrac{u}{\alpha}\right)^3 - \dfrac{1}{2}\left(\dfrac{u}{\alpha}\right)^4\right), & u \in [0, \alpha) \\[8pt]
@@ -273,6 +279,7 @@ We evaluated all ten controllers across 30 generalized multi-station scenarios (
 \scriptsize
 \caption{Stage 3 Generalized Multi-Station Benchmark Across Clean (15 Scenarios), Weather-Disturbed (15 Scenarios), and Combined (30 Scenarios) Comparing Cosine vs. Learned Non-Cosine Soft-Curve Shapers and Shielding Architectures.}
 \label{tab:stage3}
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{lcccccccc}
 \toprule
 \textbf{Trajectory Pilot + Contract Shield Method} & \textbf{$|\text{TimeErr}|$} & \textbf{$|\text{StopErr}|$} & \textbf{SmoothLoss} & \textbf{SpecEnergy} & \textbf{LossScore} & \textbf{Shield\%} & \textbf{Core Step} & \textbf{Total (Mean/P99/Max)} \\
@@ -316,15 +323,16 @@ We evaluated all ten controllers across 30 generalized multi-station scenarios (
 9. Soft-Curve PPO + Jerk-Horizon UCB-DMPS & 0.89\,s & 0.008\,m & 0.0512 & 42.96\,Wh/t$\cdot$km & 2.1850 & 7.2\% & 13.9\,$\mu$s & 36.3 / 76.2 / 350.4\,$\mu$s \\
 10. Bilbao (2025) CBTC-ATO (RMBTP+PI) \cite{ref17} & 3.99\,s & 0.024\,m & 0.1032 & 43.52\,Wh/t$\cdot$km & 5.6517 & 0.0\% & 19.9\,$\mu$s & 19.9 / 25.2 / 413.2\,$\mu$s \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table}
 
 \subsection{Ablation Analysis: Cosine Shaper vs. Learned Non-Cosine Soft-Curve with Tree-Guided UCB-DMPS}
 Comparing Methods 4 through 9 in Table~\ref{tab:stage3} highlights three primary findings:
 \begin{enumerate}
     \item \textbf{Dominance of Tree-Guided UCB-DMPS Over Memoryless 1-Step Shielding (Method 7 vs. Methods 4, 5, and 6):} Across all 30 scenarios (Part C), pairing the PPO pilot with the Safe Contract Searching Tree \cite{ref22}, Tchebycheff multi-objective scoring \cite{ref21}, and inductive 8-step disturbance arrival detection \cite{ref18} (Method 7) achieves the best combined performance on every metric: $|\text{TimeErr}| = \mathbf{0.70\,\text{s}}$ ($42.6\%$ lower than Unshielded PPO at $1.22\,\text{s}$ and $52.1\%$ lower than 1-Step DCBF at $1.46\,\text{s}$), $|\text{StopErr}| = \mathbf{0.005\,\text{m}}$, $\text{SmoothLoss} = \mathbf{0.0462}$ ($16.5\%$ smoother than Unshielded PPO at $0.0553$ and $55.2\%$ smoother than Bilbao et al. \cite{ref17}), $\text{SpecEnergy} = \mathbf{42.36\,\text{Wh/t}\cdot\text{km}}$ ($-1.95\,\text{Wh/t}\cdot\text{km}$ vs. Unshielded PPO), and $\text{LossScore} = \mathbf{1.9277}$ ($24.8\%$ lower than Unshielded PPO).
-    \item \textbf{Learned Non-Cosine $C^2$ Algebraic Soft-Curve Outperforms Unshielded Cosine (Method 8 vs. Method 4):} Replacing the piecewise-quadratic trapezoidal ramp (which previously suffered from $3.31\,\text{s}$ arrival error and $0.0778$ smoothness loss due to $\Delta j \neq 0$ boundary jumps) with our $C^2$ Hermite cubic-acceleration soft-curve progression $\psi_{\text{soft}}(u; \alpha)$ (Eq.~\ref{eq:trap_prog}) and online fuzzy satisfaction softening $\alpha(\mu_y)$ (Eq.~\ref{eq:soft_alpha}) enables the unshielded non-cosine controller (Method 8) to achieve $|\text{TimeErr}| = \mathbf{1.01\,\text{s}}$ ($0.41\,\text{s}$ clean), $\text{SpecEnergy} = \mathbf{43.05\,\text{Wh/t}\cdot\text{km}}$, and $\text{LossScore} = \mathbf{2.3206}$—outperforming Unshielded Cosine PPO (Method 4: $1.22\,\text{s}$, $44.31\,\text{Wh/t}\cdot\text{km}$, $\text{LossScore} = 2.5619$).
-    \item \textbf{Effectiveness of Jerk-Horizon UCB-DMPS on Non-Cosine Soft-Curve Trajectories (Method 9 vs. Method 8):} Adding the Tree-Guided UCB-DMPS shield to the non-cosine soft-curve generator (Method 9) reduces $\text{SmoothLoss}$ by \textbf{10.2\%} ($0.0570 \to \mathbf{0.0512}$ combined; $0.0557 \to \mathbf{0.0499}$ under weather disturbances—softer than Unshielded Cosine PPO at $0.0553$), improves arrival accuracy by \textbf{11.9\%} ($1.01\,\text{s} \to \mathbf{0.89\,\text{s}}$ combined; $\mathbf{0.34\,\text{s}}$ clean, achieving the lowest clean $\text{LossScore} = \mathbf{1.4244}$ across all ten methods), reduces traction energy ($43.05 \to \mathbf{42.96\,\text{Wh/t}\cdot\text{km}}$), and lowers combined $\text{LossScore}$ to $\mathbf{2.1850}$.
+    \item \textbf{Learned Non-Cosine $C^2$ Algebraic Soft-Curve Outperforms Unshielded Cosine (Method 8 vs. Method 4):} Replacing the piecewise-quadratic trapezoidal ramp (which previously suffered from $3.31\,\text{s}$ arrival error and $0.0778$ smoothness loss due to $\Delta j \neq 0$ boundary jumps) with our $C^2$ Hermite cubic-acceleration soft-curve progression $\psi_{\text{soft}}(u; \alpha)$ (Eq.~\ref{eq:trap_prog}) and online fuzzy satisfaction softening $\alpha(\mu_y)$ (Eq.~\ref{eq:soft_alpha}) enables the unshielded non-cosine controller (Method 8) to achieve $|\text{TimeErr}| = \mathbf{1.01\,\text{s}}$ ($0.41\,\text{s}$ clean), $\text{SpecEnergy} = \mathbf{43.05\,\text{Wh/t}\cdot\text{km}}$, and $\text{LossScore} = \mathbf{2.3206}$---outperforming Unshielded Cosine PPO (Method 4: $1.22\,\text{s}$, $44.31\,\text{Wh/t}\cdot\text{km}$, $\text{LossScore} = 2.5619$).
+    \item \textbf{Effectiveness of Jerk-Horizon UCB-DMPS on Non-Cosine Soft-Curve Trajectories (Method 9 vs. Method 8):} Adding the Tree-Guided UCB-DMPS shield to the non-cosine soft-curve generator (Method 9) reduces $\text{SmoothLoss}$ by \textbf{10.2\%} ($0.0570 \to \mathbf{0.0512}$ combined; $0.0557 \to \mathbf{0.0499}$ under weather disturbances---softer than Unshielded Cosine PPO at $0.0553$), improves arrival accuracy by \textbf{11.9\%} ($1.01\,\text{s} \to \mathbf{0.89\,\text{s}}$ combined; $\mathbf{0.34\,\text{s}}$ clean, achieving the lowest clean $\text{LossScore} = \mathbf{1.4244}$ across all ten methods), reduces traction energy ($43.05 \to \mathbf{42.96\,\text{Wh/t}\cdot\text{km}}$), and lowers combined $\text{LossScore}$ to $\mathbf{2.1850}$.
 \end{enumerate}
 
 \begin{table}[h!]
@@ -332,6 +340,7 @@ Comparing Methods 4 through 9 in Table~\ref{tab:stage3} highlights three primary
 \footnotesize
 \caption{Aggregated Hierarchical Differential and Contract Shield Diagnostics Across All 30 Generalized Multi-Station Scenarios ($430.9\,\text{km}$ Total Distance, $66,975$ Active Driving Micro-Steps Excluding Passive Station Dwell, Overall Emu-to-Real RMSE $= 0.0196\,\text{m/s}$, Empirical 99th-Percentile Error $= 0.0519\,\text{m/s}$, Physical Tube Containment $= \mathbf{99.94\%}$).}
 \label{tab:diagnostics}
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{lcccccc}
 \toprule
 \textbf{Driving Regime} & \textbf{Total Steps (Mean/Run)} & \textbf{Emu-Real RMSE} & \textbf{Learned 99\% Scissor} & \textbf{Safe Envelope} & \textbf{Regime P99 / MaxErr} & \textbf{Interventions} \\
@@ -341,7 +350,8 @@ Shift (Ramp) & 3,989 (133.0/run) & 0.0151\,m/s & $\pm 0.0846\,\text{m/s}$ & $\pm
 Braking & 2,122 (70.7/run) & 0.0200\,m/s & $\pm 0.0876\,\text{m/s}$ & $\pm 0.2476\,\text{m/s}$ & 0.0509 / 0.0601\,m/s & 119 (5.6\%) \\
 Station Stop & 5,803 (193.4/run) & 0.0333\,m/s & $\pm 0.0747\,\text{m/s}$ & $\pm 0.1852\,\text{m/s}$ & 0.0873 / 0.3326\,m/s & 171 (2.9\%) \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table}
 
 \section{Conclusions}
