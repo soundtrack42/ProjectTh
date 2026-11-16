@@ -280,6 +280,15 @@ class SafetyFilterShield:
             self._feat_buf[0, 2] = u_clamped
             self._feat_buf[0, 3] = ext_f_norm
             self._feat_buf[0, 4] = v_norm * v_norm
+            g_scale = getattr(env, "gains_scale", None)
+            if g_scale is not None and len(pid_gains) >= 3:
+                self._feat_buf[0, 5] = float(pid_gains[0] / g_scale[0])
+                self._feat_buf[0, 6] = float(pid_gains[1] / g_scale[1])
+                self._feat_buf[0, 7] = float(pid_gains[2] / g_scale[2])
+            else:
+                self._feat_buf[0, 5] = 1.0
+                self._feat_buf[0, 6] = 1.0
+                self._feat_buf[0, 7] = 1.0
             with torch.no_grad():
                 out = env.learned_model.net(self._feat_buf)
                 dv_res = float(out[0, 0].item())

@@ -73,7 +73,8 @@ class CosineTrajectoryShaper:
         if b_phys_cap < 0.35:
             b_phys_cap = 0.35
         b_hi = self.corridor.comfort_braking_max if self.corridor.comfort_braking_max < b_phys_cap else b_phys_cap
-        return 0.50 if b_req < 0.50 else (b_hi if b_req > b_hi else float(b_req))
+        b_lo = 0.50 if 0.50 < b_hi else b_hi
+        return b_lo if b_req < b_lo else (b_hi if b_req > b_hi else float(b_req))
 
     @staticmethod
     def invert_cosine_distance_phase(rem_ratio: float) -> float:
@@ -121,10 +122,10 @@ class CosineTrajectoryShaper:
         w_pos = d_wind_hat if d_wind_hat > 0.0 else 0.0
         b_cap_src = float(max_braking_decel) if max_braking_decel is not None else float(corridor.max_service_braking)
         b_phys_max = b_cap_src * 0.86 - w_pos
-        if b_phys_max < 0.45:
-            b_phys_max = 0.45
+        if b_phys_max < 0.44:
+            b_phys_max = 0.44
         b_comf_hi = corridor.comfort_braking_max if corridor.comfort_braking_max < b_phys_max else b_phys_max
-        b_comf_lo = 0.62
+        b_comf_lo = 0.62 if 0.62 < b_comf_hi else b_comf_hi
 
         # Base wind-adjusted comfort deceleration
         b_raw = b_land_cmd - 0.12 * w_pos
@@ -284,15 +285,15 @@ class CosineTrajectoryShaper:
         d_wind_hat: float = 0.0,
     ) -> tuple[np.ndarray, float, float]:
         """
-        Learned C^2 Algebraic Soft-Curve & Fuzzy-Softened Horizon Trajectory Generator (No Cosine).
+        Analytical C^2 Algebraic Soft-Curve & Fuzzy-Softened Horizon Trajectory Shaper (No Cosine).
         Combines a C^2 Hermite-blended algebraic velocity progression (continuous jerk, zero
         trigonometric functions) with Wang et al. (2026) online fuzzy satisfaction horizon softening
-        alpha(mu_min) so transitions and curves are smoothly adapted online.
+        alpha(mu_min), guided online by the RL pilot's scalar rate commands.
         """
         dt = self.corridor.dt
         rem_dist_now = max(0.0, self.corridor.station_x_m - x_curr)
         t_rem_now = max(dt, self.corridor.deadline_s - t_curr)
-        # Learned curve softness alpha in [0.38, 0.45] adapted by RL pilot's ramp rate commands
+        # Curve softness alpha in [0.38, 0.45] modulated by RL pilot's ramp rate commands
         # + Wang et al. (2026) Eq. 25 online fuzzy tracking satisfaction mu_y:
         rate_soft_hint = 0.5 * ((a_start_cmd - 0.96) / 0.22 + (b_land_cmd - 0.78) / 0.12)
         alpha_base = float(0.41 - 0.03 * max(-1.0, min(1.0, rate_soft_hint)))
@@ -357,7 +358,7 @@ class CosineTrajectoryShaper:
             t_land_rem = max(0.0, (1.0 - u_now) * self.t_land_ref)
             return v_ref, self.x_brake_dynamic, float(t_land_rem)
 
-        # Open Cruising & Learned C^2 Algebraic Soft-Curve Shift Phase:
+        # Open Cruising & Analytical C^2 Algebraic Soft-Curve Shift Phase:
         v_free_ceil = self.corridor.compute_free_spatial_ceiling(x_curr, b_land_cmd)
         v_goal_clamped = 0.0 if v_cmd_rl < 0.0 else (v_free_ceil if v_cmd_rl > v_free_ceil else float(v_cmd_rl))
 
@@ -498,16 +499,26 @@ class CosineTrajectoryShaper:
                 self.v_entry_ref = 0.80 * self.v_entry_ref + 0.20 * v_entry_implied
                 b_cap = self.feasible_comfort_braking(self.corridor.comfort_braking_max, d_wind_hat)
                 bp_raw = (pi_val * (self.v_entry_ref ** 2)) / (4.0 * self.dx_land_ref)
-                self.b_peak_ref = 0.50 if bp_raw < 0.50 else (b_cap if bp_raw > b_cap else float(bp_raw))
+                b_min_ref = 0.50 if 0.50 < b_cap else b_cap
+                self.b_peak_ref = b_min_ref if bp_raw < b_min_ref else (b_cap if bp_raw > b_cap else float(bp_raw))
                 self.t_land_ref = float((pi_val * self.v_entry_ref) / (2.0 * self.b_peak_ref))
 
+            b_phys_stop = max(0.36, self.max_service_braking_est * 0.94 - max(0.0, d_wind_hat))
             du_step = dt / max(dt, self.t_land_ref)
+            sim_rem = rem_dist_now
+            sim_v_l = v_curr
             for i in range(n_p):
                 u_i = min(1.0, u_now + (i + 1) * du_step)
                 v_cos_i = 0.5 * self.v_entry_ref * (1.0 + math.cos(pi_val * u_i))
-                if rem_dist_now <= 0.03 or u_i >= 0.999:
+                v_stop_env = math.sqrt(max(0.0, 2.0 * b_phys_stop * max(0.0, sim_rem)))
+                if v_cos_i > v_stop_env:
+                    v_cos_i = v_stop_env
+                if rem_dist_now <= 0.03 or sim_rem <= 0.03 or u_i >= 0.999:
                     v_cos_i = 0.0
-                v_ref[i] = v_cos_i if v_cos_i > 0.0 else 0.0
+                v_cos_pos = v_cos_i if v_cos_i > 0.0 else 0.0
+                v_ref[i] = v_cos_pos
+                sim_rem -= 0.5 * (sim_v_l + v_cos_pos) * dt
+                sim_v_l = v_cos_pos
 
             t_land_rem = max(0.0, (1.0 - u_now) * self.t_land_ref)
             return v_ref, self.x_brake_dynamic, float(t_land_rem)

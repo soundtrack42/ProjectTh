@@ -72,23 +72,33 @@ This document tracks all mathematical, physical, algorithmic, and verification u
 
 | Method | Metric | Clean (15 Scen.) | Weather-Disturbed (15 Scen.) | Combined (30 Scen.) |
 | :--- | :--- | :---: | :---: | :---: |
-| **4. Multi-Property PPO (Unshielded)** | `\|TimeErr\|` | `0.87 s` | `1.57 s` | `1.22 s` |
-| | `\|StopErr\|` | `0.003 m` | `0.013 m` | `0.008 m` |
-| | `SmoothLoss` | `0.0558` | `0.0547` | `0.0553` |
-| | `SpecEnergy` | `36.40 Wh/t-km` | `52.21 Wh/t-km` | `44.31 Wh/t-km` |
-| | `LossScore` | `1.9405` | `3.1833` | `2.5619` |
-| **7. Contract-Shielded PPO (UCB-DMPS Cosine)** | `\|TimeErr\|` | **`0.44 s`** | **`0.97 s`** | **`0.70 s`** (**-42.6% vs M4**) |
-| | `\|StopErr\|` | **`0.003 m`** | **`0.007 m`** | **`0.005 m`** (**-37.5% vs M4**) |
-| | `SmoothLoss` | **`0.0467`** | **`0.0457`** | **`0.0462`** (**-16.5% vs M4**) |
-| | `SpecEnergy` | **`35.27 Wh/t-km`** | **`49.45 Wh/t-km`** | **`42.36 Wh/t-km`** (**-1.95 vs M4**) |
-| | `LossScore` | `1.4564` | **`2.3990`** | **`1.9277`** (**#1 Overall**) |
-| **8. Soft-Curve PPO (No Cosine, Unshielded)** | `\|TimeErr\|` | `0.41 s` | `1.60 s` | `1.01 s` |
-| | `\|StopErr\|` | `0.005 m` | `0.011 m` | `0.008 m` |
-| | `SmoothLoss` | `0.0582` | `0.0557` | `0.0570` |
-| | `SpecEnergy` | `35.95 Wh/t-km` | `50.16 Wh/t-km` | `43.05 Wh/t-km` |
-| | `LossScore` | `1.5037` | `3.1375` | `2.3206` |
-| **9. Soft-Curve PPO + Jerk-Horizon UCB-DMPS** | `\|TimeErr\|` | **`0.34 s`** | `1.44 s` | **`0.89 s`** (**-11.9% vs M8**) |
-| | `\|StopErr\|` | `0.005 m` | `0.010 m` | `0.008 m` |
-| | `SmoothLoss` | `0.0525` | `0.0499` | **`0.0512`** (**-10.2% vs M8**) |
-| | `SpecEnergy` | `35.90 Wh/t-km` | `50.03 Wh/t-km` | **`42.96 Wh/t-km`** |
-| | `LossScore` | **`1.4244`** (**#1 Clean**) | `2.9457` | **`2.1850`** (**-5.8% vs M8**) |
+| **4. Multi-Property PPO (Unshielded)** | `\|TimeErr\|` | `0.58 s` | `1.07 s` | `0.82 s` |
+| | `\|StopErr\|` | `0.004 m` | `0.011 m` | `0.008 m` |
+| | `SmoothLoss` | `0.0514` | `0.0509` | `0.0512` |
+| | `SpecEnergy` | `36.70 Wh/t-km` | `51.27 Wh/t-km` | `43.98 Wh/t-km` |
+| | `LossScore` | `1.6580` | `2.6157` | `2.1369` |
+| **7. Contract-Shielded PPO (UCB-DMPS Cosine)** | `\|TimeErr\|` | **`0.54 s`** | **`0.78 s`** | **`0.66 s`** (**#1 Combined**) |
+| | `\|StopErr\|` | `0.004 m` | `0.009 m` | `0.007 m` |
+| | `SmoothLoss` | `0.0529` | `0.0539` | `0.0534` |
+| | `SpecEnergy` | **`36.34 Wh/t-km`** | `51.17 Wh/t-km` | **`43.76 Wh/t-km`** (**Beats M4**) |
+| | `LossScore` | **`1.6096`** | **`2.3117`** | **`1.9606`** (**#1 Overall**) |
+| **8. Soft-Curve PPO (No Cosine, Unshielded)** | `\|TimeErr\|` | `0.78 s` | `1.30 s` | `1.04 s` |
+| | `\|StopErr\|` | `0.004 m` | `0.008 m` | **`0.006 m`** |
+| | `SmoothLoss` | `0.0600` | `0.0519` | `0.0559` |
+| | `SpecEnergy` | `37.00 Wh/t-km` | `51.88 Wh/t-km` | `44.44 Wh/t-km` |
+| | `LossScore` | `1.8890` | `2.8333` | `2.3611` |
+| **9. Soft-Curve PPO + Jerk-Horizon UCB-DMPS** | `\|TimeErr\|` | `0.54 s` | `1.05 s` | `0.80 s` (**-23.1% vs M8**) |
+| | `\|StopErr\|` | `0.007 m` | `0.009 m` | `0.008 m` |
+| | `SmoothLoss` | `0.0616` | `0.0558` | `0.0587` |
+| | `SpecEnergy` | `36.71 Wh/t-km` | `51.85 Wh/t-km` | `44.28 Wh/t-km` (**Beats M8**) |
+| | `LossScore` | `1.6697` | `2.5977` | **`2.1337`** (**-9.6% vs M8**) |
+
+Also verified on 10 live Finnish Digitraffic + Open-Meteo scenarios (`110.6 km`, `16,939` steps): combined M4 `3.42 s | 52.62 Wh/t-km | Loss = 5.0556` vs. M7 `2.02 s | 52.72 Wh/t-km | Loss = 3.6269 | Sh = 8.4%` (`99.99%` clean API / `99.72%` extreme noise tube containment).
+
+---
+
+## 3. Forward "On-Track" Eco-Coasting Shield & Causal 3-Block 2nd-Diff Mass ID (`goodall_trajectory_shield.py`, `dynamic_railroad_mpc.py`)
+
+* **Forward Zone-by-Zone "On-Track" Eco-Coasting (`_build_remaining_time_estimator`, `estimate_remaining_time_at_speed`, `compute_on_track_slack_s`, `_compute_eco_speed_limit`):** Computes exact remaining corridor travel time `t_rem(min(v_cap_z, v_meas))` summed across remaining speed zones plus stop trajectory `t_land`, activating `C4_ECO_REGEN_COAST` against positive throttle commands whenever `ot_slack > 3.0 s`, `v_obs > max(12.4, v_pace_feasible + 0.25)`, `u_act > 0.02`, and `v_cmd > v_obs + 0.08` (alongside downhill/curve coasting, `C1` downward clamp, and immediate-clear latch release). Across 30 synthetic scenarios (`99.96%` containment), UCB arbitration actively selects `C4` (`C1=0, C2=43, C3=334, C4=1631`), cutting energy below Unshielded PPO on both Cosine (`43.76` vs. `43.98`, `Sh=13.5%`, `LossScore=1.9606`) and Soft-Curve (`44.28` vs. `44.44`, `Sh=11.4%`, `LossScore=2.1337`).
+* **Causal Telescoping 3-Block 2nd-Diff IRLS MAP Mass ID (`_estimate_causal_mass_kg`):** Preserves `0.72/0.28` actuator lag inside per-step force projections `f_k` and `(1, -0.14)` velocity momentum over triple blocks `[s, s+W), [s+W, s+2W), [s+2W, s+3W)` (`k < 64`), taking the second difference to cancel smooth linear wind ramps while telescoping intermediate tachometer noise and self-calibrating between smooth `(1,2,4,8)` and noisy `(4,8,12)` departures via `W=1` MAD (`1.4 kg` MAE clean, `max = 10.7 kg`; `774.0 kg` MAE extreme noise).
+* **Architecture Diagram Sync ([generate_architecture_diagram.py](file:///home/giorge/Desktop/ProjectTh/deadline_station_trackGen/generate_architecture_diagram.py)):** Regenerated `contracts_hierarchical_shielding_arch.png` reflecting the forward on-track slack estimator, 3-block 2nd-diff MAP mass ID, `86.5%` pass-through / `13.5%` shield-active split, and all-contract UCB feedback loop.

@@ -220,9 +220,8 @@ class LearnedLinearizationModel(nn.Module):
         dv_norm = (v_lin_next - v_curr) / 1.5
         u_norm = torch.clamp(u_cmd, -1.0, 1.0)
         quad_norm = v_norm ** 2
-        zeros_3 = torch.zeros_like(gains_norm)
         base = torch.stack([dv_norm, v_norm, u_norm, ext_force, quad_norm], dim=-1)
-        return torch.cat([base, zeros_3], dim=-1)
+        return torch.cat([base, gains_norm], dim=-1)
 
     def forward(
         self,
@@ -1128,49 +1127,22 @@ def _compute_surrogate_horizon_q_costs(
         obs_buffer.append(surrogate_env.get_observation())
         saved_state = surrogate_env.get_internal_state()
 
-        k_curr = surrogate_env.k
-        k_12 = min(k_curr + 12, surrogate_env.max_steps)
-        v_win_12 = surrogate_env.v_des[max(0, k_curr) : k_12 + 1]
-        dv_win_12 = np.diff(v_win_12) if len(v_win_12) > 1 else np.array([0.0])
-        in_stop_approach = (
-            (surrogate_env.shift_timer == 0)
-            and (float(np.min(v_win_12)) <= 3.1)
-            and (float(np.min(dv_win_12)) < -0.02)
-            and (float(surrogate_env.v_des[min(k_curr + 1, surrogate_env.max_steps)] - surrogate_env.v_des[k_curr]) < -0.015)
-        )
-
         costs_a = np.zeros(n_algs, dtype=np.float32)
         for a_idx in range(n_algs):
             surrogate_env.set_internal_state(saved_state)
             cum_cost = 0.0
             discount = 1.0
-            for h in range(rollout_horizon):
-                if is_learned:
-                    act_h = (
-                        a_idx
-                        if (h <= 1 or not surrogate_env.shift_timer)
-                        else (4 if n_algs == 5 else 2)
-                    )
-                else:
-                    act_h = (
-                        a_idx
-                        if (h == 0 or not surrogate_env.shift_timer)
-                        else (4 if n_algs == 5 else 2)
-                    )
-
+            for _ in range(rollout_horizon):
                 if n_algs == 5:
-                    _, rew, term, _, info_h = surrogate_env.step_hybrid(act_h)
+                    _, rew, term, _, info_h = surrogate_env.step_hybrid(a_idx)
                 else:
-                    _, rew, term, _, info_h = surrogate_env.step(act_h)
+                    _, rew, term, _, info_h = surrogate_env.step(a_idx)
 
                 step_cost = -rew
                 if is_learned and info_h.get("shift_active", False):
                     s_sign = 1.0 if surrogate_env.shift_delta >= 0.0 else -1.0
                     margin_os = max(0.0, s_sign * (surrogate_env.v_real - info_h["v_des"]))
                     step_cost += 180.0 * margin_os
-
-                if n_algs == 5 and a_idx < 4:
-                  step_cost += 25.0 * abs(surrogate_env.int_err) + (25.0 if in_stop_approach else 4.5)
 
                 cum_cost += discount * step_cost
                 discount *= 0.72

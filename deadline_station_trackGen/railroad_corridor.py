@@ -373,6 +373,28 @@ def generate_multi_station_scenario(
         leg_mass_kg = float(tare_mass_kg + curr_passengers * avg_pax_weight_kg)
         ticket_est_mass_kg = float(tare_mass_kg + curr_tickets * 75.0)
 
+        if leg_idx == 0:
+            is_scenario_weather = (wind_mode != "none") and (
+                True if wind_mode in ("disjoint", "continuous") else ((seed // 29) % 2 == 0)
+            )
+        is_weather_active = is_scenario_weather
+
+        if not is_weather_active:
+            weather_name, mu_adhesion, temp_c, w_type = "Clear-Dry", 1.00, 20.0, -1
+        else:
+            # Sample unseen weather regime before computing leg budget so adhesion adder uses current leg's mu_adhesion
+            w_type = int(rng.choice([0, 1, 2, 3, 4], p=[0.22, 0.24, 0.18, 0.18, 0.18]))
+            if w_type == 0:
+                weather_name, mu_adhesion, temp_c = "Windy-Dry", 1.00, 16.0
+            elif w_type == 1:
+                weather_name, mu_adhesion, temp_c = "Rain-WetRail", 0.86, 8.0
+            elif w_type == 2:
+                weather_name, mu_adhesion, temp_c = "Cold-Humid", 0.92, -6.0
+            elif w_type == 3:
+                weather_name, mu_adhesion, temp_c = "Snow-Slush", 0.80, -3.0
+            else:
+                weather_name, mu_adhesion, temp_c = "Heat-Thermal", 0.94, 38.0
+
         mass_time_adder = max(0.0, (leg_mass_kg - 85000.0) / 2200.0) + (4.0 if mu_adhesion < 0.85 else 0.0)
         eff_min_feas_s = min_feas_s + mass_time_adder
 
@@ -386,16 +408,9 @@ def generate_multi_station_scenario(
         leg_deadline_s = t_clock + leg_budget_s
         dwell_s = 25.0 if leg_idx < n_legs - 1 else 0.0
 
-        if leg_idx == 0:
-            is_scenario_weather = (wind_mode != "none") and (
-                True if wind_mode in ("disjoint", "continuous") else ( (seed // 29) % 2 == 0 )
-            )
-        is_weather_active = is_scenario_weather
-
         if not is_weather_active:
             n_st = int(np.ceil((leg_budget_s + 150.0) / 0.50)) + 40
             w_prof, w_desc, w_meta = np.zeros(n_st, dtype=np.float64), "Clean (No Weather)", []
-            weather_name, mu_adhesion, temp_c = "Clear-Dry", 1.00, 20.0
         else:
             if wind_mode == "continuous":
                 w_prof, w_desc, w_meta = generate_continuous_evolving_wind(
@@ -405,22 +420,13 @@ def generate_multi_station_scenario(
                 w_prof, w_desc, w_meta = generate_disjoint_wind_events(
                     leg_budget_s + 150.0, 0.50, calm_deadband_mps2=0.22, seed=seed * 31 + leg_idx
                 )
-            # Sample unseen weather regime (Windy-Dry, Rain-WetRail, Cold-Humid, Snow-Slush, or Heat-Thermal):
-            w_type = int(rng.choice([0, 1, 2, 3, 4], p=[0.22, 0.24, 0.18, 0.18, 0.18]))
-            if w_type == 0:
-                weather_name, mu_adhesion, temp_c = "Windy-Dry", 1.00, 16.0
-            elif w_type == 1:
-                weather_name, mu_adhesion, temp_c = "Rain-WetRail", 0.86, 8.0
+            if w_type == 1:
                 w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.15, 0.0)
             elif w_type == 2:
-                weather_name, mu_adhesion, temp_c = "Cold-Humid", 0.92, -6.0
                 w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.12, 0.0)
             elif w_type == 3:
-                weather_name, mu_adhesion, temp_c = "Snow-Slush", 0.80, -3.0
                 w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.20, 0.0)
-            else:
-                # High-Temperature / Heatwave (CWR rail thermal expansion T_rail ~ 56 C, oxide-softened dry adhesion):
-                weather_name, mu_adhesion, temp_c = "Heat-Thermal", 0.94, 38.0
+            elif w_type == 4:
                 w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.05, 0.0)
 
         # Wayside station sensor at departure (t=0):

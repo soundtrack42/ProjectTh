@@ -2,4 +2,7 @@ Env/
 __pycache__/
 *.pyc
 *.png
+*.json
 *.csv
+*.pt
+CHANGES.md

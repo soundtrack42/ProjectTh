@@ -1,14 +1,14 @@
 """
 Generate a publication-grade architecture diagram for the final multi-station
 train control architecture:
-  - 4-criterion event-triggered mid-horizon preemption gate -> 15-D Macro-Step PPO pilot
+  - 4-criterion event-triggered mid-horizon preemption gate -> 18-D Macro-Step PPO pilot
   - Hierarchical differential shield + Step-Adaptive Safe Contract Searching Tree
-    (Tchebycheff multi-objective scoring + Discounted-UCB + leg-wide latching)
+    (Tchebycheff multi-objective scoring + persistent Discounted-UCB + honest hysteresis latch)
   - Dual C^2 shaper (Cosine S-curve / Non-Cosine Hermite Soft-curve + fuzzy softening)
   - Fast 5x3 state-augmented LTV-MPC (closed-form 3x3 Cramer QP + DOB compensation)
   - Nonlinear train & weather-coupled plant (gusts, wet/snow adhesion, CWR/Cu temp drag)
-  - Decoupled 8-step Mass ID (k<8), Lyapunov-adaptive DOB (k>=8), and Heteroscedastic
-    Neural Physics Emulator (99% Gaussian Scissor Tube)
+  - Multi-lag differential MAP Mass ID (k<64), Lyapunov-adaptive DOB (k>=8), and
+    full 8-feature Heteroscedastic Neural Physics Emulator (99% Gaussian Scissor Tube)
 
 Run with:
   .venv/bin/python3 deadline_station_trackGen/generate_architecture_diagram.py
@@ -187,7 +187,7 @@ def build_diagram(out_dir: str) -> list[str]:
     )
     ax.text(
         9.60, 5.02,
-        r"MICRO-STEP EXECUTION & PLANT LAYER ($\Delta t = 0.5\,\mathrm{s}$ | Core Shaper+MPC: $12.2$–$13.9\,\mu\mathrm{s}$ | Total Shielded: $30.1$–$36.3\,\mu\mathrm{s}$)",
+        r"MICRO-STEP EXECUTION & PLANT LAYER ($\Delta t = 0.5\,\mathrm{s}$ | Core Shaper+MPC: $11.8$–$13.1\,\mu\mathrm{s}$ | Total Shielded: $27.1$–$28.5\,\mu\mathrm{s}$)",
         ha="center", va="center", fontsize=7.8, fontweight="bold", color="#065F46",
     )
     ax.text(
@@ -218,9 +218,9 @@ def build_diagram(out_dir: str) -> list[str]:
         ax, 4.92, 5.92, 3.60, 1.98,
         r"2. Macro-Step PPO Pilot ($\pi_\theta$)",
         [
-            r"15-D observation ($O(1)$ 12-step cache):",
-            r"schedule pace $v_{\mathrm{feas}}$, locked mass $\hat{M}$, DOB $\hat{d}_k$,",
-            r"grade/wind/ceiling lookahead, speed margin",
+            r"18-D observation (forward slope + adhesion aware):",
+            r"kinematic pace hint, mass $\hat{M}$, DOB $\hat{d}_k$,",
+            r"grade lookahead (+150/350m), speed ceilings, $\mu_{\mathrm{adh}}$",
             r"Outputs $p_{\mathrm{task}} = (v_{\mathrm{cmd}}, a_{\mathrm{start}}, b_{\mathrm{land}})$",
             r"held over $M=8$ cruise ($M=1$ landing) unless preempted",
         ],
@@ -232,14 +232,14 @@ def build_diagram(out_dir: str) -> list[str]:
         ax, 9.32, 5.92, 5.56, 1.98,
         "3. Hierarchical Differential & Contract Tree Shield (UCB-DMPS)",
         [
-            r"Hierarchy $\mathcal{W}_3$ ($j\leq 0.48, a\leq 0.92$) $\subset \mathcal{W}_2$ $\subset \mathcal{W}_1$ ($v_{\mathrm{ceil}} - 0.15\,r_{99}$)",
-            r"Evaluates differential pressures $(\rho_1,\rho_2,\rho_3,\rho_E,\rho_T)$ vs. deadline slack",
-            r"Safe Contract Searching Tree (depth $M_{\mathrm{rem}}$): expands $\mathcal{L}_{\mathrm{cert}}=\{\mathcal{C}_0..\mathcal{C}_4\}$, prunes via",
-            r"99% reachable leaf tube; scores Tchebycheff $g^{\mathrm{te}}$ + Discounted-UCB + 2-step check",
-            r"Latches $(a_{\mathrm{lat}}, b_{\mathrm{lat}})$ across leg & syncs pace $v_{\mathrm{feas}}(a_{\mathrm{lat}}, b_{\mathrm{lat}}) \rightarrow p_{\mathrm{safe}}$",
+            r"Hierarchy $\mathcal{W}_3$ ($j\leq 0.48, a\leq 0.92$) $\subset \mathcal{W}_2$ $\subset \mathcal{W}_1$ ($v_{\mathrm{ceil}} - r_{99}$)",
+            r"Evaluates pressures $(\rho_1,\rho_2,\rho_3,\rho_E,\rho_T)$ + forward 'on-track' zone/stop slack",
+            r"Safe Contract Searching Tree (depth $M_{\mathrm{rem}}$): evaluates ALL 4 contracts $\{\mathcal{C}_1..\mathcal{C}_4\}$,",
+            r"prunes via full 99% leaf tube; causal energy-excess UCB + Tchebycheff + 2-step check",
+            r"2-step latch clears immediately on $h\geq 0$ (no post-clear lock / forced $v_{\max}$) $\rightarrow p_{\mathrm{safe}}$",
         ],
         facecolor="#FEF3C7", edgecolor="#B45309", header_bg="#FDE68A", title_color="#78350F",
-        fontsize_body=7.75,
+        fontsize_body=7.65,
     )
 
     # Arrows inside Supervisory Layer (wide 0.80 gaps!)
@@ -283,7 +283,7 @@ def build_diagram(out_dir: str) -> list[str]:
         "6. Nonlinear Train & Weather-Coupled Plant",
         [
             r"First-order lag: $u_{\mathrm{act}}(k) = 0.72\,u_{\mathrm{cmd}}(k) + 0.28\,u_{\mathrm{act}}(k-1)$",
-            r"Mass $M \in [75.6, 94.2]\,\mathrm{t}$ + Davis/grade/curve forces",
+            r"Mass $M \in [75.3, 99.2]\,\mathrm{t}$ + Davis/grade/curve forces",
             "5 Weather/Thermal Regimes: Storm Gusts, Wet/Snow",
             r"Polach adhesion $\mu_{\mathrm{adh}}$, $\rho_{\mathrm{air}}(T)$, CWR/Cu temp drag",
         ],
@@ -303,26 +303,26 @@ def build_diagram(out_dir: str) -> list[str]:
     # =========================================================================
     _draw_box(
         ax, 0.52, 0.40, 6.85, 1.44,
-        r"7. Decoupled Station Mass ID ($k < 8$) & Lyapunov-Adaptive DOB ($k \geq 8$)",
+        r"7. Causal 3-Block 2nd-Diff MAP Mass ID ($k < 64$) & Adaptive DOB ($k \geq 8$)",
         [
-            r"$k < 8$: Station departure window locks 8-step median inertia $\hat{M}_{\mathrm{locked}}$ (with wayside wind, zero reset)",
-            r"$k \geq 8$: Adaptive DOB $\hat{d}_k$ tracks storm gusts, Polach adhesion drops, & CWR/Cu thermal resistance shifts",
-            r"Cleanly separates time-invariant payload uncertainty ($M$) from time-varying external disturbances ($d_{\mathrm{ext}}$)",
+            r"Telescoping multi-width $(1,2,4,8)$ / $(4,8,12)$ block IRLS with per-step lag $f_k$ & noise gating",
+            r"$k \geq 8$: Adaptive DOB $\hat{d}_k$ tracks storm gusts, Polach adhesion drops, & CWR/Cu thermal shifts",
+            r"Cancels constant + linear wind drift; converges to $1.4\,\mathrm{kg}$ MAE clean / $774\,\mathrm{kg}$ extreme",
         ],
         facecolor="#F5F3FF", edgecolor="#6D28D9", header_bg="#EDE9FE", title_color="#4C1D95",
-        fontsize_body=7.8,
+        fontsize_body=7.7,
     )
 
     _draw_box(
         ax, 7.98, 0.40, 6.90, 1.44,
-        r"8. Heteroscedastic Neural Physics Emulator ($\hat{f}_\theta$) & 99% Gaussian Scissor Tube",
+        r"8. 8-Feature Heteroscedastic Emulator ($\hat{f}_\theta$) & 99% Scissor Tube",
         [
-            r"2-Head SiLU MLP (Gaussian NLL + $2.5\times$ asymmetric shift weight) predicts $\mu_{\mathrm{res}}$ & $\sigma_\theta$",
+            r"All 8 inputs $(dv, v, u, F_{\mathrm{ext}}, v^2, M, \rho_{\mathrm{air}}, \mu_{\mathrm{adh}})$ active (Gaussian NLL + $2.5\times$ shift weight)",
             r"Propagates contractive variance $\sigma_k^2 = \gamma_\sigma \sigma_{k-1}^2 + \hat{\sigma}_{\mathrm{step}}^2$ ($\gamma_\sigma = 0.65$)",
-            r"Constructs $r_{99,k} = 2.576\,\sigma_k$ tube for Tree Leaf Pruning, 2-Step Check & Inductive Preemption",
+            r"Full $r_{99,k} = 2.576\,\sigma_k$ tube for Tree Leaf Pruning, 2-Step Check & Inductive Preemption",
         ],
         facecolor="#FAF5FF", edgecolor="#7E22CE", header_bg="#F3E8FF", title_color="#581C87",
-        fontsize_body=7.8,
+        fontsize_body=7.7,
     )
 
     # =========================================================================
@@ -334,7 +334,7 @@ def build_diagram(out_dir: str) -> list[str]:
     _arrow(ax, (2.25, 4.94), (2.25, 4.78), color="#B45309", lw=2.0)
     _label_pill(
         ax, 7.70, 5.47,
-        r"Certified Safe Targets  $p_{\mathrm{safe}} = (v_{\mathrm{safe}}, a_{\mathrm{safe}}, b_{\mathrm{safe}})$  [92.1%–92.8% Zero-Override Steps]",
+        r"Certified Safe Targets  $p_{\mathrm{safe}} = (v_{\mathrm{safe}}, a_{\mathrm{safe}}, b_{\mathrm{safe}})$  [86.5% Pass-Through / 13.5% Shield-Active]",
         bg="#FFFBEB", edge="#D97706", color="#92400E", bold=True, fontsize=7.9,
     )
 
