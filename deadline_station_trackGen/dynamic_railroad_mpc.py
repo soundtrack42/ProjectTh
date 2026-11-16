@@ -4,8 +4,16 @@ for Multi-Station Automatic Train Operation (`dynamic_railroad_mpc.py`).
 """
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import argparse
 import copy
+import csv
+import json
 import math
 import time
 import numpy as np
@@ -33,6 +41,7 @@ from railroad_corridor import (
     generate_multi_station_scenario,
 )
 from cosine_trajectory_shaper import CosineTrajectoryShaper
+from real_world_rail_weather import fetch_real_world_multi_station_scenario
 from bilbao_cbtc_ato import BilbaoCBTCATOController
 from goodall_trajectory_shield import (
     TrajectoryShieldConfig,
@@ -81,9 +90,15 @@ class MPCTransitionRailroadEnv:
         self.physics.max_traction_accel = self.corridor.base_max_traction_accel * mass_ratio * adh_mu
         self.physics.max_braking_decel = self.corridor.base_max_service_braking * mass_ratio * adh_mu
         if reset_shaper or not hasattr(self, "shaper"):
-            self.shaper = CosineTrajectoryShaper(self.corridor, use_cosine=self.use_cosine_shaper)
+            self.shaper = CosineTrajectoryShaper(
+                self.corridor,
+                use_cosine=self.use_cosine_shaper,
+                max_traction_accel=self.physics.max_traction_accel,
+                max_service_braking=self.physics.max_braking_decel,
+            )
         else:
             self.shaper.corridor = self.corridor
+            self.shaper.sync_limits(self.physics.max_traction_accel, self.physics.max_braking_decel)
         self.mpc = PureLiuMPC(
             n_p=5, n_c=3, q1=160.0, q2=0.05, q3=0.35, adaptive_shift=True,
             dt=self.corridor.dt, mass_kg=ctrl_mass,
@@ -109,11 +124,18 @@ class MPCTransitionRailroadEnv:
         # At station standstill (wheel brakes locked), read station wayside telemetry:
         # turnstile ticket prior mass, rail adhesion sensor, temperature, and anemometer:
         self.mass_hat_kg = float(getattr(self.corridor, "ticket_estimated_mass_kg", 85000.0))
+        self.mass_prior_kg = self.mass_hat_kg
         self.mass_locked = False
         self.mass_samples = []
+        # Bayesian MAP prior weight in acceleration-weighted impulse space prevents noisy anemometer spikes from blowing up M_hat
+        self.mass_den_sum = 0.25
+        self.mass_num_sum = self.mass_den_sum * self.mass_prior_kg
         self.d_standstill = float(getattr(self.corridor, "station_wind_sensor_mps2", 0.0))
         self.station_mu = float(getattr(self.corridor, "adhesion_mu_factor", 1.0))
         self.station_temp_c = float(getattr(self.corridor, "temp_celsius", 18.0))
+        self.speed_sensor_noise_mps = float(getattr(self.corridor, "speed_sensor_noise_mps", 0.0))
+        self.unmodeled_drag_factor = float(getattr(self.corridor, "unmodeled_drag_factor", 1.0))
+        self.sensor_rng = np.random.default_rng(int(getattr(self.corridor, "sensor_noise_seed", 0)))
         self._sync_physics_and_mpc(use_estimated_mass=True)
 
         self.t_curr = float(self.corridor.start_time_s)
@@ -121,6 +143,8 @@ class MPCTransitionRailroadEnv:
         self.x_curr = 0.0
         self.v_curr = 0.0
         self.v_prev = 0.0
+        self.v_meas = 0.0
+        self.v_meas_prev = 0.0
         self.u_act = 0.0
         self.d_hat = self.d_standstill
         self.d_hat_prev = self.d_standstill
@@ -132,22 +156,23 @@ class MPCTransitionRailroadEnv:
         self.energy_kwh = 0.0
         self.regen_kwh = 0.0
         self.sigma_tube = 0.0045
-        self._feas_cache: tuple[int, float, float, float, float] | None = None
+        self._feas_cache_k: int = -1
+        self._feas_cache_map: dict[tuple[float, float], tuple[float, float]] = {}
         self.shaper.reset()
         self.mpc.reset()
         return self._get_obs()
 
     def compute_feasible_deadline_pace(self, a_start: float, b_land: float) -> tuple[float, float]:
-        if (
-            self._feas_cache is not None
-            and self._feas_cache[0] == self.k_elapsed
-            and abs(self._feas_cache[1] - a_start) < 1e-6
-            and abs(self._feas_cache[2] - b_land) < 1e-6
-        ):
-            return self._feas_cache[3], self._feas_cache[4]
+        if self._feas_cache_k != self.k_elapsed:
+            self._feas_cache_k = self.k_elapsed
+            self._feas_cache_map.clear()
+        cache_key = (round(a_start, 6), round(b_land, 6))
+        cached = self._feas_cache_map.get(cache_key)
+        if cached is not None:
+            return cached
 
         x_curr = self.x_curr
-        v_curr = self.v_curr
+        v_curr = self.v_meas
         station_x_m = self.corridor.station_x_m
         x_rem = max(0.0, station_x_m - x_curr)
         t_rem = max(self.corridor.dt, self.corridor.deadline_s - self.t_curr)
@@ -161,11 +186,16 @@ class MPCTransitionRailroadEnv:
 
         if x_rem <= 15.0 or self.shaper.in_landing:
             v_f = 0.0 if v_naive < 0.0 else (v_local_cap if v_naive > v_local_cap else float(v_naive))
-            self._feas_cache = (self.k_elapsed, a_start, b_land, v_f, float(v_naive))
-            return v_f, float(v_naive)
+            res_f = (v_f, float(v_naive))
+            self._feas_cache_map[cache_key] = res_f
+            return res_f
 
         _, _, _, b_eff_land = CosineTrajectoryShaper.dynamic_cosine_braking_spot(
-            self.corridor, max(v_curr, 12.2), b_land, d_wind_hat=self.d_hat
+            self.corridor,
+            max(v_curr, 12.2),
+            b_land,
+            d_wind_hat=self.d_hat,
+            max_braking_decel=self.physics.max_braking_decel,
         )
         if self.use_cosine_shaper:
             land_k = 0.5 * math.pi
@@ -228,8 +258,9 @@ class MPCTransitionRailroadEnv:
                 hi = mid
         v_feas = 0.5 * (lo + hi)
         v_res = 1.5 if v_feas < 1.5 else (v_local_cap if v_feas > v_local_cap else float(v_feas))
-        self._feas_cache = (self.k_elapsed, a_start, b_land, v_res, float(v_naive))
-        return v_res, float(v_naive)
+        res_f = (v_res, float(v_naive))
+        self._feas_cache_map[cache_key] = res_f
+        return res_f
 
     def _get_obs(self) -> np.ndarray:
         x_rem = max(0.0, self.corridor.station_x_m - self.x_curr)
@@ -238,7 +269,11 @@ class MPCTransitionRailroadEnv:
         v_lim_300 = self.corridor.get_speed_limit(min(self.corridor.station_x_m, self.x_curr + 300.0))
 
         x_brake, dx_brake, t_land, _ = CosineTrajectoryShaper.dynamic_cosine_braking_spot(
-            self.corridor, self.v_curr, self.corridor.comfort_braking_decel, d_wind_hat=self.d_hat
+            self.corridor,
+            self.v_meas,
+            self.corridor.comfort_braking_decel,
+            d_wind_hat=self.d_hat,
+            max_braking_decel=self.physics.max_braking_decel,
         )
         v_naive = x_rem / t_rem
         t_to_brake_local = max(1.0, t_rem - t_land)
@@ -255,11 +290,11 @@ class MPCTransitionRailroadEnv:
             self.x_curr / self.corridor.station_x_m,
             x_rem / self.corridor.station_x_m,
             t_rem / 450.0,
-            self.v_curr / 18.0,
+            self.v_meas / 18.0,
             v_naive / 18.0,
             v_kin_hint / 18.0,
             (v_kin_hint - v_naive) / 4.0,
-            (self.v_curr - v_naive) / 5.0,
+            (self.v_meas - v_naive) / 5.0,
             v_lim_now / 18.0,
             v_lim_300 / 18.0,
             np.tanh((x_brake - self.x_curr) / 500.0),
@@ -278,6 +313,12 @@ class MPCTransitionRailroadEnv:
         a2 = -1.0 if a2_raw < -1.0 else (1.0 if a2_raw > 1.0 else a2_raw)
         a_start_cos = 0.96 + 0.22 * a1   # [0.74, 1.18] m/s^2
         b_land_cos = 0.78 + 0.12 * a2    # [0.66, 0.90] m/s^2
+        if not self.use_cosine_shaper:
+            # Learned Non-Cosine Soft-Curve Trajectory (Methods 8 & 9):
+            a_s = 0.92 * a_start_cos + 0.08 * 0.88
+            a_start_cos = 0.74 if a_s < 0.74 else (1.14 if a_s > 1.14 else a_s)
+            b_s = 0.92 * b_land_cos + 0.08 * 0.74
+            b_land_cos = 0.66 if b_s < 0.66 else (0.86 if b_s > 0.86 else b_s)
 
         v_feas, v_naive = self.compute_feasible_deadline_pace(a_start_cos, b_land_cos)
         is_ucb_dmps = (self.traj_shield is not None and self.traj_shield.cfg.mode == "mps_rollout")
@@ -292,12 +333,6 @@ class MPCTransitionRailroadEnv:
         # Action[0] = 0.0 corresponds to naive pace; Action[0] > 0 commands cruise velocity overshoot
         v_raw = v_naive + 3.80 * a0
         if not self.use_cosine_shaper:
-            # Learned Non-Cosine Soft-Curve Trajectory (Methods 8 & 9):
-            # Synchronize cruise pace with the exact C^2 algebraic soft-curve feasible deadline pace v_feas
-            # while retaining policy-adapted responsiveness and slightly gentler comfort parameters:
-            a_start_cos = float(np.clip(0.92 * a_start_cos + 0.08 * 0.88, 0.74, 1.14))
-            b_land_cos = float(np.clip(0.92 * b_land_cos + 0.08 * 0.74, 0.66, 0.86))
-            v_feas, v_naive = self.compute_feasible_deadline_pace(a_start_cos, b_land_cos)
             v_raw = 0.68 * v_feas + 0.32 * v_raw
         v_cmd_rl = 1.5 if v_raw < 1.5 else (v_cap if v_raw > v_cap else v_raw)
         return v_cmd_rl, a_start_cos, b_land_cos, v_feas, v_naive
@@ -327,7 +362,12 @@ class MPCTransitionRailroadEnv:
         macro_shield_us = (t_macro_1 - t_macro_0) * 1e6
 
         x_brake_est, _, _, _ = CosineTrajectoryShaper.dynamic_cosine_braking_spot(
-            self.corridor, self.v_curr, b_land_cos, v_scissor_rad=0.0, d_wind_hat=self.d_hat
+            self.corridor,
+            self.v_meas,
+            b_land_cos,
+            v_scissor_rad=0.0,
+            d_wind_hat=self.d_hat,
+            max_braking_decel=self.physics.max_braking_decel,
         )
         n_substeps = 1 if (self.shaper.in_landing or (x_brake_est - self.x_curr) < 180.0) else self.corridor.macro_steps
         d_hat_at_trigger = self.d_hat  # Record disturbance at macro-trigger instant k_t (Sun et al. 2024 Eq. 20)
@@ -340,7 +380,7 @@ class MPCTransitionRailroadEnv:
             t0 = time.thread_time()
             v_ref_h, x_brake_active, _ = self.shaper.step_reference_horizon(
                 self.x_curr,
-                self.v_curr,
+                self.v_meas,
                 self.t_curr,
                 v_cmd_rl,
                 a_start_cos,
@@ -355,9 +395,9 @@ class MPCTransitionRailroadEnv:
             ) / (self.physics.M * self.physics.g)
 
             eff_ff_gain = 1.00 if self.shaper.in_landing else mpc_wind_comp_gain
-            self.mpc.prev_v = float(self.v_prev)
+            self.mpc.prev_v = float(self.v_meas_prev)
             u_cmd = self.mpc.select_action(
-                v_curr=self.v_curr,
+                v_curr=self.v_meas,
                 v_ref_horizon=v_ref_h,
                 slope_iota=slope_iota,
                 dt_step=self.corridor.dt,
@@ -370,7 +410,7 @@ class MPCTransitionRailroadEnv:
             t_emu_0 = time.thread_time()
             if self.traj_shield is not None:
                 v_emu_step, _, self.sigma_tube = self.traj_shield.predict_emulator_step_with_uncertainty(
-                    self.physics, self.x_curr, self.v_curr, self.v_prev,
+                    self.physics, self.x_curr, self.v_meas, self.v_meas_prev,
                     self.u_act, u_cmd, self.sigma_tube, d_wind_hat=self.d_hat,
                     ext_f_norm=slope_iota * 33.333333333333336,
                 )
@@ -391,10 +431,10 @@ class MPCTransitionRailroadEnv:
             # 3) Stator/inverter copper winding temperature coefficient alpha_Cu = 0.00393 K^-1 above 20 C (Xiao et al. 2023)
             cu_temp_factor = 1.0 + 0.00393 * max(0.0, self.station_temp_c - 20.0)
 
-            u_clamped = float(np.clip(u_cmd, -1.0, 1.0))
+            u_clamped = -1.0 if u_cmd < -1.0 else (1.0 if u_cmd > 1.0 else float(u_cmd))
             self.u_act = 0.72 * u_clamped + 0.28 * self.u_act
             f_prop_true = self.u_act * self.true_physics.max_propulsion_force(self.v_curr, self.u_act)
-            f_drag_true = self.true_physics.basic_resistance(self.v_curr) * rho_air_station
+            f_drag_true = self.true_physics.basic_resistance(self.v_curr) * rho_air_station * self.unmodeled_drag_factor
             f_grade_true = self.true_physics.grade_resistance(self.x_curr)
             f_curve_true = self.true_physics.curve_resistance(self.x_curr) * cwr_thermal_factor
             a_true_nom = (f_prop_true - f_drag_true - f_grade_true - f_curve_true) / self.true_physics.M_eff
@@ -410,20 +450,43 @@ class MPCTransitionRailroadEnv:
             jerk = abs(a_real - self.prev_accel) / self.corridor.dt
             self.prev_accel = a_real
 
-            # Online 8-step mass identification using station wayside telemetry (k_elapsed < 8)
+            # Causal speed sensor observation (with optional tachometer noise in extreme scenarios)
+            if self.speed_sensor_noise_mps > 0.0 and (v_next > 1e-4 or self.v_curr > 1e-4):
+                v_next_meas = float(max(0.0, v_next + self.sensor_rng.normal(0.0, self.speed_sensor_noise_mps)))
+            else:
+                v_next_meas = v_next
+            inertia_mom_meas = 0.14 * (self.v_meas - self.v_meas_prev)
+
+            # Online 8-step mass identification using strictly causal station wayside telemetry (k_elapsed < 8)
             self.d_hat_prev = self.d_hat
-            a_meas_no_mom = ((v_next - self.v_curr) - inertia_mom) / self.corridor.dt
+            a_meas_no_mom = ((v_next_meas - self.v_meas) - inertia_mom_meas) / self.corridor.dt
+            a_meas_obs = (v_next_meas - self.v_meas) / self.corridor.dt
 
             if self.k_elapsed < 8:
-                self.d_standstill = d_ext
-                self.d_hat = d_ext
-                a_nom_measured = a_meas_no_mom - d_ext
-                spec_grade_curve = (f_grade_true + f_curve_true) / self.true_physics.M
-                denom_per_kg = (1.0 + self.true_physics.gamma) * a_nom_measured + spec_grade_curve
-                if abs(denom_per_kg) > 1e-4 and abs(self.u_act) > 1e-3:
-                    m_step_est = (f_prop_true - f_drag_true) / denom_per_kg
-                    self.mass_samples.append(float(np.clip(m_step_est, 70000.0, 102000.0)))
-                    self.mass_hat_kg = float(np.median(self.mass_samples))
+                # Strictly use station anemometer reading (self.d_standstill) and controller physics (no ground-truth d_ext or true_physics)
+                self.d_hat = self.d_standstill
+                a_nom_measured = a_meas_no_mom - self.d_standstill
+                f_prop_est = self.u_act * self.physics.max_propulsion_force(self.v_meas, self.u_act)
+                f_drag_est = self.physics.basic_resistance(self.v_meas) * rho_air_station
+                spec_grade_curve = (
+                    self.physics.grade_resistance(self.x_curr)
+                    + self.physics.curve_resistance(self.x_curr) * cwr_thermal_factor
+                ) / self.physics.M
+                denom_per_kg = (1.0 + self.physics.gamma) * a_nom_measured + spec_grade_curve
+                if abs(denom_per_kg) > 1e-4 and abs(self.u_act) > 1e-3 and v_next > 1e-6:
+                    w_k = abs(self.u_act)
+                    self.mass_num_sum += w_k * (f_prop_est - f_drag_est)
+                    self.mass_den_sum += w_k * denom_per_kg
+                    m_step_est = (f_prop_est - f_drag_est) / denom_per_kg
+                    m_lo = max(70500.0, self.mass_prior_kg - 5000.0)
+                    m_hi = min(98000.0, self.mass_prior_kg + 5000.0)
+                    m_clamped_step = m_lo if m_step_est < m_lo else (m_hi if m_step_est > m_hi else float(m_step_est))
+                    self.mass_samples.append(m_clamped_step)
+                    if self.mass_den_sum > 1e-3 and self.k_elapsed >= 2:
+                        m_int_est = self.mass_num_sum / self.mass_den_sum
+                        self.mass_hat_kg = m_lo if m_int_est < m_lo else (m_hi if m_int_est > m_hi else float(m_int_est))
+                    elif self.mass_samples:
+                        self.mass_hat_kg = float(np.median(self.mass_samples))
 
                 if self.k_elapsed == 7:
                     self.mass_locked = True
@@ -433,8 +496,8 @@ class MPCTransitionRailroadEnv:
             else:
                 # Open-line disturbance observer (k_elapsed >= 8) with Lyapunov-Adaptive & Fuzzy Rate
                 # (Hanna et al. 2023 Eqs. 35-45 + Wang, Wang, & Chen 2026 Eqs. 20-21, Table 2):
-                f_prop_est = self.u_act * self.physics.max_propulsion_force(self.v_curr, self.u_act)
-                f_drag_est = self.physics.basic_resistance(self.v_curr) * rho_air_station
+                f_prop_est = self.u_act * self.physics.max_propulsion_force(self.v_meas, self.u_act)
+                f_drag_est = self.physics.basic_resistance(self.v_meas) * rho_air_station
                 f_grade_est = self.physics.grade_resistance(self.x_curr)
                 f_curve_est = self.physics.curve_resistance(self.x_curr) * cwr_thermal_factor
                 a_est_nom = (f_prop_est - f_drag_est - f_grade_est - f_curve_est) / self.physics.M_eff
@@ -452,7 +515,8 @@ class MPCTransitionRailroadEnv:
                     # boost observer correction gain up to 0.82; when settling, damp smoothly:
                     e_d = abs(delta_d)
                     same_sign_boost = 0.08 if (delta_d * dot_delta_d > 0.0) else -0.03
-                    alpha_lyap = float(np.clip(0.45 + 0.85 * e_d / (0.14 + e_d) + same_sign_boost, 0.42, 0.82))
+                    al_raw = 0.45 + 0.85 * e_d / (0.14 + e_d) + same_sign_boost
+                    alpha_lyap = 0.42 if al_raw < 0.42 else (0.82 if al_raw > 0.82 else al_raw)
                     self.d_hat = float((1.0 - alpha_lyap) * self.d_hat + alpha_lyap * d_step)
 
             # 3. Fair Traction Energy Measurement (Inverter/Motor Copper & Transient Losses + Electrodynamic Regen Blending)
@@ -462,16 +526,15 @@ class MPCTransitionRailroadEnv:
                 # rapid torque/current slewing (accel/jerk transient losses during active ramps), and high-speed field weakening:
                 ramp_slew = 0.18 * max(0.0, a_start_cos - 0.78) if (self.shaper.ramp_u_phase < 1.0 or a_real > 0.08) else 0.0
                 slew_loss = 0.24 * (max(0.0, a_real - 0.52) ** 2) + 0.20 * (min(1.5, jerk) ** 2) + ramp_slew
-                eta_trac = float(np.clip(
-                    0.92 - 0.16 * cu_temp_factor * (self.u_act ** 2) - slew_loss - 0.010 * (max(0.0, avg_v - 13.4) ** 2),
-                    0.58, 0.92,
-                ))
+                eta_raw = 0.92 - 0.16 * cu_temp_factor * (self.u_act ** 2) - slew_loss - 0.010 * (max(0.0, avg_v - 13.4) ** 2)
+                eta_trac = 0.58 if eta_raw < 0.58 else (0.92 if eta_raw > 0.92 else eta_raw)
                 step_kwh = ((f_prop_true / eta_trac) * avg_v * self.corridor.dt) / 3.6e6
                 self.energy_kwh += step_kwh
             else:
                 # Electrodynamic regenerative braking captures deceleration smoothly when b_land_cos <= 0.72
                 # and |a_real| <= 0.68 m/s^2; steeper braking blends pneumatic friction brakes (dissipated as heat):
-                regen_blend = float(np.clip(1.0 - 1.6 * max(0.0, b_land_cos - 0.70) - 0.8 * max(0.0, abs(a_real) - 0.68), 0.35, 1.0))
+                rb_raw = 1.0 - 1.6 * max(0.0, b_land_cos - 0.70) - 0.8 * max(0.0, abs(a_real) - 0.68)
+                regen_blend = 0.35 if rb_raw < 0.35 else (1.0 if rb_raw > 1.0 else rb_raw)
                 f_regen_cap = self.true_physics.M_eff * 0.72 * regen_blend
                 f_elec_brake = min(abs(f_prop_true), f_regen_cap) if avg_v > 1.0 else 0.0
                 regen_step_kwh = 0.46 * regen_blend * (f_elec_brake * avg_v * self.corridor.dt) / 3.6e6
@@ -505,7 +568,7 @@ class MPCTransitionRailroadEnv:
                         self.v_curr, float(v_ref_h[0]), self.shaper.in_landing
                     )
                     if self.traj_shield is not None
-                    else GoodallTrajectoryShield(self.corridor).compute_regime_and_envelope_margin(
+                    else GoodallTrajectoryShield.compute_regime_and_envelope_margin_default(
                         self.v_curr, float(v_ref_h[0]), self.shaper.in_landing
                     )
                 )
@@ -546,6 +609,8 @@ class MPCTransitionRailroadEnv:
 
             self.v_prev = self.v_curr
             self.v_curr = v_next
+            self.v_meas_prev = self.v_meas
+            self.v_meas = v_next_meas
             self.x_curr = x_next
             self.t_curr += self.corridor.dt
             self.k_elapsed += 1
@@ -564,7 +629,7 @@ class MPCTransitionRailroadEnv:
             if (sub_idx >= 1) and (self.k_elapsed > 8):
                 rem_sub = n_substeps - 1 - sub_idx
                 d_shift = abs(self.d_hat - d_hat_at_trigger)
-                v_track_err = abs(self.v_curr - v_emu_step)
+                v_track_err = abs(self.v_meas - v_emu_step)
                 # Wang et al. (2026) Eq. 24-25 online fuzzy satisfaction mu_min in [0, 1]:
                 mu_y = max(0.0, 1.0 - v_track_err / (2.576 * self.sigma_tube + 0.095))
                 mu_d = max(0.0, 1.0 - d_shift / 0.175)
@@ -572,8 +637,8 @@ class MPCTransitionRailroadEnv:
                 # Inductive remaining-horizon reachable tube projection (Sun et al. 2024 Eq. 18):
                 v_lim_curr = self.corridor.get_speed_limit(self.x_curr)
                 v_rem_tube_top = (
-                    self.v_curr
-                    + rem_sub * self.corridor.dt * max(0.0, a_real + 0.5 * self.d_hat)
+                    self.v_meas
+                    + rem_sub * self.corridor.dt * max(0.0, a_meas_obs + 0.5 * self.d_hat)
                     + 2.576 * self.sigma_tube
                 )
                 if (
@@ -641,8 +706,8 @@ class MPCTransitionRailroadEnv:
             u_cmd, v_ff, v_cmd_pi, replanned = bilbao_ctrl.select_microscopic_action(
                 t_curr=self.t_curr,
                 x_curr=self.x_curr,
-                v_curr=self.v_curr,
-                v_prev=self.v_prev,
+                v_curr=self.v_meas,
+                v_prev=self.v_meas_prev,
                 d_obs=self.d_hat,
                 force_replan=False,
             )
@@ -652,10 +717,10 @@ class MPCTransitionRailroadEnv:
             rho_air_station = 293.15 / max(250.0, 273.15 + self.station_temp_c)
             cwr_thermal_factor = 1.0 + 0.0045 * max(0.0, self.station_temp_c - 25.0)
             cu_temp_factor = 1.0 + 0.00393 * max(0.0, self.station_temp_c - 20.0)
-            u_clamped = float(np.clip(u_cmd, -1.0, 1.0))
+            u_clamped = -1.0 if u_cmd < -1.0 else (1.0 if u_cmd > 1.0 else float(u_cmd))
             self.u_act = 0.72 * u_clamped + 0.28 * self.u_act
             f_prop_true = self.u_act * self.true_physics.max_propulsion_force(self.v_curr, self.u_act)
-            f_drag_true = self.true_physics.basic_resistance(self.v_curr) * rho_air_station
+            f_drag_true = self.true_physics.basic_resistance(self.v_curr) * rho_air_station * self.unmodeled_drag_factor
             f_grade_true = self.true_physics.grade_resistance(self.x_curr)
             f_curve_true = self.true_physics.curve_resistance(self.x_curr) * cwr_thermal_factor
             a_true_nom = (f_prop_true - f_drag_true - f_grade_true - f_curve_true) / self.true_physics.M_eff
@@ -671,12 +736,18 @@ class MPCTransitionRailroadEnv:
             jerk = abs(a_real - self.prev_accel) / self.corridor.dt
             self.prev_accel = a_real
 
+            if self.speed_sensor_noise_mps > 0.0 and (v_next > 1e-4 or self.v_curr > 1e-4):
+                v_next_meas = float(max(0.0, v_next + self.sensor_rng.normal(0.0, self.speed_sensor_noise_mps)))
+            else:
+                v_next_meas = v_next
+            inertia_mom_meas = 0.14 * (self.v_meas - self.v_meas_prev)
+
             # Bilbao uses station telemetry only at station standstill (k=0, via reset());
             # once moving, it relies on its open-line disturbance observer without 8-step anemometer reads:
             self.d_hat_prev = self.d_hat
-            a_meas_no_mom = ((v_next - self.v_curr) - inertia_mom) / self.corridor.dt
-            f_prop_est = self.u_act * self.physics.max_propulsion_force(self.v_curr, self.u_act)
-            f_drag_est = self.physics.basic_resistance(self.v_curr) * rho_air_station
+            a_meas_no_mom = ((v_next_meas - self.v_meas) - inertia_mom_meas) / self.corridor.dt
+            f_prop_est = self.u_act * self.physics.max_propulsion_force(self.v_meas, self.u_act)
+            f_drag_est = self.physics.basic_resistance(self.v_meas) * rho_air_station
             f_grade_est = self.physics.grade_resistance(self.x_curr)
             f_curve_est = self.physics.curve_resistance(self.x_curr) * cwr_thermal_factor
             a_est_nom = (f_prop_est - f_drag_est - f_grade_est - f_curve_est) / self.physics.M_eff
@@ -694,14 +765,13 @@ class MPCTransitionRailroadEnv:
             if f_prop_true >= 0.0:
                 ramp_slew = 0.18 * max(0.0, a_eff_plan - 0.78) if a_real > 0.08 else 0.0
                 slew_loss = 0.24 * (max(0.0, a_real - 0.52) ** 2) + 0.20 * (min(1.5, jerk) ** 2) + ramp_slew
-                eta_trac = float(np.clip(
-                    0.92 - 0.16 * cu_temp_factor * (self.u_act ** 2) - slew_loss - 0.010 * (max(0.0, avg_v - 13.4) ** 2),
-                    0.58, 0.92,
-                ))
+                eta_raw = 0.92 - 0.16 * cu_temp_factor * (self.u_act ** 2) - slew_loss - 0.010 * (max(0.0, avg_v - 13.4) ** 2)
+                eta_trac = 0.58 if eta_raw < 0.58 else (0.92 if eta_raw > 0.92 else eta_raw)
                 step_kwh = ((f_prop_true / eta_trac) * avg_v * self.corridor.dt) / 3.6e6
                 self.energy_kwh += step_kwh
             else:
-                regen_blend = float(np.clip(1.0 - 1.6 * max(0.0, b_eff_plan - 0.70) - 0.8 * max(0.0, abs(a_real) - 0.68), 0.35, 1.0))
+                rb_raw = 1.0 - 1.6 * max(0.0, b_eff_plan - 0.70) - 0.8 * max(0.0, abs(a_real) - 0.68)
+                regen_blend = 0.35 if rb_raw < 0.35 else (1.0 if rb_raw > 1.0 else rb_raw)
                 f_regen_cap = self.true_physics.M_eff * 0.72 * regen_blend
                 f_elec_brake = min(abs(f_prop_true), f_regen_cap) if avg_v > 1.0 else 0.0
                 regen_step_kwh = 0.46 * regen_blend * (f_elec_brake * avg_v * self.corridor.dt) / 3.6e6
@@ -716,7 +786,7 @@ class MPCTransitionRailroadEnv:
             if record_micro:
                 v_naive_now = max(0.0, self.corridor.station_x_m - self.x_curr) / max(0.5, self.corridor.deadline_s - self.t_curr)
                 in_land = (self.corridor.station_x_m - self.x_curr) < 350.0
-                reg_name, env_margin = GoodallTrajectoryShield(self.corridor).compute_regime_and_envelope_margin(
+                reg_name, env_margin = GoodallTrajectoryShield.compute_regime_and_envelope_margin_default(
                     self.v_curr, v_ff, in_land
                 )
                 micro_logs.append({
@@ -756,6 +826,8 @@ class MPCTransitionRailroadEnv:
 
             self.v_prev = self.v_curr
             self.v_curr = v_next
+            self.v_meas_prev = self.v_meas
+            self.v_meas = v_next_meas
             self.x_curr = x_next
             self.t_curr += self.corridor.dt
             self.k_elapsed += 1
@@ -1066,6 +1138,8 @@ def evaluate_multi_station_journey(
 
         done = False
         leg_micro = []
+        act_buf = np.zeros(3, dtype=np.float32)
+        gc.collect()
         gc.disable()
 
         while not done:
@@ -1078,21 +1152,28 @@ def evaluate_multi_station_journey(
             t_pol_0 = time.thread_time()
             if mode in ("RL_LEARNED", "RL_FREE_LEARNED"):
                 assert rl_policy is not None
-                with torch.no_grad():
-                    act, _, _ = rl_policy.get_action_and_value(obs, deterministic=True)
+                act, _, _ = rl_policy.get_action_and_value(obs, deterministic=True)
                 mpc_gain = 0.95
             elif mode == "MAX_SPEED_GREEDY":
                 v_feas_g, v_naive_g = env.compute_feasible_deadline_pace(1.18, 0.90)
-                a0_greedy = 1.0 if (v_naive_g >= v_feas_g - 0.85 or env.v_curr < v_feas_g) else float(np.clip((v_feas_g + 0.65 - v_naive_g) / 3.80, 0.25, 1.0))
-                act = np.array([a0_greedy, 1.0, 1.0], dtype=np.float32)
+                if v_naive_g >= v_feas_g - 0.85 or env.v_meas < v_feas_g:
+                    a0_greedy = 1.0
+                else:
+                    ag_raw = (v_feas_g + 0.65 - v_naive_g) / 3.80
+                    a0_greedy = 0.25 if ag_raw < 0.25 else (1.0 if ag_raw > 1.0 else ag_raw)
+                act_buf[0], act_buf[1], act_buf[2] = a0_greedy, 1.0, 1.0
+                act = act_buf
                 mpc_gain = 0.95
             elif mode == "NAIVE_NO_OVERSHOOT":
-                act = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                act_buf[0], act_buf[1], act_buf[2] = 0.0, 0.0, 0.0
+                act = act_buf
                 mpc_gain = 0.95
             elif mode == "STATIC_NO_WIND_REPLAN":
                 v_naive_now = max(0.0, env.corridor.station_x_m - env.x_curr) / max(0.5, env.corridor.deadline_s - env.t_curr)
-                a0_stat = float(np.clip((v_static_target - v_naive_now) / 3.80, -1.0, 1.0))
-                act = np.array([a0_stat, 0.0, 0.0], dtype=np.float32)
+                as_raw = (v_static_target - v_naive_now) / 3.80
+                a0_stat = -1.0 if as_raw < -1.0 else (1.0 if as_raw > 1.0 else as_raw)
+                act_buf[0], act_buf[1], act_buf[2] = a0_stat, 0.0, 0.0
+                act = act_buf
                 mpc_gain = 0.0
             else:
                 raise ValueError(f"Unknown mode: {mode}")
@@ -1228,6 +1309,8 @@ def evaluate_multi_station_journey(
         "total_length_m": scenario["total_length_m"],
         "has_infeasible_leg": scenario["has_infeasible_leg"],
         "is_weather_disturbed": scenario.get("is_weather_disturbed", True),
+        "is_harsh_injected": scenario.get("is_harsh_injected", False),
+        "is_extreme_scenario": scenario.get("is_extreme_scenario", scenario.get("is_harsh_injected", False)),
         "abs_sched_err_s": mean_t_err,
         "abs_stop_err_m": mean_x_err,
         "peak_accel": float(np.max(leg_peak_accels)),
@@ -1284,6 +1367,7 @@ def save_dual_axis_wind_trajectory_shield_plot(
     run_unshielded_wind: dict,
     run_shielded_wind: dict,
     out_path: str = "wind_trajectory_shield_dual_axis.png",
+    tag_label: str = "",
 ) -> None:
     tr_nom = run_nominal_no_wind["traj"]
     tr_unsh = run_unshielded_wind["traj"]
@@ -1329,13 +1413,15 @@ def save_dual_axis_wind_trajectory_shield_plot(
     )
 
     w_true = tr_sh["wind_true"]
+    is_real_scen = "Digitraffic" in str(scenario.get("data_source", "")) or "Snapshot" in str(scenario.get("data_source", ""))
+    wind_prefix = "Meteorological" if is_real_scen else "Disjoint"
     ax_top.fill_between(
         x_sh, 0.0, 18.2, where=(w_true < -0.04), color="deepskyblue", alpha=0.12,
-        label="Disjoint Headwind Drag Event"
+        label=f"{wind_prefix} Headwind Drag Event"
     )
     ax_top.fill_between(
         x_sh, 0.0, 18.2, where=(w_true > 0.04), color="mediumseagreen", alpha=0.12,
-        label="Disjoint Tailwind Push Event"
+        label=f"{wind_prefix} Tailwind Push Event"
     )
 
     ax_top.fill_between(
@@ -1373,8 +1459,9 @@ def save_dual_axis_wind_trajectory_shield_plot(
     ax_top.set_ylabel("Train Speed v (m/s)", fontsize=11, fontweight="bold")
     masses_str = " -> ".join([f"Leg{l['leg_idx']}:{l['mass_kg']/1000:.1f}t({l['passengers']}pax)" for l in scenario["legs"]])
     n_landings = len(scenario["legs"])
+    tag_prefix = f"[{tag_label}] " if tag_label else ""
     ax_top.set_title(
-        f"Multi-Station ({scenario['total_length_m']/1000:.1f} km, {n_landings} Landings) Wind-Adapted Cosine Trajectory & Contract Shield\n"
+        f"{tag_prefix}Multi-Station ({scenario['total_length_m']/1000:.1f} km, {n_landings} Landings) Wind-Adapted Cosine Trajectory & Contract Shield\n"
         f"[Vehicle Mass Evolution: {masses_str} | Mean Leg Deadline Err = {run_shielded_wind['abs_sched_err_s']:.2f} s]",
         fontsize=11.0, fontweight="bold", pad=28,
     )
@@ -1388,7 +1475,7 @@ def save_dual_axis_wind_trajectory_shield_plot(
     ax_bot.axhline(0.0, color="k", linewidth=0.8, alpha=0.4)
     ax_bot.fill_between(x_sh, 0.0, w_true, where=(w_true < 0.0), color="deepskyblue", alpha=0.35, label="Headwind Drag (m/s²)")
     ax_bot.fill_between(x_sh, 0.0, w_true, where=(w_true >= 0.0), color="mediumseagreen", alpha=0.35, label="Tailwind Push (m/s²)")
-    ax_bot.plot(x_sh, w_true, color="navy", linewidth=1.5, label="Disjoint Wind d_wind(x)")
+    ax_bot.plot(x_sh, w_true, color="navy", linewidth=1.5, label=f"{wind_prefix} Wind d_wind(x)")
     ax_bot.plot(x_sh, tr_sh["u_act"], color="crimson", alpha=0.85, linewidth=1.4, label="MPC Throttle/Brake u_act(x)")
 
     ax_mass = ax_bot.twinx()
@@ -1409,6 +1496,167 @@ def save_dual_axis_wind_trajectory_shield_plot(
     print(f"Saved Dual-Axis {n_landings}-Station ({scenario['total_length_m']/1000:.1f} km) Wind-Trajectory-Shield plot to: {out_path}", flush=True)
 
 
+def _serialize_scenarios_subset(
+    indices: list[int],
+    category_label: str,
+    scenarios_list: list[dict],
+    agg_results: dict[str, list[dict]],
+    method_specs: list[tuple[str, str, str | None]],
+) -> tuple[list[dict], list[dict]]:
+    json_records: list[dict] = []
+    csv_rows: list[dict] = []
+    for idx in indices:
+        sc = scenarios_list[idx]
+        leg_records = []
+        for l in sc["legs"]:
+            wp = np.asarray(l["wind_profile"], dtype=np.float64)
+            leg_records.append({
+                "leg_idx": int(l["leg_idx"]),
+                "route_name": l["corridor"].route_name,
+                "station_name": l["station_name"],
+                "leg_length_m": float(l["leg_length_m"]),
+                "t_start_s": float(l["t_start"]),
+                "deadline_s": float(l["deadline_s"]),
+                "budget_s": float(l["budget_s"]),
+                "dwell_s": float(l["dwell_s"]),
+                "passengers": int(l["passengers"]),
+                "sold_tickets": int(l["sold_tickets"]),
+                "mass_kg": float(l["mass_kg"]),
+                "ticket_mass_kg": float(l["ticket_mass_kg"]),
+                "weather": l.get("weather", "Clear-Dry"),
+                "adhesion_mu": float(l["adhesion_mu"]),
+                "temp_c": float(l["temp_c"]),
+                "is_harsh_injected": bool(l.get("is_harsh_injected", False)),
+                "speed_sensor_noise_mps": float(l.get("speed_sensor_noise_mps", getattr(l["corridor"], "speed_sensor_noise_mps", 0.0))),
+                "unmodeled_drag_factor": float(l.get("unmodeled_drag_factor", getattr(l["corridor"], "unmodeled_drag_factor", 1.0))),
+                "station_wind_sensor_mps2": float(l["corridor"].station_wind_sensor_mps2),
+                "wind_peak_abs_mps2": float(np.max(np.abs(wp))) if len(wp) > 0 else 0.0,
+                "wind_mean_mps2": float(np.mean(wp)) if len(wp) > 0 else 0.0,
+                "wind_desc": l.get("wind_desc", ""),
+                "real_weather_raw": l.get("real_weather_raw"),
+                "weather_effective": l.get("weather_effective"),
+                "real_empirical_delay_s": l.get("real_empirical_delay_s"),
+                "track_bearing_deg": l.get("track_bearing_deg"),
+            })
+
+        method_metrics = {}
+        for m_name, _, _ in method_specs:
+            r = agg_results[m_name][idx]
+            m_entry = {
+                "abs_sched_err_s": float(r["abs_sched_err_s"]),
+                "abs_stop_err_m": float(r["abs_stop_err_m"]),
+                "step_smooth_cost": float(r["step_smooth_cost"]),
+                "spec_energy_wh_tkm": float(r["spec_energy_wh_tkm"]),
+                "multi_obj_score": float(r["multi_obj_score"]),
+                "shield_rate_pct": float(r["shield_rate_pct"]),
+                "mean_step_us": float(r["mean_step_us"]),
+                "mean_total_us": float(r["mean_total_us"]),
+                "p99_total_us": float(r["p99_total_us"]),
+                "max_total_us": float(r["max_total_us"]),
+                "property_counts": dict(r.get("property_counts", {})),
+                "peak_pressures": dict(r.get("peak_pressures", {})),
+            }
+            method_metrics[m_name] = m_entry
+            csv_rows.append({
+                "scenario_num": idx + 1,
+                "scenario_id": int(sc.get("scenario_id", idx)),
+                "category": category_label,
+                "data_source": sc.get("data_source", "Synthetic"),
+                "date_str": sc.get("date_str", ""),
+                "train_number": sc.get("train_number", ""),
+                "n_legs": int(sc["n_legs"]),
+                "total_length_km": round(float(sc["total_length_m"]) / 1000.0, 3),
+                "is_extreme_scenario": bool(sc.get("is_extreme_scenario", sc.get("is_harsh_injected", False))),
+                "max_wind_mps2": round(max((lr["wind_peak_abs_mps2"] for lr in leg_records), default=0.0), 4),
+                "min_adhesion_mu": round(min((lr["adhesion_mu"] for lr in leg_records), default=1.0), 4),
+                "method": m_name,
+                "abs_sched_err_s": round(m_entry["abs_sched_err_s"], 4),
+                "abs_stop_err_m": round(m_entry["abs_stop_err_m"], 4),
+                "step_smooth_cost": round(m_entry["step_smooth_cost"], 6),
+                "spec_energy_wh_tkm": round(m_entry["spec_energy_wh_tkm"], 4),
+                "multi_obj_score": round(m_entry["multi_obj_score"], 4),
+                "shield_rate_pct": round(m_entry["shield_rate_pct"], 2),
+                "mean_step_us": round(m_entry["mean_step_us"], 2),
+                "mean_total_us": round(m_entry["mean_total_us"], 2),
+                "p99_total_us": round(m_entry["p99_total_us"], 2),
+                "max_total_us": round(m_entry["max_total_us"], 2),
+            })
+
+        json_records.append({
+            "scenario_num": idx + 1,
+            "scenario_id": int(sc.get("scenario_id", idx)),
+            "category": category_label,
+            "data_source": sc.get("data_source", "Synthetic"),
+            "date_str": sc.get("date_str", ""),
+            "train_number": sc.get("train_number", None),
+            "train_category": sc.get("train_category", ""),
+            "composition_desc": sc.get("composition_desc", ""),
+            "n_legs": int(sc["n_legs"]),
+            "total_length_m": float(sc["total_length_m"]),
+            "is_weather_disturbed": bool(sc.get("is_weather_disturbed", True)),
+            "is_harsh_injected": bool(sc.get("is_harsh_injected", False)),
+            "is_extreme_scenario": bool(sc.get("is_extreme_scenario", sc.get("is_harsh_injected", False))),
+            "legs": leg_records,
+            "method_metrics": method_metrics,
+        })
+    return json_records, csv_rows
+
+
+def _export_separated_scenario_datasets(
+    out_dir: Path,
+    prefix: str,
+    baseline_indices: list[int],
+    extreme_indices: list[int],
+    scenarios_list: list[dict],
+    agg_results: dict[str, list[dict]],
+    method_specs: list[tuple[str, str, str | None]],
+) -> dict[str, str]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    exported: dict[str, str] = {}
+    subsets = [("baseline", baseline_indices)]
+    if extreme_indices:
+        subsets.append(("extreme", extreme_indices))
+
+    for sub_name, idxs in subsets:
+        if not idxs:
+            continue
+        json_recs, csv_rows = _serialize_scenarios_subset(
+            idxs, sub_name, scenarios_list, agg_results, method_specs
+        )
+        json_path = out_dir / f"{prefix}_{sub_name}_scenarios.json"
+        csv_path = out_dir / f"{prefix}_{sub_name}_metrics.csv"
+        with open(json_path, "w", encoding="utf-8") as fj:
+            json.dump({"subset": sub_name, "count": len(json_recs), "scenarios": json_recs}, fj, indent=2)
+        if csv_rows:
+            with open(csv_path, "w", newline="", encoding="utf-8") as fc:
+                writer = csv.DictWriter(fc, fieldnames=list(csv_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(csv_rows)
+        exported[f"{sub_name}_json"] = str(json_path)
+        exported[f"{sub_name}_csv"] = str(csv_path)
+    return exported
+
+
+def _print_spike_profiler(dmps_runs: list[dict], subset_label: str) -> None:
+    if not dmps_runs:
+        return
+    all_spikes_sorted = sorted(
+        [r["worst_spike"] for r in dmps_runs] + [r["second_spike"] for r in dmps_runs],
+        key=lambda s: s["total_step_us"],
+        reverse=True,
+    )
+    sp1, sp2 = all_spikes_sorted[0], all_spikes_sorted[1]
+    macro_pct = 100.0 * float(np.mean([1.0 if r["worst_spike"]["is_macro_entry"] else 0.0 for r in dmps_runs]))
+    print(
+        f"\n[INFERENCE SPIKE PROFILER | {subset_label} ({len(dmps_runs)} Runs)] "
+        f"{macro_pct:.0f}% of Max Spikes occurred on Macro-Step Entry (sub_idx == 0)\n"
+        f"  -> #1 Most Expensive Step ({sp1['total_step_us']:.1f} us at x={sp1['x']:.0f}m, regime='{sp1['regime']}'): "
+        f"MPC_QP={sp1['step_us']:.1f} us | Emulator={sp1['emu_us']:.1f} us | PPO_Pol={sp1['pol_us']:.1f} us | Shield={sp1['sh_us']:.1f} us\n"
+        f"  -> #2 2nd Expensive Step  ({sp2['total_step_us']:.1f} us at x={sp2['x']:.0f}m, regime='{sp2['regime']}'): "
+        f"MPC_QP={sp2['step_us']:.1f} us | Emulator={sp2['emu_us']:.1f} us | PPO_Pol={sp2['pol_us']:.1f} us | Shield={sp2['sh_us']:.1f} us"
+    )
+
+
 def main():
     ap = argparse.ArgumentParser(description="Multi-Property PPO + Hierarchical Contract Shielding (3-Station ~16.5 km)")
     ap.add_argument("--epochs", type=int, default=220, help="PPO training epochs (logarithmic convergence around ~180-220)")
@@ -1420,19 +1668,58 @@ def main():
     ap.add_argument("--plot", type=str, default="rl_cosine_mpc.png")
     ap.add_argument("--dual-plot", type=str, default="wind_trajectory_shield_dual_axis.png")
     ap.add_argument("--load-checkpoint", type=str, default="", help="Path to .pt file (e.g. best_ppo_cosine_pilot.pt) to skip training")
+    ap.add_argument("--real-data", action="store_true", help="Benchmark on real Digitraffic rail + Open-Meteo weather data")
+    ap.add_argument("--train-number", type=int, default=8311, help="Finnish Digitraffic train number (e.g. 8311 HSL commuter or 23 InterCity)")
+    ap.add_argument("--train-date", type=str, default="", help="YYYY-MM-DD departure date for Digitraffic + Open-Meteo (default: latest completed run)")
+    ap.add_argument(
+        "--harsh-weather",
+        type=str,
+        default=None,
+        choices=["mixed", "always", "raw", "none"],
+        help="Extreme noise injection mode (default: mixed when --real-data, none otherwise): mixed (50%% baseline + 50%% extreme), always, raw/none",
+    )
+    ap.add_argument(
+        "--data-dir",
+        type=str,
+        default="collected_data",
+        help="Directory to store separated baseline vs extreme-scenario datasets (JSON + CSV)",
+    )
     args = ap.parse_args()
 
+    if args.harsh_weather is not None:
+        harsh_mode_eff = "raw" if args.harsh_weather == "none" else args.harsh_weather
+    elif args.real_data:
+        harsh_mode_eff = "raw" if args.wind_mode == "none" else "mixed"
+    else:
+        harsh_mode_eff = "none"
+
     import os, gc
+    script_dir = Path(__file__).resolve().parent
+
+    def _resolve_ckpt(path_str: str) -> str:
+        if not path_str:
+            return ""
+        if os.path.exists(path_str):
+            return path_str
+        cand = script_dir / path_str
+        return str(cand) if cand.exists() else path_str
+
     base_corridor = RailroadCorridor()
     print("=" * 152)
+    mode_tag = (
+        f"REAL-WORLD DIGITRAFFIC + OPEN-METEO (EXTREME_NOISE={harsh_mode_eff.upper()})"
+        if args.real_data
+        else f"GENERALIZED CORRIDOR (1..5 STATIONS, PASSENGER MASS & WEATHER | EXTREME_NOISE={harsh_mode_eff.upper()})"
+    )
     print(
         f"MULTI-PROPERTY PPO ({args.epochs} EPOCHS) + HIERARCHICAL CONTRACT SHIELD | "
-        f"GENERALIZED CORRIDOR (1..5 STATIONS, PASSENGER MASS & WEATHER) | {args.eval_runs} SCENARIOS"
+        f"{mode_tag} | {args.eval_runs} SCENARIOS"
     )
     print("=" * 152, flush=True)
 
-    emu_ckpt_path = "best_emulator.pt"
-    if args.load_checkpoint and os.path.exists(emu_ckpt_path):
+    emu_ckpt_path = _resolve_ckpt("best_emulator.pt")
+    load_ckpt_resolved = _resolve_ckpt(args.load_checkpoint)
+    if load_ckpt_resolved and os.path.exists(emu_ckpt_path):
         print(f"\n=== 1. Loading Pre-Trained Neural Physics Emulator from '{emu_ckpt_path}' ===", flush=True)
         emulator = LearnedLinearizationModel(hidden_dim=64)
         emulator.load_state_dict(torch.load(emu_ckpt_path, map_location="cpu"))
@@ -1444,10 +1731,10 @@ def main():
         )
         torch.save(emulator.state_dict(), emu_ckpt_path)
 
-    if args.load_checkpoint and os.path.exists(args.load_checkpoint):
-        print(f"\n=== 2. Loading Pre-Trained PPO Pilot Checkpoint from '{args.load_checkpoint}' ===", flush=True)
+    if load_ckpt_resolved and os.path.exists(load_ckpt_resolved):
+        print(f"\n=== 2. Loading Pre-Trained PPO Pilot Checkpoint from '{load_ckpt_resolved}' ===", flush=True)
         rl_policy = CosineTrajectoryRLPolicy(obs_dim=15, act_dim=3, hidden_dim=64)
-        rl_policy.load_state_dict(torch.load(args.load_checkpoint, map_location="cpu"))
+        rl_policy.load_state_dict(torch.load(load_ckpt_resolved, map_location="cpu"))
         rl_policy.eval()
     else:
         print(f"\n=== 2. Training 15-Feature Multi-Property PPO Pilot Across {args.epochs} Epochs ===", flush=True)
@@ -1455,8 +1742,8 @@ def main():
             base_corridor, emulator=emulator, epochs=args.epochs, wind_mode=args.wind_mode, seed=args.seed
         )
 
-    free_ckpt_path = "best_ppo_free_pilot.pt"
-    if args.load_checkpoint and os.path.exists(args.load_checkpoint):
+    free_ckpt_path = _resolve_ckpt("best_ppo_free_pilot.pt")
+    if load_ckpt_resolved and os.path.exists(load_ckpt_resolved):
         if os.path.exists(free_ckpt_path):
             free_sd = torch.load(free_ckpt_path, map_location="cpu")
             if float(torch.abs(free_sd["actor_mean.4.weight"]).max().item()) > 1e-6:
@@ -1490,28 +1777,73 @@ def main():
 
     agg_results = {name: [] for name, _, _ in method_specs}
     scenarios_list = []
-    sample_ep0_trajs = {}
-    sample_ep0_scenario = None
-    sample_ep0_no_wind = None
+    sample_base_trajs = {}
+    sample_base_scenario = None
+    sample_base_no_wind = None
+    sample_ext_trajs = {}
+    sample_ext_scenario = None
+    sample_ext_no_wind = None
     multi_scen_dmps = []
 
     for ep in range(args.eval_runs):
-        scen = generate_multi_station_scenario(
-            seed=9000 + ep * 29,
-            n_legs=args.n_legs,
-            wind_mode=args.wind_mode,
-            allow_infeasible_breaks=(ep > 0),
-        )
+        if args.real_data:
+            scen = fetch_real_world_multi_station_scenario(
+                date_str=(args.train_date if args.train_date else None),
+                train_number=args.train_number,
+                n_legs_max=args.n_legs,
+                seed=9000 + ep * 29,
+                ep_idx=ep,
+                harsh_weather_mode=harsh_mode_eff,
+            )
+            if ep == 0:
+                l0 = scen["legs"][0]
+                gps_txt = (
+                    f" | LiveGPS={l0['latest_gps_speed_mps']*3.6:.0f}km/h"
+                    if l0.get("latest_gps_speed_mps") is not None
+                    else ""
+                )
+                print(
+                    f"\n[REAL-WORLD DATA MERGER] Source={scen['data_source']} | Train #{scen['train_number']} "
+                    f"({scen['date_str']}, {scen['composition_desc']}{gps_txt})\n"
+                    f"  Leg 1: {l0['corridor'].route_name}\n"
+                    f"  Leg 1 Weather: {l0['wind_desc']} | Regime={l0['weather']} (mu={l0['adhesion_mu']:.2f})",
+                    flush=True,
+                )
+        else:
+            if harsh_mode_eff == "always":
+                is_ext_synth = True
+            elif harsh_mode_eff == "mixed":
+                is_ext_synth = (ep % 2 == 1)
+            else:
+                is_ext_synth = False
+            scen = generate_multi_station_scenario(
+                seed=9000 + ep * 29,
+                n_legs=args.n_legs,
+                wind_mode=args.wind_mode,
+                allow_infeasible_breaks=(ep > 0),
+                extreme_noise=is_ext_synth,
+            )
         scenarios_list.append(scen)
-        if ep == 0:
-            sample_ep0_scenario = scen
-            sample_ep0_no_wind = evaluate_multi_station_journey(
+        is_ext_ep = bool(scen.get("is_extreme_scenario", scen.get("is_harsh_injected", False)))
+        capture_base = (sample_base_scenario is None) and (not is_ext_ep)
+        capture_ext = (sample_ext_scenario is None) and is_ext_ep
+        capture_fallback_ep0 = (ep == 0) and (sample_base_scenario is None) and (sample_ext_scenario is None)
+
+        if capture_base or capture_fallback_ep0:
+            sample_base_scenario = scen
+            sample_base_no_wind = evaluate_multi_station_journey(
                 "Nominal No-Wind", scen, "RL_LEARNED", rl_policy=rl_policy,
+                shield_mode=None, emulator=emulator, record_traj=True, zero_wind_override=True
+            )
+        if capture_ext:
+            sample_ext_scenario = scen
+            sample_ext_no_wind = evaluate_multi_station_journey(
+                "Nominal No-Wind (Extreme)", scen, "RL_LEARNED", rl_policy=rl_policy,
                 shield_mode=None, emulator=emulator, record_traj=True, zero_wind_override=True
             )
 
         for name, mode_str, sh_mode in method_specs:
-            need_traj = (ep == 0) or (sh_mode == "mps_rollout")
+            need_traj = capture_base or capture_ext or capture_fallback_ep0 or (sh_mode == "mps_rollout")
             active_pol = rl_policy_free if (mode_str == "RL_FREE_LEARNED") else rl_policy
             res = evaluate_multi_station_journey(
                 label=name,
@@ -1523,44 +1855,123 @@ def main():
                 record_traj=need_traj,
             )
             agg_results[name].append(res)
-            if ep == 0:
-                sample_ep0_trajs[name] = res
+            if capture_base or capture_fallback_ep0:
+                sample_base_trajs[name] = res
+            if capture_ext:
+                sample_ext_trajs[name] = res
             if sh_mode == "mps_rollout" and ep < 5:
                 multi_scen_dmps.append(res)
 
-    print("\n" + "=" * 156)
-    print(f"SAMPLE OF THE {args.eval_runs} GENERALIZED MULTI-STATION (1..5 STOPS, 4..31 KM) SCENARIOS — CONTRACT-SHIELDED PPO")
-    print("-" * 156)
-    print(
-        f"{'Scen#':<5} | {'Stops':>5} | {'Total Len':>9} | {'Passenger Mass Evolution Across Stops':<48} | "
-        f"{'|TimeErr|':>9} | {'|StopErr|':>9} | {'SpecEnergy':>12} | {'MultiScore':>10} | {'Shield%':>7}"
-    )
-    print("-" * 156)
-    for ep_i in range(min(8, args.eval_runs)):
-        r_d = agg_results["7. Contract-Shielded PPO (UCB-DMPS Cosine)"][ep_i]
-        scen_i = scenarios_list[ep_i]
-        m_str = "->".join([f"{l['mass_kg']/1000:.1f}t" for l in scen_i["legs"]])
+        if args.real_data and ((ep + 1) % 5 == 0 or (ep + 1) == args.eval_runs):
+            cat_str = "EXTREME" if is_ext_ep else "RAW-API"
+            print(
+                f"  [Eval {ep + 1:2d}/{args.eval_runs}] Train #{scen.get('train_number', '?')} "
+                f"({scen['n_legs']} legs, {scen['total_length_m']/1000:.2f} km) | Category={cat_str}",
+                flush=True,
+            )
+
+    baseline_indices = [
+        i for i, sc in enumerate(scenarios_list)
+        if not sc.get("is_extreme_scenario", sc.get("is_harsh_injected", False))
+    ]
+    extreme_indices = [
+        i for i, sc in enumerate(scenarios_list)
+        if sc.get("is_extreme_scenario", sc.get("is_harsh_injected", False))
+    ]
+
+    def _print_sample_subset(subset_title: str, idxs: list[int]) -> None:
+        if not idxs:
+            return
+        print("\n" + "=" * 168)
+        print(subset_title)
+        print("-" * 168)
         print(
-            f"{ep_i + 1:<5d} | {r_d['n_legs']:5d} | {r_d['total_length_m']/1000:6.2f} km | {m_str:<48} | "
-            f"{r_d['abs_sched_err_s']:7.2f} s | {r_d['abs_stop_err_m']:7.3f} m | "
-            f"{r_d['spec_energy_wh_tkm']:7.2f} Wh/tk | {r_d['multi_obj_score']:10.4f} | {r_d['shield_rate_pct']:6.1f}%"
+            f"{'Scen#':<5} | {'Stops':>5} | {'Total Len':>9} | {'Max|Wind|':>9} | {'MinMu':>5} | "
+            f"{'Train & Mass Evolution Across Stops':<44} | {'|TimeErr|':>9} | {'|StopErr|':>9} | {'SpecEnergy':>12} | {'MultiScore':>10} | {'Shield%':>7}"
         )
-    print("=" * 156)
+        print("-" * 168)
+        for ep_i in idxs[:10]:
+            r_d = agg_results["7. Contract-Shielded PPO (UCB-DMPS Cosine)"][ep_i]
+            scen_i = scenarios_list[ep_i]
+            max_w = max((float(np.max(np.abs(l["wind_profile"]))) for l in scen_i["legs"]), default=0.0)
+            min_mu = min((float(l["adhesion_mu"]) for l in scen_i["legs"]), default=1.0)
+            m_str = "->".join([f"{l['mass_kg']/1000:.1f}t" for l in scen_i["legs"]])
+            if args.real_data:
+                m_str = f"#{scen_i.get('train_number', '?')} {m_str}"
+            if len(m_str) > 44:
+                m_str = m_str[:41] + "..."
+            print(
+                f"{ep_i + 1:<5d} | {r_d['n_legs']:5d} | {r_d['total_length_m']/1000:6.2f} km | {max_w:6.2f}m/s²| {min_mu:5.2f} | "
+                f"{m_str:<44} | {r_d['abs_sched_err_s']:7.2f} s | {r_d['abs_stop_err_m']:7.3f} m | "
+                f"{r_d['spec_energy_wh_tkm']:7.2f} Wh/tk | {r_d['multi_obj_score']:10.4f} | {r_d['shield_rate_pct']:6.1f}%"
+            )
+        print("=" * 168)
 
-    # Weather Regime Distribution across the 30 generalized scenarios
-    weather_leg_counts: dict[str, int] = {}
-    for sc in scenarios_list:
-        for l_item in sc["legs"]:
-            w_name = l_item.get("weather", "Clean-Dry")
-            weather_leg_counts[w_name] = weather_leg_counts.get(w_name, 0) + 1
-    w_summary = " | ".join([f"{k}: {v} legs" for k, v in sorted(weather_leg_counts.items())])
-    print(f"[WEATHER & THERMAL REGIME DISTRIBUTION ACROSS ALL {sum(weather_leg_counts.values())} LEGS] {w_summary}")
+    if args.real_data:
+        _print_sample_subset(
+            f"BASELINE REAL-WORLD API SCENARIOS (UNPERTURBED DIGITRAFFIC + OPEN-METEO | {len(baseline_indices)}/{args.eval_runs}) — CONTRACT-SHIELDED PPO",
+            baseline_indices,
+        )
+        if extreme_indices:
+            _print_sample_subset(
+                f"EXTREME NOISE-INJECTED API SCENARIOS (COLLECTED APART | {len(extreme_indices)}/{args.eval_runs}) — CONTRACT-SHIELDED PPO",
+                extreme_indices,
+            )
+    else:
+        _print_sample_subset(
+            f"BASELINE SYNTHETIC SCENARIOS ({len(baseline_indices)}/{args.eval_runs}) — CONTRACT-SHIELDED PPO",
+            baseline_indices,
+        )
+        if extreme_indices:
+            _print_sample_subset(
+                f"EXTREME NOISE-INJECTED SYNTHETIC SCENARIOS (COLLECTED APART | {len(extreme_indices)}/{args.eval_runs}) — CONTRACT-SHIELDED PPO",
+                extreme_indices,
+            )
 
-    for subset_title, filter_fn in [
-        ("1. NO-WEATHER (CLEAN) SCENARIOS ONLY", lambda r: not r.get("is_weather_disturbed", False)),
-        ("2. WEATHER-DISTURBED (WIND / RAIN / SNOW / COLD / HEAT-THERMAL) SCENARIOS ONLY", lambda r: r.get("is_weather_disturbed", True)),
-        ("3. UNITED BENCHMARK: ALL GENERALIZED SCENARIOS COMBINED", lambda r: True),
-    ]:
+    # Weather Regime Distribution separated across Baseline vs Extreme legs
+    for grp_lbl, idxs in (("BASELINE", baseline_indices), ("EXTREME NOISE", extreme_indices)):
+        if not idxs:
+            continue
+        weather_leg_counts: dict[str, int] = {}
+        for idx in idxs:
+            for l_item in scenarios_list[idx]["legs"]:
+                w_name = l_item.get("weather", "Clean-Dry")
+                weather_leg_counts[w_name] = weather_leg_counts.get(w_name, 0) + 1
+        w_summary = " | ".join([f"{k}: {v} legs" for k, v in sorted(weather_leg_counts.items())])
+        print(f"[{grp_lbl} WEATHER DISTRIBUTION ACROSS {sum(weather_leg_counts.values())} LEGS] {w_summary}")
+
+    # Persist collected scenario data completely apart (Baseline vs Extreme)
+    data_out_dir = Path(args.data_dir)
+    if not data_out_dir.is_absolute():
+        data_out_dir = script_dir / data_out_dir
+    data_prefix = "real_world_api" if args.real_data else "synthetic"
+    exported_files = _export_separated_scenario_datasets(
+        data_out_dir, data_prefix, baseline_indices, extreme_indices, scenarios_list, agg_results, method_specs
+    )
+    print(f"\n[SEPARATED DATA COLLECTION SAVED TO '{data_out_dir}']", flush=True)
+    for k_exp, v_exp in exported_files.items():
+        print(f"  -> {k_exp:<15s}: {v_exp}", flush=True)
+
+    if args.real_data:
+        subset_defs = [
+            ("1. REAL OPEN-METEO BASELINE (UNPERTURBED API WEATHER) SCENARIOS ONLY", lambda r: not r.get("is_extreme_scenario", r.get("is_harsh_injected", False))),
+            ("2. EXTREME NOISE-INJECTED API SCENARIOS ONLY (COLLECTED APART)", lambda r: r.get("is_extreme_scenario", r.get("is_harsh_injected", False))),
+            ("3. UNITED REAL-WORLD BENCHMARK: ALL REAL TRAIN SCENARIOS COMBINED", lambda r: True),
+        ]
+    elif extreme_indices:
+        subset_defs = [
+            ("1. BASELINE SYNTHETIC SCENARIOS ONLY", lambda r: not r.get("is_extreme_scenario", False)),
+            ("2. EXTREME NOISE-INJECTED SCENARIOS ONLY (COLLECTED APART)", lambda r: r.get("is_extreme_scenario", False)),
+            ("3. UNITED BENCHMARK: ALL SCENARIOS COMBINED", lambda r: True),
+        ]
+    else:
+        subset_defs = [
+            ("1. NO-WEATHER (CLEAN) SCENARIOS ONLY", lambda r: not r.get("is_weather_disturbed", False)),
+            ("2. WEATHER-DISTURBED (WIND / RAIN / SNOW / COLD / HEAT-THERMAL) SCENARIOS ONLY", lambda r: r.get("is_weather_disturbed", True)),
+            ("3. UNITED BENCHMARK: ALL GENERALIZED SCENARIOS COMBINED", lambda r: True),
+        ]
+
+    for subset_title, filter_fn in subset_defs:
         sample_sub = [r for r in agg_results[method_specs[0][0]] if filter_fn(r)]
         if not sample_sub:
             continue
@@ -1592,35 +2003,46 @@ def main():
             )
         print("=" * 168, flush=True)
 
-    # Diagnostic Profiler: Where & Why Did the Max Inference Spike Happen?
+    # Diagnostic Profiler & Scissor Diagnostics separated for Baseline vs Extreme Scenarios
     dmps_runs = agg_results["7. Contract-Shielded PPO (UCB-DMPS Cosine)"]
-    all_spikes_sorted = sorted(
-        [r["worst_spike"] for r in dmps_runs] + [r["second_spike"] for r in dmps_runs],
-        key=lambda s: s["total_step_us"],
-        reverse=True,
-    )
-    sp1, sp2 = all_spikes_sorted[0], all_spikes_sorted[1]
-    macro_pct = 100.0 * float(np.mean([1.0 if r["worst_spike"]["is_macro_entry"] else 0.0 for r in dmps_runs]))
-    print(
-        f"\n[INFERENCE SPIKE PROFILER across 30 Runs] {macro_pct:.0f}% of Max Spikes occurred on Macro-Step Entry (sub_idx == 0)\n"
-        f"  -> #1 Most Expensive Step ({sp1['total_step_us']:.1f} us at x={sp1['x']:.0f}m, regime='{sp1['regime']}'): "
-        f"MPC_QP={sp1['step_us']:.1f} us | Emulator={sp1['emu_us']:.1f} us | PPO_Pol={sp1['pol_us']:.1f} us | Shield={sp1['sh_us']:.1f} us\n"
-        f"  -> #2 2nd Expensive Step  ({sp2['total_step_us']:.1f} us at x={sp2['x']:.0f}m, regime='{sp2['regime']}'): "
-        f"MPC_QP={sp2['step_us']:.1f} us | Emulator={sp2['emu_us']:.1f} us | PPO_Pol={sp2['pol_us']:.1f} us | Shield={sp2['sh_us']:.1f} us"
-    )
+    dmps_base = [dmps_runs[i] for i in baseline_indices]
+    dmps_ext = [dmps_runs[i] for i in extreme_indices]
+    if dmps_base:
+        _print_spike_profiler(dmps_base, "BASELINE SCENARIOS")
+        print_goodall_trajectory_scissor_diagnostics(dmps_base, subset_label="BASELINE SCENARIOS")
+    if dmps_ext:
+        _print_spike_profiler(dmps_ext, "EXTREME NOISE SCENARIOS")
+        print_goodall_trajectory_scissor_diagnostics(dmps_ext, subset_label="EXTREME NOISE SCENARIOS")
 
-    print_goodall_trajectory_scissor_diagnostics(agg_results["7. Contract-Shielded PPO (UCB-DMPS Cosine)"])
-
+    plot_base_scen = sample_base_scenario if sample_base_scenario is not None else sample_ext_scenario
+    plot_base_nw = sample_base_no_wind if sample_base_no_wind is not None else sample_ext_no_wind
+    plot_base_trajs = sample_base_trajs if sample_base_trajs else sample_ext_trajs
+    base_tag = "RAW-API BASELINE" if (args.real_data and not plot_base_scen.get("is_extreme_scenario", False)) else (
+        "EXTREME NOISE" if plot_base_scen.get("is_extreme_scenario", False) else "BASELINE"
+    )
     save_dual_axis_wind_trajectory_shield_plot(
-        scenario=sample_ep0_scenario,
-        run_nominal_no_wind=sample_ep0_no_wind,
-        run_unshielded_wind=sample_ep0_trajs["4. Multi-Property PPO Pilot (Unshielded)"],
-        run_shielded_wind=sample_ep0_trajs["7. Contract-Shielded PPO (UCB-DMPS Cosine)"],
+        scenario=plot_base_scen,
+        run_nominal_no_wind=plot_base_nw,
+        run_unshielded_wind=plot_base_trajs["4. Multi-Property PPO Pilot (Unshielded)"],
+        run_shielded_wind=plot_base_trajs["7. Contract-Shielded PPO (UCB-DMPS Cosine)"],
         out_path=args.dual_plot,
+        tag_label=base_tag,
     )
+    if sample_ext_scenario is not None and sample_ext_trajs and sample_ext_scenario is not plot_base_scen:
+        dp = Path(args.dual_plot)
+        ext_dual_path = str(dp.with_name(f"{dp.stem}_extreme{dp.suffix}"))
+        save_dual_axis_wind_trajectory_shield_plot(
+            scenario=sample_ext_scenario,
+            run_nominal_no_wind=sample_ext_no_wind,
+            run_unshielded_wind=sample_ext_trajs["4. Multi-Property PPO Pilot (Unshielded)"],
+            run_shielded_wind=sample_ext_trajs["7. Contract-Shielded PPO (UCB-DMPS Cosine)"],
+            out_path=ext_dual_path,
+            tag_label="EXTREME NOISE",
+        )
 
     # ---------------- 6-Panel Benchmark-Relevant Trajectory & Multi-Stat Figure ----------------
-    tr_dmps = sample_ep0_trajs["7. Contract-Shielded PPO (UCB-DMPS Cosine)"]["traj"]
+    sample_plot_trajs = plot_base_trajs
+    tr_dmps = sample_plot_trajs["7. Contract-Shielded PPO (UCB-DMPS Cosine)"]["traj"]
     fig, axes = plt.subplots(2, 3, figsize=(18.5, 10.0))
     plot_names = [
         "1. Max-Speed Greedy Cosine + MPC",
@@ -1636,7 +2058,7 @@ def main():
 
     # Panel 1: Multi-Station Speed Trajectories v(x)
     for name, c, ls in zip(plot_names, cols, lss):
-        r = sample_ep0_trajs[name]
+        r = sample_plot_trajs[name]
         axes[0, 0].plot(r["traj"]["x"], r["traj"]["v"], color=c, linestyle=ls, linewidth=1.5, label=name)
     axes[0, 0].set_title("1. Multi-Station Speed Trajectories v(x) Across Competing Pilots")
     axes[0, 0].set_xlabel("Cumulative Track Position x (m)")
@@ -1673,36 +2095,59 @@ def main():
         "Greedy", "Naive", "Static", "PPO Unsh", "PPO+Sw",
         "PPO+DCBF", "PPO+DMPS", "Stab Unsh", "Stab+DMPS", "Bilbao'25"
     ]
-    bar_colors = [
-        "steelblue", "darkorange", "purple", "seagreen", "salmon",
-        "indianred", "crimson", "darkcyan", "teal", "goldenrod"
-    ]
     x_pos = np.arange(len(method_specs))
-
-    # Panel 4: Overall Mean |Deadline Error| (Clean vs Weather vs Combined)
     w_b = 0.26
-    clean_t = [float(np.mean([r["abs_sched_err_s"] for r in agg_results[k] if not r["is_weather_disturbed"]])) for k, _, _ in method_specs]
-    weath_t = [float(np.mean([r["abs_sched_err_s"] for r in agg_results[k] if r["is_weather_disturbed"]])) for k, _, _ in method_specs]
-    comb_t = [float(np.mean([r["abs_sched_err_s"] for r in agg_results[k]])) for k, _, _ in method_specs]
-    axes[1, 0].bar(x_pos - w_b, clean_t, width=w_b, color="mediumseagreen", alpha=0.88, label="No-Weather (Clean)")
-    axes[1, 0].bar(x_pos, weath_t, width=w_b, color="royalblue", alpha=0.88, label="Weather-Disturbed")
-    axes[1, 0].bar(x_pos + w_b, comb_t, width=w_b, color="crimson", alpha=0.88, label="Combined (Overall)")
+
+    # Build non-empty comparison groups for Panels 4 & 5 (avoids empty-slice NaN warnings)
+    first_runs = agg_results[method_specs[0][0]]
+    if args.real_data:
+        cand_groups = [
+            ("Real API (Baseline)", "mediumseagreen", lambda r: not r.get("is_extreme_scenario", r.get("is_harsh_injected", False))),
+            ("Extreme Noise (Apart)", "royalblue", lambda r: r.get("is_extreme_scenario", r.get("is_harsh_injected", False))),
+            ("Combined Real", "crimson", lambda r: True),
+        ]
+        p4_title = "4. Real-World |Deadline Error|: Raw API vs Extreme Noise vs Combined"
+    elif extreme_indices:
+        cand_groups = [
+            ("Baseline Scenarios", "mediumseagreen", lambda r: not r.get("is_extreme_scenario", False)),
+            ("Extreme Noise (Apart)", "royalblue", lambda r: r.get("is_extreme_scenario", False)),
+            ("Combined (Overall)", "crimson", lambda r: True),
+        ]
+        p4_title = "4. Overall |Deadline Error|: Baseline vs Extreme Noise vs Combined"
+    else:
+        cand_groups = [
+            ("No-Weather (Clean)", "mediumseagreen", lambda r: not r.get("is_weather_disturbed", False)),
+            ("Weather-Disturbed", "royalblue", lambda r: r.get("is_weather_disturbed", True)),
+            ("Combined (Overall)", "crimson", lambda r: True),
+        ]
+        p4_title = "4. Overall |Deadline Error|: Clean vs Weather vs Combined"
+
+    active_groups = [
+        (lbl, col, fn) for (lbl, col, fn) in cand_groups
+        if any(fn(r) for r in first_runs)
+    ]
+    if len(active_groups) == 2 and all(active_groups[0][2](r) for r in first_runs):
+        active_groups = [active_groups[-1]]
+    bar_w = min(0.55, 0.78 / max(1, len(active_groups)))
+    offsets = (np.arange(len(active_groups)) - 0.5 * (len(active_groups) - 1)) * bar_w
+
+    # Panel 4: Mean |Deadline Error|
+    for g_off, (g_lbl, g_col, g_fn) in zip(offsets, active_groups):
+        vals = [float(np.mean([r["abs_sched_err_s"] for r in agg_results[k] if g_fn(r)])) for k, _, _ in method_specs]
+        axes[1, 0].bar(x_pos + g_off, vals, width=bar_w, color=g_col, alpha=0.88, label=g_lbl)
     axes[1, 0].set_xticks(x_pos)
-    axes[1, 0].set_xticklabels(short_labels, fontsize=7.0)
-    axes[1, 0].set_title(f"4. Overall |Deadline Error|: Clean vs Weather vs Combined")
+    axes[1, 0].set_xticklabels(short_labels, fontsize=6.6, rotation=16, ha="right")
+    axes[1, 0].set_title(p4_title)
     axes[1, 0].set_ylabel("Mean |Deadline Error| (s)")
     axes[1, 0].legend(fontsize=7.2)
     axes[1, 0].grid(True, axis="y", alpha=0.3)
 
-    # Panel 5: Overall Multi-Objective LossScore (Clean vs Weather vs Combined)
-    clean_s = [float(np.mean([r["multi_obj_score"] for r in agg_results[k] if not r["is_weather_disturbed"]])) for k, _, _ in method_specs]
-    weath_s = [float(np.mean([r["multi_obj_score"] for r in agg_results[k] if r["is_weather_disturbed"]])) for k, _, _ in method_specs]
-    comb_s = [float(np.mean([r["multi_obj_score"] for r in agg_results[k]])) for k, _, _ in method_specs]
-    axes[1, 1].bar(x_pos - w_b, clean_s, width=w_b, color="mediumseagreen", alpha=0.88, label="No-Weather (Clean)")
-    axes[1, 1].bar(x_pos, weath_s, width=w_b, color="royalblue", alpha=0.88, label="Weather-Disturbed")
-    axes[1, 1].bar(x_pos + w_b, comb_s, width=w_b, color="crimson", alpha=0.88, label="Combined (Overall)")
+    # Panel 5: Overall Multi-Objective LossScore
+    for g_off, (g_lbl, g_col, g_fn) in zip(offsets, active_groups):
+        vals = [float(np.mean([r["multi_obj_score"] for r in agg_results[k] if g_fn(r)])) for k, _, _ in method_specs]
+        axes[1, 1].bar(x_pos + g_off, vals, width=bar_w, color=g_col, alpha=0.88, label=g_lbl)
     axes[1, 1].set_xticks(x_pos)
-    axes[1, 1].set_xticklabels(short_labels, fontsize=7.0)
+    axes[1, 1].set_xticklabels(short_labels, fontsize=6.6, rotation=16, ha="right")
     axes[1, 1].set_title("5. Multi-Objective LossScore (Lower = Better)")
     axes[1, 1].set_ylabel("Composite LossScore")
     axes[1, 1].legend(fontsize=7.2)
@@ -1716,7 +2161,7 @@ def main():
     axes[1, 2].bar(x_pos, stop_cm_vals, width=w_b, color="darkorchid", alpha=0.85, label="Stop Error (cm)")
     axes[1, 2].bar(x_pos + w_b, energy_norm_vals, width=w_b, color="darkorange", alpha=0.85, label="SpecEnergy / 25 (Wh/tk)")
     axes[1, 2].set_xticks(x_pos)
-    axes[1, 2].set_xticklabels(short_labels, fontsize=7.0)
+    axes[1, 2].set_xticklabels(short_labels, fontsize=6.6, rotation=16, ha="right")
     axes[1, 2].set_title("6. Multi-Property Breakdown: Smoothness, Docking & Energy")
     axes[1, 2].set_ylabel("Normalized Metric Value (Lower = Better)")
     axes[1, 2].legend(fontsize=7.2)
@@ -1724,10 +2169,11 @@ def main():
 
     fig.tight_layout()
     fig.savefig(args.plot, dpi=150)
-    try:
-        fig.savefig(f"../{args.plot}", dpi=150)
-    except OSError:
-        pass
+    if not Path(args.plot).is_absolute():
+        try:
+            fig.savefig(f"../{args.plot}", dpi=150)
+        except OSError:
+            pass
     plt.close(fig)
     print(f"Saved 6-panel Multi-Property Benchmark plot to: {args.plot}", flush=True)
 

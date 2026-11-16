@@ -53,6 +53,10 @@ class RailroadCorridor:
     temp_celsius: float = 18.0           # Ambient temperature C (affects air density rho & drag A)
     station_wind_sensor_mps2: float = 0.0 # Wayside station anemometer reading at departure
     is_infeasible_challenge: bool = False
+    speed_sensor_noise_mps: float = 0.0  # Tachometer/radar measurement noise std (m/s)
+    unmodeled_drag_factor: float = 1.0   # Plant-only aerodynamic/rolling drag multiplier
+    sensor_noise_seed: int = 0           # Deterministic RNG seed for sensor noise per leg
+    is_extreme_scenario: bool = False    # Tag separating extreme noise-injected scenarios
 
     # Base physical & comfort bounds at nominal 85,000 kg mass (m/s^2)
     base_max_traction_accel: float = 1.85
@@ -316,6 +320,7 @@ def generate_multi_station_scenario(
     n_legs: int | None = None,
     wind_mode: str = "disjoint",
     allow_infeasible_breaks: bool = True,
+    extreme_noise: bool = False,
 ) -> dict:
     """
     Generates a generalized Multi-Station Railway Journey with:
@@ -419,7 +424,36 @@ def generate_multi_station_scenario(
                 w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.05, 0.0)
 
         # Wayside station sensor at departure (t=0):
-        station_wind_reading = float(w_prof[0] + rng.normal(0.0, 0.01)) if is_weather_active else 0.0
+        anem_std = 0.040 if extreme_noise else 0.01
+        if extreme_noise:
+            if not is_weather_active:
+                n_st = int(np.ceil((leg_budget_s + 150.0) / 0.50)) + 40
+                w_prof = np.zeros(n_st, dtype=np.float64)
+            # Inject extreme storm/turbulence bursts, harsher adhesion loss, and sensor noise
+            t_grid = np.arange(len(w_prof), dtype=np.float64) * 0.50
+            ramp_in = np.clip(t_grid / 8.0, 0.0, 1.0)
+            for _ in range(3):
+                c_s = float(rng.uniform(0.10, 0.85) * leg_budget_s)
+                w_s = float(rng.uniform(14.0, 26.0))
+                sgn = -1.0 if rng.random() < 0.65 else 1.0
+                pk = sgn * float(rng.uniform(0.45, 0.82))
+                w_prof = w_prof + pk * np.exp(-0.5 * ((t_grid - c_s) / w_s) ** 2) * ramp_in
+            ou_s = 0.0
+            ou_arr = np.zeros_like(w_prof)
+            phi_ou = math.exp(-0.50 / 4.5)
+            for k_ou in range(1, len(w_prof)):
+                ou_s = phi_ou * ou_s + 0.095 * math.sqrt(1.0 - phi_ou * phi_ou) * float(rng.normal())
+                ou_arr[k_ou] = 0.85 * ou_arr[k_ou - 1] + 0.15 * ou_s
+            w_prof = np.clip(w_prof + ou_arr * ramp_in, -0.86, 0.74)
+            mu_adhesion = float(np.clip(mu_adhesion * rng.uniform(0.76, 0.90), 0.60, 0.92))
+            is_weather_active = True
+            if weather_name == "Clear-Dry":
+                weather_name = "Extreme-Storm"
+            w_desc = f"Extreme-Noise({weather_name}, max|w|={float(np.max(np.abs(w_prof))):.2f})"
+
+        station_wind_reading = float(w_prof[0] + rng.normal(0.0, anem_std)) if is_weather_active else 0.0
+        speed_noise_std = 0.004 if extreme_noise else 0.0
+        unmodeled_drag = float(rng.uniform(1.06, 1.18)) if extreme_noise else 1.0
 
         corridor = RailroadCorridor(
             route_name=f"Leg {leg_idx+1} ({station_names[leg_idx]} -> {station_names[leg_idx+1]})",
@@ -436,6 +470,10 @@ def generate_multi_station_scenario(
             temp_celsius=temp_c,
             station_wind_sensor_mps2=station_wind_reading,
             is_infeasible_challenge=is_break,
+            speed_sensor_noise_mps=speed_noise_std,
+            unmodeled_drag_factor=unmodeled_drag,
+            sensor_noise_seed=int(seed * 101 + leg_idx * 17),
+            is_extreme_scenario=bool(extreme_noise),
             speed_zones=zones,
         )
 
@@ -460,6 +498,9 @@ def generate_multi_station_scenario(
             "adhesion_mu": mu_adhesion,
             "temp_c": temp_c,
             "is_infeasible": is_break,
+            "is_harsh_injected": bool(extreme_noise),
+            "speed_sensor_noise_mps": speed_noise_std,
+            "unmodeled_drag_factor": unmodeled_drag,
             "wind_profile": w_prof,
             "wind_desc": w_desc,
             "event_meta": w_meta,
@@ -473,5 +514,7 @@ def generate_multi_station_scenario(
         "total_scheduled_time_s": legs[-1]["deadline_s"] - legs[0]["t_start"],
         "has_infeasible_leg": any(l["is_infeasible"] for l in legs),
         "is_weather_disturbed": is_weather_active,
+        "is_harsh_injected": bool(extreme_noise),
+        "is_extreme_scenario": bool(extreme_noise),
         "legs": legs,
     }

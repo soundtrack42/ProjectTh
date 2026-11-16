@@ -19,11 +19,28 @@ class CosineTrajectoryShaper:
          remaining distance `rem_d`, remaining deadline time `t_rem`, and wind `d_wind_hat`,
          so landing deceleration is a smooth bell curve peaking at ~0.75-0.88 m/s^2.
     """
-    def __init__(self, corridor: RailroadCorridor, use_cosine: bool = True):
+    def __init__(
+        self,
+        corridor: RailroadCorridor,
+        use_cosine: bool = True,
+        max_traction_accel: float | None = None,
+        max_service_braking: float | None = None,
+    ):
         self.corridor = corridor
         self.use_cosine = bool(use_cosine)
+        self.max_traction_accel_est = (
+            float(max_traction_accel) if max_traction_accel is not None else float(corridor.max_traction_accel)
+        )
+        self.max_service_braking_est = (
+            float(max_service_braking) if max_service_braking is not None else float(corridor.max_service_braking)
+        )
         self._v_ref_buf = np.zeros(5, dtype=np.float64)
         self.reset()
+
+    def sync_limits(self, max_traction_accel: float, max_service_braking: float) -> None:
+        """Updates controller-estimated traction/braking limits from online mass_hat_kg."""
+        self.max_traction_accel_est = float(max_traction_accel)
+        self.max_service_braking_est = float(max_service_braking)
 
     def reset(self) -> None:
         self.ramp_v_start: float = 0.0
@@ -41,7 +58,7 @@ class CosineTrajectoryShaper:
 
     def feasible_comfort_accel(self, v_mps: float, a_req: float, d_wind_hat: float = 0.0) -> float:
         scale = 1.0 if v_mps <= 14.0 else (14.0 / (v_mps if v_mps > 14.0 else 14.0))
-        a_motor_max = self.corridor.max_traction_accel * scale * 0.90
+        a_motor_max = self.max_traction_accel_est * scale * 0.90
         a_drag = 0.02 + 0.00018 * (v_mps * v_mps)
         w_neg = d_wind_hat if d_wind_hat < 0.0 else 0.0
         a_phys_cap = a_motor_max - a_drag + w_neg
@@ -52,7 +69,7 @@ class CosineTrajectoryShaper:
 
     def feasible_comfort_braking(self, b_req: float, d_wind_hat: float = 0.0) -> float:
         w_pos = d_wind_hat if d_wind_hat > 0.0 else 0.0
-        b_phys_cap = self.corridor.max_service_braking * 0.88 - w_pos
+        b_phys_cap = self.max_service_braking_est * 0.88 - w_pos
         if b_phys_cap < 0.35:
             b_phys_cap = 0.35
         b_hi = self.corridor.comfort_braking_max if self.corridor.comfort_braking_max < b_phys_cap else b_phys_cap
@@ -90,10 +107,11 @@ class CosineTrajectoryShaper:
         t_rem_deadline: float | None = None,
         v_scissor_rad: float = 0.0,
         d_wind_hat: float = 0.0,
+        max_braking_decel: float | None = None,
     ) -> tuple[float, float, float, float]:
         """
         Computes the dynamic half-cosine braking spot `x_brake` from current velocity,
-        vehicle braking capacity, active wind `d_wind_hat`, and remaining time `t_rem_deadline`.
+        estimated vehicle braking capacity, active wind `d_wind_hat`, and remaining time `t_rem_deadline`.
         """
         v_scis = v_scissor_rad if v_scissor_rad > 0.0 else 0.0
         v_eff = v_curr + v_scis
@@ -101,7 +119,8 @@ class CosineTrajectoryShaper:
             return corridor.station_x_m, 0.0, 0.0, b_land_cmd
 
         w_pos = d_wind_hat if d_wind_hat > 0.0 else 0.0
-        b_phys_max = corridor.max_service_braking * 0.86 - w_pos
+        b_cap_src = float(max_braking_decel) if max_braking_decel is not None else float(corridor.max_service_braking)
+        b_phys_max = b_cap_src * 0.86 - w_pos
         if b_phys_max < 0.45:
             b_phys_max = 0.45
         b_comf_hi = corridor.comfort_braking_max if corridor.comfort_braking_max < b_phys_max else b_phys_max
@@ -288,7 +307,7 @@ class CosineTrajectoryShaper:
         # Future Arrival-Synchronized Braking Spot for C^2 Algebraic Soft-Deceleration Profile:
         v_eff = max(0.0, float(v_curr))
         w_pos = d_wind_hat if d_wind_hat > 0.0 else 0.0
-        b_phys_max = max(0.45, self.corridor.max_service_braking * 0.86 - w_pos)
+        b_phys_max = max(0.45, self.max_service_braking_est * 0.86 - w_pos)
         b_comf_hi = min(self.corridor.comfort_braking_max, b_phys_max)
         b_comf_lo = 0.60
         b_raw = b_land_cmd - 0.12 * w_pos
@@ -455,6 +474,7 @@ class CosineTrajectoryShaper:
             t_rem_deadline=t_rem_now if rem_dist_now < 420.0 else None,
             v_scissor_rad=v_scissor_rad,
             d_wind_hat=d_wind_hat,
+            max_braking_decel=self.max_service_braking_est,
         )
 
         # Trigger landing when train reaches the dynamic braking spot
