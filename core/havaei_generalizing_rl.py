@@ -6,7 +6,15 @@ Runtime Shielding and Filter-Aware RL Training (Section 3.5.3 of Hsu, Hu, & Fisa
 from __future__ import annotations
 
 import copy
+from pathlib import Path
+import sys
 import time
+
+_CORE_DIR = Path(__file__).resolve().parent
+_ROOT_DIR = _CORE_DIR.parent
+for _p in (str(_CORE_DIR), str(_ROOT_DIR), str(_ROOT_DIR / "deadline_station_trackGen")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 import numpy as np
 import torch
 import torch.nn as nn

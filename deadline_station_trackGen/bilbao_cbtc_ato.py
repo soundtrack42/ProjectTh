@@ -28,7 +28,10 @@ import sys
 from pathlib import Path
 import numpy as np
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+_ROOT_DIR = Path(__file__).resolve().parent.parent
+for _p in (str(_ROOT_DIR), str(_ROOT_DIR / "core")):
+    if _p not in sys.path:
+        sys.path.append(_p)
 from havaei_generalizing_rl import NonlinearTrainPhysics
 from railroad_corridor import RailroadCorridor
 

@@ -8,7 +8,15 @@ from `havaei_generalizing_rl.py` and evaluates:
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+import sys
 from typing import Any, Dict, List
+
+_EXP_DIR = Path(__file__).resolve().parent
+_ROOT_DIR = _EXP_DIR.parent
+for _p in (str(_EXP_DIR), str(_ROOT_DIR), str(_ROOT_DIR / "core"), str(_ROOT_DIR / "deadline_station_trackGen")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import matplotlib
 matplotlib.use("Agg")

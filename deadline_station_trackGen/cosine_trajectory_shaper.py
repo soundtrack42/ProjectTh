@@ -302,19 +302,19 @@ class CosineTrajectoryShaper:
         # Wang et al. (2026) Eq. 16 exponential fuzzy softening factor on curve flare width:
         alpha = float(min(0.46, alpha_base + 0.04 * (1.0 - mu_y)))
         shape_k = 1.0 / (1.0 - alpha)
-        land_k = 1.66  # Soft-deceleration landing duration factor (softer curve than pi/2 = 1.571)
+        land_k = max(1.66, shape_k)  # Ensure peak algebraic deceleration <= b_target across alpha
         dur_k = 1.78   # Soft-acceleration S-curve ramp duration factor
 
         # Future Arrival-Synchronized Braking Spot for C^2 Algebraic Soft-Deceleration Profile:
         v_eff = max(0.0, float(v_curr))
         w_pos = d_wind_hat if d_wind_hat > 0.0 else 0.0
-        b_phys_max = max(0.45, self.max_service_braking_est * 0.86 - w_pos)
+        b_phys_max = max(0.38, self.max_service_braking_est * 0.86 - w_pos)
         b_comf_hi = min(self.corridor.comfort_braking_max, b_phys_max)
-        b_comf_lo = 0.60
+        b_comf_lo = min(0.60, b_comf_hi)
         b_raw = b_land_cmd - 0.12 * w_pos
         b_target = b_comf_lo if b_raw < b_comf_lo else (b_comf_hi if b_raw > b_comf_hi else float(b_raw))
 
-        if rem_dist_now < 420.0 and 10.0 < t_rem_now < 45.0 and v_eff > 1e-4:
+        if rem_dist_now < 450.0 and 10.0 < t_rem_now < 45.0 and v_eff > 1e-4:
             b_for_exact_time = (land_k * v_eff) / t_rem_now
             b_blend = 0.78 * b_for_exact_time + 0.22 * b_target
             b_target = b_comf_lo if b_blend < b_comf_lo else (b_comf_hi if b_blend > b_comf_hi else float(b_blend))
@@ -323,7 +323,7 @@ class CosineTrajectoryShaper:
         dx_brake_now = 0.5 * v_eff * t_land_now
         x_brake_now = self.corridor.station_x_m - dx_brake_now
 
-        if (not self.in_landing) and (x_curr >= x_brake_now - 0.5 * v_curr * dt) and (rem_dist_now < 450.0):
+        if (not self.in_landing) and (x_curr >= x_brake_now - 0.5 * v_curr * dt) and (rem_dist_now < 470.0):
             self.in_landing = True
             self.x_brake_dynamic = float(x_curr)
             self.v_entry_ref = float(max(1.0, v_curr))
@@ -343,17 +343,27 @@ class CosineTrajectoryShaper:
                 self.v_entry_ref = 0.80 * self.v_entry_ref + 0.20 * v_entry_implied
                 b_cap = self.feasible_comfort_braking(self.corridor.comfort_braking_max, d_wind_hat)
                 bp_raw = (land_k * (self.v_entry_ref ** 2)) / (2.0 * self.dx_land_ref)
-                self.b_peak_ref = 0.48 if bp_raw < 0.48 else (b_cap if bp_raw > b_cap else float(bp_raw))
+                b_min_ref = min(0.48, b_cap)
+                self.b_peak_ref = b_min_ref if bp_raw < b_min_ref else (b_cap if bp_raw > b_cap else float(bp_raw))
                 self.t_land_ref = float((land_k * self.v_entry_ref) / self.b_peak_ref)
 
             self.free_a_curr = -float((self.v_entry_ref / max(dt, self.t_land_ref)) * self._trap_acc_shape(1.0 - u_now, alpha))
+            b_phys_stop = max(0.30, self.max_service_braking_est * 0.94 - max(0.0, d_wind_hat))
             du_step = dt / max(dt, self.t_land_ref)
+            sim_rem = rem_dist_now
+            sim_v_l = v_curr
             for i in range(n_p):
                 u_i = min(1.0, u_now + (i + 1) * du_step)
                 v_i = self.v_entry_ref * self._trap_vel_prog(1.0 - u_i, alpha)
-                if rem_dist_now <= 0.03 or u_i >= 0.999:
+                v_stop_env = math.sqrt(max(0.0, 2.0 * b_phys_stop * max(0.0, sim_rem)))
+                if v_i > v_stop_env:
+                    v_i = v_stop_env
+                if rem_dist_now <= 0.03 or sim_rem <= 0.03 or u_i >= 0.999:
                     v_i = 0.0
-                v_ref[i] = v_i if v_i > 0.0 else 0.0
+                v_pos = v_i if v_i > 0.0 else 0.0
+                v_ref[i] = v_pos
+                sim_rem -= 0.5 * (sim_v_l + v_pos) * dt
+                sim_v_l = v_pos
 
             t_land_rem = max(0.0, (1.0 - u_now) * self.t_land_ref)
             return v_ref, self.x_brake_dynamic, float(t_land_rem)

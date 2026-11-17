@@ -16,7 +16,6 @@ Run with:
 from __future__ import annotations
 
 import os
-import shutil
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -401,20 +400,16 @@ def build_diagram(out_dir: str) -> list[str]:
 
     plt.tight_layout(pad=0.25)
 
+    os.makedirs(out_dir, exist_ok=True)
     local_out = os.path.join(out_dir, "contracts_hierarchical_shielding_arch.png")
     fig.savefig(local_out, dpi=300, bbox_inches="tight")
     plt.close(fig)
-
-    parent_out = os.path.abspath(os.path.join(out_dir, "..", "contracts_hierarchical_shielding_arch.png"))
-    saved = [local_out]
-    if os.path.dirname(parent_out) != os.path.abspath(out_dir):
-        shutil.copy2(local_out, parent_out)
-        saved.append(parent_out)
-    return saved
+    return [local_out]
 
 
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    paths = build_diagram(script_dir)
+    fig_dir = os.path.join(script_dir, "figures")
+    paths = build_diagram(fig_dir)
     for p in paths:
         print(f"Generated architecture diagram: {p}")

@@ -27,7 +27,10 @@ import gc
 import sys
 from pathlib import Path
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+_ROOT_DIR = Path(__file__).resolve().parent.parent
+for _p in (str(_ROOT_DIR), str(_ROOT_DIR / "core")):
+    if _p not in sys.path:
+        sys.path.append(_p)
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -167,6 +170,7 @@ class MPCTransitionRailroadEnv:
         self._feas_cache_k: int = -1
         self._feas_cache_map: dict[tuple[float, float], tuple[float, float]] = {}
         self._ot_slack_cache_map: dict[tuple[float, float], float] = {}
+        self._geom_cache_map: dict[float, tuple[float, float]] = {}
         self.shaper.reset()
         self.mpc.reset()
         return self._get_obs()
@@ -218,13 +222,15 @@ class MPCTransitionRailroadEnv:
 
         samples: list[tuple[float, float, float, float]] = []
         if is_clean:
+            mad_4: float | None = None
             for W in (1, 2, 4, 8):
                 if 3 * W > n:
                     continue
+                if W == 8 and (mad_4 is None or mad_4 >= 0.0015):
+                    continue
                 invW = 1.0 / float(W)
-                sig0 = max(2e-4, 6e-5 * float(W * W))
-                var0 = float(W) * (sig0 ** 2)
-                c_rob = max(0.0005, 0.0002 * float(W * W))
+                w_rows: list[tuple[float, float]] = []
+                w_res: list[float] = []
                 for s in range(0, n - 3 * W + 1):
                     if not np.all(valid[s : s + 3 * W]):
                         continue
@@ -232,28 +238,50 @@ class MPCTransitionRailroadEnv:
                     d2y = ((cy[s + 3 * W] - cy[s + 2 * W]) - 2.0 * (cy[s + 2 * W] - cy[s + W]) + (cy[s + W] - cy[s])) * invW
                     if abs(d2f) < 0.35 or abs(d2y) > 2.5:
                         continue
+                    w_rows.append((d2f, d2y))
+                    w_res.append(abs(d2y - th0 * d2f))
+                if not w_rows:
+                    continue
+                mad_w = float(np.median(w_res)) * 1.4826 if len(w_res) >= 3 else 0.0
+                if W == 4:
+                    mad_4 = mad_w if len(w_res) >= 3 else 1.0
+                sig0 = max(2e-4, 6e-5 * float(W * W), mad_w)
+                var0 = float(W) * (sig0 ** 2)
+                c_rob = max(0.0005, 0.0002 * float(W * W), 1.5 * mad_w)
+                for d2f, d2y in w_rows:
                     samples.append((d2f, d2y, var0, c_rob))
             pow_r = 1.5
         else:
-            for W in (4, 8, 12):
+            w_levels = (4, 6)
+            for W in w_levels:
                 if 3 * W > n:
                     continue
                 stride = max(2, W // 2)
                 invW = 1.0 / float(W)
                 sig_tach = (4.55 * noise) / (float(W) * dt)
-                sig_turb = max(0.032, 0.8 * emp_r1) * math.sqrt(float(W) / 4.0)
+                sig_turb = max(0.038, emp_r1) * math.sqrt(float(W) / 4.0)
                 overlap = float(W) / float(stride)
+                w_rows_n: list[tuple[float, float, float]] = []
+                w_res_n: list[float] = []
                 for s in range(0, n - 3 * W + 1, stride):
                     if not np.all(valid[s : s + 3 * W]):
                         continue
                     d2f = ((cf[s + 3 * W] - cf[s + 2 * W]) - 2.0 * (cf[s + 2 * W] - cf[s + W]) + (cf[s + W] - cf[s])) * invW
                     d2y = ((cy[s + 3 * W] - cy[s + 2 * W]) - 2.0 * (cy[s + 2 * W] - cy[s + W]) + (cy[s + W] - cy[s])) * invW
                     d2fd = abs(((cd[s + 3 * W] - cd[s + 2 * W]) - 2.0 * (cd[s + 2 * W] - cd[s + W]) + (cd[s + W] - cd[s])) * invW)
-                    if abs(d2f) < 6.0 or abs(d2y) > 2.5:
+                    if abs(d2f) < 5.0 or abs(d2y) > 2.5:
                         continue
+                    w_rows_n.append((d2f, d2y, d2fd))
+                    w_res_n.append(abs(d2y - th0 * d2f))
+                if not w_rows_n:
+                    continue
+                mad_w = float(np.median(w_res_n)) * 1.4826 if len(w_res_n) >= 4 else 0.0
+                corr_mult = overlap * float(len(w_levels))
+                for d2f, d2y, d2fd in w_rows_n:
                     sig_drag = (0.18 * d2fd) / prior
-                    sig_tot = math.sqrt((sig_tach ** 2) + (sig_turb ** 2) + (sig_drag ** 2))
-                    samples.append((d2f, d2y, overlap * (sig_tot ** 2), max(0.005, 1.5 * sig_tot)))
+                    sig_model = math.sqrt((sig_tach ** 2) + (sig_turb ** 2) + (sig_drag ** 2))
+                    sig_tot = max(sig_model, mad_w)
+                    samples.append((d2f, d2y, corr_mult * (sig_tot ** 2), max(0.008, 1.5 * sig_tot)))
             pow_r = 1.0
 
         th = th0
@@ -275,27 +303,97 @@ class MPCTransitionRailroadEnv:
         m_est = 1000.0 / ((1.0 + gamma) * max(1e-6, th))
         return m_lo if m_est < m_lo else (m_hi if m_est > m_hi else float(m_est))
 
-    def _build_remaining_time_estimator(self, a_start: float, b_land: float):
-        x_curr = self.x_curr
-        v_curr = self.v_meas
-        station_x_m = self.corridor.station_x_m
-        x_rem = max(0.0, station_x_m - x_curr)
+    def _ensure_feas_cache_epoch(self) -> None:
+        if self._feas_cache_k != self.k_elapsed:
+            self._feas_cache_k = self.k_elapsed
+            self._feas_cache_map.clear()
+            self._ot_slack_cache_map.clear()
+            self._geom_cache_map.clear()
+
+    def _get_remaining_time_geom(self, b_land: float) -> tuple[float, float]:
+        b_key = round(b_land, 6)
+        cached = self._geom_cache_map.get(b_key)
+        if cached is not None:
+            return cached
         ceil_fn = (
             self.corridor.compute_smooth_spatial_ceiling
             if self.use_cosine_shaper
             else self.corridor.compute_free_spatial_ceiling
         )
-        v_local_cap = ceil_fn(x_curr, b_land)
-        if x_rem <= 15.0 or self.shaper.in_landing:
-            return x_rem, v_local_cap, lambda _vc: x_rem / max(0.5, v_curr + 0.5)
-
+        v_local_cap = float(ceil_fn(self.x_curr, b_land))
         _, _, _, b_eff_land = CosineTrajectoryShaper.dynamic_cosine_braking_spot(
             self.corridor,
-            max(v_curr, 12.2),
+            max(self.v_meas, 12.2),
             b_land,
             d_wind_hat=self.d_hat,
             max_braking_decel=self.physics.max_braking_decel,
         )
+        geom = (v_local_cap, float(b_eff_land))
+        self._geom_cache_map[b_key] = geom
+        return geom
+
+    @staticmethod
+    def _eval_remaining_time_core(
+        v_c: float,
+        x_curr: float,
+        v_curr: float,
+        station_x_m: float,
+        zones,
+        v_last_lim: float,
+        inv_2b: float,
+        inv_1b: float,
+        dur_k: float,
+        min_ramp_s: float,
+        rate_up: float,
+        rate_dn: float,
+    ) -> float:
+        x_rem = station_x_m - x_curr
+        if x_rem < 0.0:
+            x_rem = 0.0
+        v_throat = v_c if v_c < v_last_lim else v_last_lim
+        dx_land = (v_throat * v_throat) * inv_2b
+        t_land = v_throat * inv_1b
+        x_b = station_x_m - dx_land
+        if x_b < x_curr + 1.0:
+            x_b = x_curr + 1.0
+        if x_curr >= x_b:
+            v_den = v_curr + 0.5
+            return (2.0 * x_rem) / (v_den if v_den > 0.5 else 0.5)
+
+        t_acc = 0.0
+        sim_v = v_curr
+        for z in zones:
+            seg_a = x_curr if x_curr > z.x_start else z.x_start
+            seg_b = x_b if x_b < z.x_end else z.x_end
+            if seg_b <= seg_a:
+                continue
+            seg_len = seg_b - seg_a
+            v_seg = v_c if v_c < z.v_limit_mps else z.v_limit_mps
+            dv = abs(v_seg - sim_v)
+            if dv > 0.15:
+                rate = rate_up if v_seg >= sim_v else rate_dn
+                t_r = (dur_k * dv) / rate
+                t_ramp = min_ramp_s if t_r < min_ramp_s else t_r
+                dx_ramp = 0.5 * (sim_v + v_seg) * t_ramp
+                if dx_ramp < seg_len:
+                    v_den = v_seg if v_seg > 0.5 else 0.5
+                    t_acc += t_ramp + (seg_len - dx_ramp) / v_den
+                else:
+                    v_avg = 0.5 * (sim_v + v_seg)
+                    t_acc += seg_len / (v_avg if v_avg > 0.5 else 0.5)
+            else:
+                v_den = v_seg if v_seg > 0.5 else 0.5
+                t_acc += seg_len / v_den
+            sim_v = v_seg
+        return t_acc + t_land
+
+    def _remaining_time_args(self, a_start: float, b_land: float):
+        self._ensure_feas_cache_epoch()
+        x_curr = self.x_curr
+        v_curr = self.v_meas
+        station_x_m = self.corridor.station_x_m
+        x_rem = max(0.0, station_x_m - x_curr)
+        v_local_cap, b_eff_land = self._get_remaining_time_geom(b_land)
         if self.use_cosine_shaper:
             land_k, dur_k, min_ramp_s = 0.5 * math.pi, 0.5 * math.pi, 12.0
             rate_up = max(0.35, a_start * 0.62)
@@ -308,57 +406,33 @@ class MPCTransitionRailroadEnv:
         v_last_lim = zones[-1].v_limit_mps
         inv_2b = 0.5 * land_k / b_eff_land
         inv_1b = land_k / b_eff_land
+        return x_rem, v_local_cap, x_curr, v_curr, station_x_m, zones, v_last_lim, inv_2b, inv_1b, dur_k, min_ramp_s, rate_up, rate_dn
 
-        def estimate_remaining_time(v_c: float) -> float:
-            v_throat = v_c if v_c < v_last_lim else v_last_lim
-            dx_land = (v_throat * v_throat) * inv_2b
-            t_land = v_throat * inv_1b
-            x_b = station_x_m - dx_land
-            if x_b < x_curr + 1.0:
-                x_b = x_curr + 1.0
-            if x_curr >= x_b:
-                return (2.0 * x_rem) / max(0.5, v_curr + 0.5)
-
-            t_acc = 0.0
-            sim_v = v_curr
-            for z in zones:
-                seg_a = x_curr if x_curr > z.x_start else z.x_start
-                seg_b = x_b if x_b < z.x_end else z.x_end
-                if seg_b <= seg_a:
-                    continue
-                seg_len = seg_b - seg_a
-                v_seg = v_c if v_c < z.v_limit_mps else z.v_limit_mps
-                dv = abs(v_seg - sim_v)
-                if dv > 0.15:
-                    rate = rate_up if v_seg >= sim_v else rate_dn
-                    t_r = (dur_k * dv) / rate
-                    t_ramp = min_ramp_s if t_r < min_ramp_s else t_r
-                    dx_ramp = 0.5 * (sim_v + v_seg) * t_ramp
-                    if dx_ramp < seg_len:
-                        t_acc += t_ramp + (seg_len - dx_ramp) / max(0.5, v_seg)
-                    else:
-                        t_acc += seg_len / max(0.5, 0.5 * (sim_v + v_seg))
-                else:
-                    t_acc += seg_len / max(0.5, v_seg)
-                sim_v = v_seg
-            return t_acc + t_land
-
-        return x_rem, v_local_cap, estimate_remaining_time
+    def _build_remaining_time_estimator(self, a_start: float, b_land: float):
+        x_rem, v_local_cap, x_curr, v_curr, station_x_m, zones, v_last_lim, inv_2b, inv_1b, dur_k, min_ramp_s, rate_up, rate_dn = self._remaining_time_args(a_start, b_land)
+        if x_rem <= 15.0 or self.shaper.in_landing:
+            return x_rem, v_local_cap, lambda _vc: x_rem / max(0.5, v_curr + 0.5)
+        return x_rem, v_local_cap, lambda v_c: self._eval_remaining_time_core(
+            v_c, x_curr, v_curr, station_x_m, zones, v_last_lim, inv_2b, inv_1b, dur_k, min_ramp_s, rate_up, rate_dn
+        )
 
     def estimate_remaining_time_at_speed(self, v_hold: float, a_start: float, b_land: float) -> float:
         """Forward disturbance-free travel + stopping time if speed is capped at min(cap_i, v_hold) per zone."""
-        _, _, est_fn = self._build_remaining_time_estimator(a_start, b_land)
-        return float(est_fn(float(v_hold)))
+        x_rem, _, x_curr, v_curr, station_x_m, zones, v_last_lim, inv_2b, inv_1b, dur_k, min_ramp_s, rate_up, rate_dn = self._remaining_time_args(a_start, b_land)
+        if x_rem <= 15.0 or self.shaper.in_landing:
+            return float(x_rem / max(0.5, v_curr + 0.5))
+        return float(
+            self._eval_remaining_time_core(
+                float(v_hold), x_curr, v_curr, station_x_m, zones, v_last_lim, inv_2b, inv_1b, dur_k, min_ramp_s, rate_up, rate_dn
+            )
+        )
 
     def compute_on_track_slack_s(self, a_start: float, b_land: float) -> float:
         """
         Forward 'we're on track' trajectory time slack (s):
         positive when maintaining min(cap_i, v_curr) across remaining zones + stop arrives early.
         """
-        if self._feas_cache_k != self.k_elapsed:
-            self._feas_cache_k = self.k_elapsed
-            self._feas_cache_map.clear()
-            self._ot_slack_cache_map.clear()
+        self._ensure_feas_cache_epoch()
         cache_key = (round(a_start, 6), round(b_land, 6))
         cached = self._ot_slack_cache_map.get(cache_key)
         if cached is not None:
@@ -367,25 +441,25 @@ class MPCTransitionRailroadEnv:
         if self.shaper.in_landing or x_rem <= 15.0 or self.v_meas < 1.0:
             self._ot_slack_cache_map[cache_key] = 0.0
             return 0.0
-        _, v_local_cap, est_fn = self._build_remaining_time_estimator(a_start, b_land)
-        v_hold = min(v_local_cap, float(self.v_meas))
+        _, v_local_cap, x_curr, v_curr, station_x_m, zones, v_last_lim, inv_2b, inv_1b, dur_k, min_ramp_s, rate_up, rate_dn = self._remaining_time_args(a_start, b_land)
+        v_hold = v_local_cap if v_local_cap < self.v_meas else float(self.v_meas)
         t_budget = max(self.corridor.dt, self.corridor.deadline_s - self.t_curr)
-        slack = float(t_budget - est_fn(v_hold))
+        t_est = self._eval_remaining_time_core(
+            v_hold, x_curr, v_curr, station_x_m, zones, v_last_lim, inv_2b, inv_1b, dur_k, min_ramp_s, rate_up, rate_dn
+        )
+        slack = float(t_budget - t_est)
         self._ot_slack_cache_map[cache_key] = slack
         return slack
 
     def compute_feasible_deadline_pace(self, a_start: float, b_land: float) -> tuple[float, float]:
-        if self._feas_cache_k != self.k_elapsed:
-            self._feas_cache_k = self.k_elapsed
-            self._feas_cache_map.clear()
-            self._ot_slack_cache_map.clear()
+        self._ensure_feas_cache_epoch()
         cache_key = (round(a_start, 6), round(b_land, 6))
         cached = self._feas_cache_map.get(cache_key)
         if cached is not None:
             return cached
 
         t_rem = max(self.corridor.dt, self.corridor.deadline_s - self.t_curr)
-        x_rem, v_local_cap, estimate_remaining_time = self._build_remaining_time_estimator(a_start, b_land)
+        x_rem, v_local_cap, x_curr, v_curr, station_x_m, zones, v_last_lim, inv_2b, inv_1b, dur_k, min_ramp_s, rate_up, rate_dn = self._remaining_time_args(a_start, b_land)
         v_naive = x_rem / t_rem
 
         if x_rem <= 15.0 or self.shaper.in_landing:
@@ -396,9 +470,10 @@ class MPCTransitionRailroadEnv:
 
         n_bisect = 6 if self.use_cosine_shaper else 9
         lo, hi = 2.0, 17.8
+        eval_core = self._eval_remaining_time_core
         for _ in range(n_bisect):
             mid = 0.5 * (lo + hi)
-            if estimate_remaining_time(mid) > t_rem:
+            if eval_core(mid, x_curr, v_curr, station_x_m, zones, v_last_lim, inv_2b, inv_1b, dur_k, min_ramp_s, rate_up, rate_dn) > t_rem:
                 lo = mid
             else:
                 hi = mid
@@ -718,7 +793,8 @@ class MPCTransitionRailroadEnv:
                 + 1.00 * max(0.0, rho_2_acc - 0.94) ** 2
                 + 0.60 * max(0.0, rho_3_jerk - 0.88) ** 2
             )
-            energy_pen = 0.06 * step_kwh
+            ton_km_prior = max(50.0, (self.mass_prior_kg / 1000.0) * (self.corridor.station_x_m / 1000.0))
+            energy_pen = 0.35 * ((step_kwh * 1000.0) / ton_km_prior)
             x_rem_now = max(0.0, self.corridor.station_x_m - x_next)
             stall_pen = 0.30 if ((not self.shaper.in_landing) and (x_rem_now > 150.0) and (v_next < 0.8)) else 0.0
 
@@ -1269,7 +1345,9 @@ def train_pure_ppo_cosine_pilot(
             if det_loss_score <= best_score:
                 best_score = det_loss_score
                 best_state = copy.deepcopy(policy.state_dict())
-                torch.save(best_state, f"best_{checkpoint_prefix}.pt")
+                ckpt_dir = Path(__file__).resolve().parent / "checkpoints"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(best_state, str(ckpt_dir / f"best_{checkpoint_prefix}.pt"))
 
         history.append({
             "epoch": epoch,
@@ -1888,6 +1966,7 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--plot", type=str, default="rl_cosine_mpc.png")
     ap.add_argument("--dual-plot", type=str, default="wind_trajectory_shield_dual_axis.png")
+    ap.add_argument("--save-extreme-plot", action="store_true", help="Also write an extra _extreme.png dual-axis plot in mixed mode")
     ap.add_argument("--load-checkpoint", type=str, default="", help="Path to .pt file (e.g. best_ppo_cosine_pilot.pt) to skip training")
     ap.add_argument("--real-data", action="store_true", help="Benchmark on real Digitraffic rail + Open-Meteo weather data")
     ap.add_argument("--train-number", type=int, default=8311, help="Finnish Digitraffic train number (e.g. 8311 HSL commuter or 23 InterCity)")
@@ -1902,7 +1981,7 @@ def main():
     ap.add_argument(
         "--data-dir",
         type=str,
-        default="collected_data",
+        default="data",
         help="Directory to store separated baseline vs extreme-scenario datasets (JSON + CSV)",
     )
     args = ap.parse_args()
@@ -1916,14 +1995,29 @@ def main():
 
     import os, gc
     script_dir = Path(__file__).resolve().parent
+    ckpt_dir = script_dir / "checkpoints"
+    figures_dir = script_dir / "figures"
 
     def _resolve_ckpt(path_str: str) -> str:
         if not path_str:
             return ""
         if os.path.exists(path_str):
             return path_str
-        cand = script_dir / path_str
-        return str(cand) if cand.exists() else path_str
+        for cand in (ckpt_dir / path_str, script_dir / path_str):
+            if cand.exists():
+                return str(cand)
+        return str(ckpt_dir / Path(path_str).name)
+
+    def _resolve_fig_out(path_str: str) -> Path:
+        p = Path(path_str)
+        if p.is_absolute() or len(p.parts) > 1:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            return p
+        figures_dir.mkdir(parents=True, exist_ok=True)
+        return figures_dir / p.name
+
+    plot_out_path = _resolve_fig_out(args.plot)
+    dual_plot_out_path = _resolve_fig_out(args.dual_plot)
 
     base_corridor = RailroadCorridor()
     print("=" * 152)
@@ -1950,6 +2044,7 @@ def main():
         emulator, _ = train_150_step_mpc_trajectory_emulator(
             base_corridor, emulator_steps=args.emulator_steps, seed=args.seed
         )
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
         torch.save(emulator.state_dict(), emu_ckpt_path)
 
     if load_ckpt_resolved and os.path.exists(load_ckpt_resolved):
@@ -2246,12 +2341,11 @@ def main():
         run_nominal_no_wind=plot_base_nw,
         run_unshielded_wind=plot_base_trajs["4. Multi-Property PPO Pilot (Unshielded)"],
         run_shielded_wind=plot_base_trajs["7. Contract-Shielded PPO (UCB-DMPS Cosine)"],
-        out_path=args.dual_plot,
+        out_path=str(dual_plot_out_path),
         tag_label=base_tag,
     )
-    if sample_ext_scenario is not None and sample_ext_trajs and sample_ext_scenario is not plot_base_scen:
-        dp = Path(args.dual_plot)
-        ext_dual_path = str(dp.with_name(f"{dp.stem}_extreme{dp.suffix}"))
+    if args.save_extreme_plot and sample_ext_scenario is not None and sample_ext_trajs and sample_ext_scenario is not plot_base_scen:
+        ext_dual_path = str(dual_plot_out_path.with_name(f"{dual_plot_out_path.stem}_extreme{dual_plot_out_path.suffix}"))
         save_dual_axis_wind_trajectory_shield_plot(
             scenario=sample_ext_scenario,
             run_nominal_no_wind=sample_ext_no_wind,
@@ -2389,14 +2483,9 @@ def main():
     axes[1, 2].grid(True, axis="y", alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig(args.plot, dpi=150)
-    if not Path(args.plot).is_absolute():
-        try:
-            fig.savefig(f"../{args.plot}", dpi=150)
-        except OSError:
-            pass
+    fig.savefig(str(plot_out_path), dpi=150)
     plt.close(fig)
-    print(f"Saved 6-panel Multi-Property Benchmark plot to: {args.plot}", flush=True)
+    print(f"Saved 6-panel Multi-Property Benchmark plot to: {plot_out_path}", flush=True)
 
 
 if __name__ == "__main__":

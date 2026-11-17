@@ -104,9 +104,11 @@ Across disturbed multi-station legs, the simulator models five weather regimes w
 | [deadline_station_trackGen/real_world_rail_weather.py](deadline_station_trackGen/real_world_rail_weather.py) | Live Finnish Digitraffic train timetable/GPS fetcher paired with Open-Meteo wind/temperature/precipitation profiles and optional harsh extreme-noise injection. |
 | [deadline_station_trackGen/bilbao_cbtc_ato.py](deadline_station_trackGen/bilbao_cbtc_ato.py) | Standalone implementation of the Bilbao-Moreno et al. (2025) two-layer CBTC-ATO controller (RMBTP Regula Falsi Mesoscopic Planner + Microscopic Cascade PI-Position/PI-Speed). |
 | [deadline_station_trackGen/safety_shield.py](deadline_station_trackGen/safety_shield.py) | Standalone Stage 1 & Stage 2 safety filter using all 8 active neural emulator channels and analytical scissor band diagnostics. |
-| [pure_mpc_controller.py](pure_mpc_controller.py) | State-augmented LTV-MPC ($z_k = [v_k, u_{\text{act}}(k-1)]^\top$) with horizon $N_p=5, N_c=3$, causal plateau lookahead guard, and fast box-constrained QP solver. |
-| [havaei_generalizing_rl.py](havaei_generalizing_rl.py) | Nonlinear subway train plant (`NonlinearTrainPhysics`), Davis drag, grade/curve resistance, active 8-feature `LearnedLinearizationModel`, and unbiased 5-action Hybrid RL selector. |
-| [deadline_station_trackGen/Report2.tex](deadline_station_trackGen/Report2.tex) & [CHANGES.md](deadline_station_trackGen/CHANGES.md) | Full LaTeX technical report and detailed changelog aligned with current implementation and benchmark measurements. |
+| [core/pure_mpc_controller.py](core/pure_mpc_controller.py) | State-augmented LTV-MPC ($z_k = [v_k, u_{\text{act}}(k-1)]^\top$) with horizon $N_p=5, N_c=3$, causal plateau lookahead guard, and fast box-constrained QP solver. |
+| [core/havaei_generalizing_rl.py](core/havaei_generalizing_rl.py) | Nonlinear subway train plant (`NonlinearTrainPhysics`), Davis drag, grade/curve resistance, active 8-feature `LearnedLinearizationModel`, and unbiased 5-action Hybrid RL selector. |
+| [core/fuzzy_pid_controller.py](core/fuzzy_pid_controller.py) | Fuzzy-PID and ILR-PSO-Fuzzy-PID baseline controllers for Stage 1–2 single-corridor comparison. |
+| [experiments/benchmark_central.py](experiments/benchmark_central.py) & [experiments/test_emulator_150_vs_linear.py](experiments/test_emulator_150_vs_linear.py) | Stage 1–2 single-corridor tracking and 150-step vs. linear emulator ablation scripts. |
+| [deadline_station_trackGen/docs/Report2.tex](deadline_station_trackGen/docs/Report2.tex) & [deadline_station_trackGen/docs/CHANGES.md](deadline_station_trackGen/docs/CHANGES.md) | Full LaTeX technical report and detailed changelog aligned with current implementation (`checkpoints/`, `figures/`, `data/`). |
 
 ---
 
@@ -120,7 +122,7 @@ pip install numpy torch matplotlib
 ```
 
 ### 2. Instant Evaluation Using Pre-Trained Checkpoints
-Run from inside `deadline_station_trackGen/` to evaluate all 10 methods across 30 randomized multi-station scenarios (using `best_emulator.pt`, `best_ppo_cosine_pilot.pt`, and `best_ppo_free_pilot.pt`), or pass `--real-data --eval-runs 10` for Finnish Digitraffic + Open-Meteo evaluation:
+Run from inside `deadline_station_trackGen/` to evaluate all 10 methods across 30 randomized multi-station scenarios (using checkpoints in `deadline_station_trackGen/checkpoints/`), or pass `--real-data --eval-runs 10` for Finnish Digitraffic + Open-Meteo evaluation:
 ```bash
 cd deadline_station_trackGen
 python dynamic_railroad_mpc.py --eval-runs 30 --n-legs 0 --wind-mode mixed --load-checkpoint best_ppo_cosine_pilot.pt
@@ -140,14 +142,15 @@ python dynamic_railroad_mpc.py --epochs 220 --eval-runs 30 --n-legs 0 --wind-mod
 * `--n-legs`: Number of station-to-station legs per journey (`0` = randomly sample `1..5` stations per scenario; or set fixed `1..5`).
 * `--wind-mode`: Weather disturbance mode (`mixed`, `disjoint`, `continuous`, `none`).
 * `--real-data`: Evaluate on live Finnish Digitraffic train timetables + Open-Meteo weather profiles (default `--harsh-weather mixed`).
-* `--load-checkpoint`: Path to pre-trained cosine PPO `.pt` file to bypass training (`best_ppo_free_pilot.pt` and `best_emulator.pt` are loaded automatically if present).
+* `--load-checkpoint`: Path or filename (auto-resolved inside `checkpoints/`) to pre-trained cosine PPO `.pt` file to bypass training (`best_ppo_free_pilot.pt` and `best_emulator.pt` are loaded automatically if present).
+* `--save-extreme-plot`: Optionally export an extra `_extreme.png` dual-axis plot in mixed mode (by default only the 6-panel plot and single dual-axis plot are written to `figures/`).
 
 ---
 
 ## Experimental Results
 
 ### Stage 1 & Stage 2 Summary (Single-Corridor Speed Tracking)
-* **Stage 1 (`havaei_generalizing_rl.py`):** Lifting actuator delay into LTV-MPC eliminates shift overshoot ($0.7480\text{ m/s} \to 0.0350\text{ m/s}$); an unbiased 5-action Hybrid RL policy across 15 unseen 1,000-step trajectories selects lifted MPC on `76.23%` of steps unshielded (`88.16%` DMPS-shielded), achieving `PaperScore = 0.0910` (`0.0585` shielded).
+* **Stage 1 (`core/havaei_generalizing_rl.py`):** Lifting actuator delay into LTV-MPC eliminates shift overshoot ($0.7480\text{ m/s} \to 0.0350\text{ m/s}$); an unbiased 5-action Hybrid RL policy across 15 unseen 1,000-step trajectories selects lifted MPC on `76.23%` of steps unshielded (`88.16%` DMPS-shielded), achieving `PaperScore = 0.0910` (`0.0585` shielded).
 
 ### Stage 3 Generalized Multi-Station Synthetic Benchmark ($N = 30$ Scenarios, $1\text{--}5$ Stations, $4.75\text{--}27.80\text{ km}$)
 Evaluated across 84 inter-station legs (`37 Clear-Dry`, `4 Windy-Dry`, `12 Rain-WetRail`, `9 Cold-Humid`, `11 Snow-Slush`, `11 Heat-Thermal`) under the loss-consistent multi-objective metric:
@@ -203,7 +206,7 @@ $$\text{LossScore} = 1.0\,|\text{TimeErr}| + 15.0\,|\text{StopErr}|_{\text{m}} +
 
 ## Generated Diagnostic Figures
 
-Running `dynamic_railroad_mpc.py` automatically exports two high-resolution diagnostic figures inside `deadline_station_trackGen/` (and copies `rl_cosine_mpc.png` to the project root):
+Running `dynamic_railroad_mpc.py` automatically exports two high-resolution diagnostic figures inside `deadline_station_trackGen/figures/`:
 1. **`wind_trajectory_shield_dual_axis.png`:** Dual-horizontal-axis 4-station ($21.35\text{ km}$) trajectory profile showing cumulative track position $x\text{ (m)}$ on the bottom axis and clock time $t\text{ (s)}$ on the top axis, the Goodall 99% Scissor Band (yellow) and Safe Envelope (green), active contract interventions (red dots), disjoint wind fronts, MPC throttle/brake effort $u_{\text{act}}$, and causal telescoping 3-block 2nd-diff MAP passenger mass convergence $\hat{M}(x) \to M(x)$.
 2. **`rl_cosine_mpc.png`:** 6-panel benchmark overview comparing (1) multi-station speed profiles $v(x)$, (2) Order-2 acceleration $a(t)$ and Order-3 jerk $j(t)$, (3) online causal 3-block 2nd-diff MAP passenger mass identification and weather observer $\hat{d}(t)$, (4) mean deadline error across Clean, Weather-Disturbed, and Combined runs, (5) composite `LossScore`, and (6) normalized multi-property breakdown (`SmoothLoss`, `StopErr`, and `SpecEnergy`).
 
