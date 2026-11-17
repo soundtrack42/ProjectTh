@@ -24,6 +24,7 @@ Architecture (Two-Layer Mesoscopic + Microscopic CBTC-ATO):
 """
 
 from __future__ import annotations
+import math
 import sys
 from pathlib import Path
 import numpy as np
@@ -34,6 +35,10 @@ for _p in (str(_ROOT_DIR), str(_ROOT_DIR / "core")):
         sys.path.append(_p)
 from havaei_generalizing_rl import NonlinearTrainPhysics
 from railroad_corridor import RailroadCorridor
+
+
+def _clamp(val: float, lo: float, hi: float) -> float:
+    return lo if val < lo else (hi if val > hi else float(val))
 
 
 class BilbaoCBTCATOController:
@@ -78,8 +83,8 @@ class BilbaoCBTCATOController:
         """Effective 90% RMBTP acceleration and braking rates accounting for mass and disturbance."""
         mass_scale = 85000.0 / max(65000.0, self.physics.M)
         adh_mu = getattr(self.corridor, "adhesion_mu_factor", 1.0)
-        a_eff = float(np.clip(self.a_plan_cap * mass_scale * adh_mu + 0.45 * d_obs, 0.42, 1.15))
-        b_eff = float(np.clip(self.b_plan_cap * mass_scale * adh_mu - 0.35 * d_obs, 0.42, 0.88))
+        a_eff = _clamp(self.a_plan_cap * mass_scale * adh_mu + 0.45 * d_obs, 0.42, 1.15)
+        b_eff = _clamp(self.b_plan_cap * mass_scale * adh_mu - 0.35 * d_obs, 0.42, 0.88)
         return a_eff, b_eff
 
     def compute_backward_braking_ceiling(self, x_m: float, d_obs: float = 0.0) -> float:
@@ -92,14 +97,14 @@ class BilbaoCBTCATOController:
 
         # 1. Backward braking curve to the station stop (x = station_x_m, v = 0)
         rem_station = max(0.0, self.corridor.station_x_m - x_m)
-        v_stop_envelope = float(np.sqrt(2.0 * b_eff * rem_station))
+        v_stop_envelope = math.sqrt(2.0 * b_eff * rem_station)
         v_ceil = min(v_lim_here, v_stop_envelope)
 
         # 2. Backward braking curves to all upcoming speed-limit reductions (Fig. 7)
         for z in self.corridor.speed_zones:
             if z.x_start > x_m and z.v_limit_mps < v_ceil:
                 dist_to_zone = z.x_start - x_m
-                v_zone_env = float(np.sqrt(z.v_limit_mps ** 2 + 2.0 * b_eff * dist_to_zone))
+                v_zone_env = math.sqrt(z.v_limit_mps ** 2 + 2.0 * b_eff * dist_to_zone)
                 v_ceil = min(v_ceil, v_zone_env)
 
         return float(max(0.0, v_ceil))
@@ -143,7 +148,7 @@ class BilbaoCBTCATOController:
         for i in range(n_z - 2, -1, -1):
             v_next_lim = min(v_target_zone[i], v_target_zone[i + 1])
             dx_next = active_zones[i + 1][1] - active_zones[i + 1][0]
-            v_max_from_exit = float(np.sqrt(v_exit[i + 1] ** 2 + 2.0 * b_eff * dx_next))
+            v_max_from_exit = math.sqrt(v_exit[i + 1] ** 2 + 2.0 * b_eff * dx_next)
             v_exit[i] = min(v_next_lim, v_max_from_exit)
 
         # Forward pass: build (accel -> cruise -> backward-brake) segments per zone
@@ -162,7 +167,7 @@ class BilbaoCBTCATOController:
             # (v_peak^2 - curr_v^2)/(2*a_eff) + (v_peak^2 - v_end_cap^2)/(2*b_eff) <= seg_len
             num = 2.0 * seg_len + (curr_v ** 2) / a_eff + (v_end_cap ** 2) / b_eff
             denom = (1.0 / a_eff) + (1.0 / b_eff)
-            v_tri = float(np.sqrt(max(0.0, num / denom)))
+            v_tri = math.sqrt(max(0.0, num / denom))
             v_cruise = min(v_z, v_tri)
 
             # 1. Acceleration / adjustment from curr_v to v_cruise
@@ -179,7 +184,7 @@ class BilbaoCBTCATOController:
                 curr_v = v_cruise
             elif v_cruise < curr_v - 1e-3:
                 dx_brk1 = min(seg_len, (curr_v ** 2 - v_cruise ** 2) / (2.0 * b_eff))
-                v_after = float(np.sqrt(max(0.0, curr_v ** 2 - 2.0 * b_eff * dx_brk1)))
+                v_after = math.sqrt(max(0.0, curr_v ** 2 - 2.0 * b_eff * dx_brk1))
                 dt_brk1 = (curr_v - v_after) / b_eff
                 segs.append({
                     "t0": curr_t, "t1": curr_t + dt_brk1,
@@ -208,7 +213,7 @@ class BilbaoCBTCATOController:
             # 3. Backward slowdown ramp to v_end_cap at zb
             rem_to_zb = max(0.0, zb - curr_x)
             if rem_to_zb > 1e-3 and (curr_v > v_end_cap + 1e-3 or v_end_cap == 0.0):
-                v_final = float(np.sqrt(max(0.0, curr_v ** 2 - 2.0 * b_eff * rem_to_zb)))
+                v_final = math.sqrt(max(0.0, curr_v ** 2 - 2.0 * b_eff * rem_to_zb))
                 if i == n_z - 1:
                     v_final = 0.0
                 v_mean = max(0.25, 0.5 * (curr_v + v_final))
@@ -263,11 +268,11 @@ class BilbaoCBTCATOController:
             if it == 0 or err_low is None:
                 # Eq. 15-16 proportional time-ratio update from Bilbao-Moreno et al. (2025)
                 dt_sim = max(1.0, (self.corridor.deadline_s - err_op_time) - t0)
-                v_next = float(np.clip(v_k * (dt_sim / max(1.0, dt_sim + err_op_time)), 3.5, v_max_corridor))
+                v_next = _clamp(v_k * (dt_sim / max(1.0, dt_sim + err_op_time)), 3.5, v_max_corridor)
             else:
                 denom = err_high - err_low
                 if abs(denom) > 1e-5:
-                    v_next = float(np.clip(v_low - err_low * (v_high - v_low) / denom, 3.5, v_max_corridor))
+                    v_next = _clamp(v_low - err_low * (v_high - v_low) / denom, 3.5, v_max_corridor)
                 else:
                     v_next = 0.5 * (v_low + v_high)
 
@@ -358,13 +363,13 @@ class BilbaoCBTCATOController:
         if in_braking_phase and dv_pos_raw > 0.0:
             dv_pos = 0.0
         else:
-            dv_pos = float(np.clip(dv_pos_raw, -1.6, 1.6))
+            dv_pos = _clamp(dv_pos_raw, -1.6, 1.6)
 
         # 3. Sync Anti-Windup & Speed Saturation (Eqs. 30-31)
         v_cmd_unsat = v_ff + dv_pos
-        v_cmd_sat = float(np.clip(v_cmd_unsat, 0.0, v_bw_ceil))
+        v_cmd_sat = _clamp(v_cmd_unsat, 0.0, v_bw_ceil)
         if not in_braking_phase and abs(v_cmd_unsat - v_cmd_sat) < 1e-3:
-            self.int_pos = float(np.clip(self.int_pos + e_pos * dt, -15.0, 15.0))
+            self.int_pos = _clamp(self.int_pos + e_pos * dt, -15.0, 15.0)
         elif in_braking_phase:
             self.int_pos *= 0.85
 
@@ -372,8 +377,8 @@ class BilbaoCBTCATOController:
         if rem_dist < 210.0:
             b_req = max(0.36, (v_curr ** 2) / max(0.12, 2.0 * rem_dist)) if v_curr > 0.05 else self.b_plan_cap
             b_max_dock = 1.15 if rem_dist < 35.0 else self.corridor.comfort_braking_max
-            b_dock = float(np.clip(b_req, 0.42, b_max_dock))
-            v_dock = float(np.sqrt(2.0 * b_dock * max(0.0, rem_dist))) if rem_dist > 0.06 else 0.0
+            b_dock = _clamp(b_req, 0.42, b_max_dock)
+            v_dock = math.sqrt(2.0 * b_dock * max(0.0, rem_dist)) if rem_dist > 0.06 else 0.0
             v_cmd_sat = min(v_bw_ceil, v_dock)
             a_ff = -b_dock if v_curr > 0.05 else 0.0
 
@@ -388,22 +393,22 @@ class BilbaoCBTCATOController:
         # 4. Inner Speed Loop PI_omega + Feedforward Traction u_ff (Eq. 28)
         e_vel = v_cmd_sat - v_curr
         if abs(e_vel) < 0.25:
-            self.int_vel = float(np.clip(self.int_vel + e_vel * dt, -1.2, 1.2))
-        a_total_des = float(np.clip(
+            self.int_vel = _clamp(self.int_vel + e_vel * dt, -1.2, 1.2)
+        a_total_des = _clamp(
             a_ff + self.kp_vel * e_vel + self.ki_vel * self.int_vel,
             -self.corridor.comfort_braking_max,
             self.corridor.comfort_accel_max,
-        ))
+        )
 
         f_prop_req = ((a_total_des - inertia_acc) + a_res) * self.physics.M_eff
         u_sign = 1.0 if f_prop_req >= 0.0 else -1.0
         f_max = max(1.0, self.physics.max_propulsion_force(v_curr, u_sign))
         u_raw = f_prop_req / f_max
-        u_clamped = float(np.clip(u_raw, -1.0, 1.0))
+        u_clamped = _clamp(u_raw, -1.0, 1.0)
 
         # Trapezoidal ATO traction slew-rate limit
         du_max = 0.18 if rem_dist > 30.0 else 0.28
-        u_cmd = float(np.clip(u_clamped, self.prev_u_cmd - du_max, self.prev_u_cmd + du_max))
+        u_cmd = _clamp(u_clamped, self.prev_u_cmd - du_max, self.prev_u_cmd + du_max)
         if rem_dist <= 0.20 and v_curr <= 0.05:
             u_cmd = 0.0
         self.prev_u_cmd = u_cmd

@@ -44,7 +44,10 @@ from railroad_corridor import (
     generate_multi_station_scenario,
 )
 from cosine_trajectory_shaper import CosineTrajectoryShaper
-from real_world_rail_weather import fetch_real_world_multi_station_scenario
+from real_world_rail_weather import (
+    EXTREME_WEATHER_REGIME_SPECS,
+    fetch_real_world_multi_station_scenario,
+)
 from bilbao_cbtc_ato import BilbaoCBTCATOController
 from goodall_trajectory_shield import (
     TrajectoryShieldConfig,
@@ -64,13 +67,23 @@ class MPCTransitionRailroadEnv:
         traj_shield: GoodallTrajectoryShield | None = None,
         emulator: LearnedLinearizationModel | None = None,
         use_cosine_shaper: bool = True,
+        eco_governor: bool | None = None,
     ):
         self.corridor = corridor if corridor is not None else RailroadCorridor()
         self.traj_shield = traj_shield
         self.emulator = emulator
         self.use_cosine_shaper = bool(use_cosine_shaper)
+        # Eco governor is part of the UCB-DMPS architecture (methods 7 and 9):
+        # Approach schedule reserve (s) kept by the eco governor; selected on tuning seeds 5000+29k (sweep 0.5..6 s).
+        self.eco_slack_reserve_s = 4.0
+        self.eco_governor = bool(
+            eco_governor if eco_governor is not None
+            else (traj_shield is not None and getattr(traj_shield.cfg, "mode", "") == "mps_rollout")
+        )
         self.obs_dim = 18
         self.act_dim = 3
+        # Optional rule layer of a literature pilot (e.g. EITOP expert rules), applied right after decoding:
+        self.pilot_filter = None
         self.wind_profile = np.zeros(1600, dtype=np.float64)
         self.mass_hat_kg = 85000.0
         self.mass_locked = False
@@ -102,12 +115,19 @@ class MPCTransitionRailroadEnv:
         else:
             self.shaper.corridor = self.corridor
             self.shaper.sync_limits(self.physics.max_traction_accel, self.physics.max_braking_decel)
-        self.mpc = PureLiuMPC(
-            n_p=5, n_c=3, q1=160.0, q2=0.05, q3=0.35, adaptive_shift=True,
-            dt=self.corridor.dt, mass_kg=ctrl_mass,
-            max_traction_accel=self.physics.max_traction_accel,
-            max_braking_decel=self.physics.max_braking_decel,
-        )
+        if hasattr(self, "mpc") and not reset_shaper:
+            self.mpc.update_mass_and_limits(
+                ctrl_mass,
+                self.physics.max_traction_accel,
+                self.physics.max_braking_decel,
+            )
+        else:
+            self.mpc = PureLiuMPC(
+                n_p=5, n_c=3, q1=160.0, q2=0.05, q3=0.35, adaptive_shift=True,
+                dt=self.corridor.dt, mass_kg=ctrl_mass,
+                max_traction_accel=self.physics.max_traction_accel,
+                max_braking_decel=self.physics.max_braking_decel,
+            )
 
     def reset(
         self,
@@ -125,22 +145,25 @@ class MPCTransitionRailroadEnv:
             self.wind_profile = np.zeros(1600, dtype=np.float64)
 
         # At station standstill (wheel brakes locked), read station wayside telemetry:
-        # turnstile ticket prior mass, rail adhesion sensor, temperature, and anemometer:
+        # turnstile ticket prior mass, rail adhesion sensor, temperature, and anemometer.
+        # Dynamic weight is identified in closed form from the first 8 steps (k_elapsed < 8, station
+        # weather telemetry window), solved once at step 8, then locked for the rest of the leg.
         self.mass_hat_kg = float(getattr(self.corridor, "ticket_estimated_mass_kg", 85000.0))
         self.mass_prior_kg = self.mass_hat_kg
         self.mass_locked = False
         self.mass_samples = []
-        self.mass_hist_f: list[float] = []
-        self.mass_hist_y: list[float] = []
-        self.mass_hist_fd: list[float] = []
-        self.mass_hist_v: list[float] = []
-        # Bayesian MAP prior on theta = 1000.0 / M_eff (sigma_M_prior = 2200 kg)
-        gamma_init = 0.08
-        th_0 = 1000.0 / ((1.0 + gamma_init) * self.mass_prior_kg)
-        sig_th_0 = (1000.0 / ((1.0 + gamma_init) * (self.mass_prior_kg ** 2))) * 2200.0
-        self.mass_info_sum = 1.0 / (sig_th_0 ** 2)
-        self.mass_rhs_sum = self.mass_info_sum * th_0
-        self.mass_res_var_ema = 0.008 ** 2
+        self.v_eco_ub: float | None = None
+        self._eco_ub_cache_k: int = -1
+        self.eco_macro_steps = 0
+        self.eco_capped_steps = 0
+        self._eco_ub_cached_res: tuple[float, bool] = (15.0, False)
+        self._eco_anchor_v: float | None = None   # latched "no further acceleration" speed (None = released)
+        # Departure mass ID accumulators (cumulative regressors of the telescoped force balance):
+        self._mid_cum_f = 0.0     # sum F_k dt   [kN s]   (traction - Davis drag, from mu_adh & T_amb)
+        self._mid_cum_c = 0.0     # sum gate_k dt [s]     (wind acts only when moving or tractive)
+        self._mid_cum_g = 0.0     # sum g_k dt    [m/s]   (grade + thermal curve resistance per M_eff)
+        self._mid_info = [0.0, 0.0, 0.0]   # (I_tt, I_td, I_dd) Gauss-Newton information
+        self._mid_rhs = [0.0, 0.0]
         self.d_standstill = float(getattr(self.corridor, "station_wind_sensor_mps2", 0.0))
         self.station_mu = float(getattr(self.corridor, "adhesion_mu_factor", 1.0))
         self.station_temp_c = float(getattr(self.corridor, "temp_celsius", 18.0))
@@ -175,133 +198,53 @@ class MPCTransitionRailroadEnv:
         self.mpc.reset()
         return self._get_obs()
 
-    def _estimate_causal_mass_kg(self) -> float:
+    def _accumulate_departure_mass_step(
+        self, f_net_n: float, g_spec: float, wind_gate: bool, v_next_meas: float
+    ) -> None:
         """
-        Causal data-driven multi-width 3-block second-difference IRLS MAP estimator for theta = 1000 / M_eff.
-        Preserves exact per-micro-step actuator lag inside block force sums f_k while telescoping
-        tachometer noise and cancelling constant + linear wind drift across consecutive blocks.
+        Station-window (k = 0..7) force balance, closed in the two unknowns theta = 1000 / M_eff and the
+        station wind d. The weather fixes every other term: traction force from adhesion mu (mass
+        independent, M_eff * a_max(M) = 1.08 * 85 t * a_base * mu), Davis drag scaled by air density
+        rho(T_amb), CWR-thermal curve resistance, and the anemometer prior on d. Telescoping
+            v_{k+1} - 0.14 v_k + sum_j g_j dt = theta * sum_j F_j dt + d * sum_j gate_j dt
+        keeps the tachometer noise un-differenced. Standstill steps (measured v_{k+1} == 0, where the
+        wheel-rail clamp v >= 0 makes the balance non-linear) carry no information and are skipped.
         """
-        n = len(self.mass_hist_f)
+        if v_next_meas <= 0.0:
+            return
+        dt = self.corridor.dt
+        self._mid_cum_f += (f_net_n / 1000.0) * dt
+        self._mid_cum_c += dt if wind_gate else 0.0
+        self._mid_cum_g += g_spec * dt
+        y = (v_next_meas - 0.14 * self.v_meas) + self._mid_cum_g
+        w = 1.0 / max(1e-4, 1.01 * self.speed_sensor_noise_mps) ** 2
+        rf, rc = self._mid_cum_f, self._mid_cum_c
+        inf = self._mid_info
+        inf[0] += w * rf * rf
+        inf[1] += w * rf * rc
+        inf[2] += w * rc * rc
+        self._mid_rhs[0] += w * rf * y
+        self._mid_rhs[1] += w * rc * y
+
+    def _solve_departure_mass_kg(self) -> tuple[float, float]:
+        """Closed-form 2x2 MAP solve (ticket-mass prior on theta, anemometer prior on d)."""
         prior = self.mass_prior_kg
-        if n < 6:
-            return prior
-
-        gamma = self.physics.gamma
-        th0 = 1000.0 / ((1.0 + gamma) * prior)
-        sig_th0 = (1000.0 / ((1.0 + gamma) * (prior ** 2))) * 2200.0
-        info0 = 1.0 / (sig_th0 ** 2)
-        rhs0 = info0 * th0
-
-        v = np.asarray(self.mass_hist_v, dtype=np.float64)
-        f = np.asarray(self.mass_hist_f, dtype=np.float64)
-        y = np.asarray(self.mass_hist_y, dtype=np.float64)
-        fd = np.asarray(self.mass_hist_fd, dtype=np.float64) / 1000.0
-        dt = float(self.corridor.dt)
-        noise = float(self.speed_sensor_noise_mps)
-
-        valid = np.zeros(n, dtype=bool)
-        for i in range(1, n):
-            if v[i] > 0.02 or (i + 1 < n and v[i + 1] > 0.05):
-                valid[i] = True
-
-        # Infer local sensor/turbulence residual scale empirically from high-curvature single-step transitions:
-        r1 = []
-        for s in range(0, n - 2):
-            if valid[s] and valid[s + 1] and valid[s + 2] and v[s + 2] > 0.05:
-                d2f = f[s + 2] - 2.0 * f[s + 1] + f[s]
-                if abs(d2f) >= 0.30:
-                    d2y = y[s + 2] - 2.0 * y[s + 1] + y[s]
-                    r1.append(abs(d2y - th0 * d2f))
-        emp_r1 = float(np.median(r1)) * 1.4826 if len(r1) >= 4 else 0.008
-        sig_tach_1 = (4.55 * noise) / dt
-        is_clean = (sig_tach_1 <= 1e-5) and (emp_r1 < 0.003)
-
-        cy = np.concatenate(([0.0], np.cumsum(y)))
-        cf = np.concatenate(([0.0], np.cumsum(f)))
-        cd = np.concatenate(([0.0], np.cumsum(fd)))
-
-        samples: list[tuple[float, float, float, float]] = []
-        if is_clean:
-            mad_4: float | None = None
-            for W in (1, 2, 4, 8):
-                if 3 * W > n:
-                    continue
-                if W == 8 and (mad_4 is None or mad_4 >= 0.0015):
-                    continue
-                invW = 1.0 / float(W)
-                w_rows: list[tuple[float, float]] = []
-                w_res: list[float] = []
-                for s in range(0, n - 3 * W + 1):
-                    if not np.all(valid[s : s + 3 * W]):
-                        continue
-                    d2f = ((cf[s + 3 * W] - cf[s + 2 * W]) - 2.0 * (cf[s + 2 * W] - cf[s + W]) + (cf[s + W] - cf[s])) * invW
-                    d2y = ((cy[s + 3 * W] - cy[s + 2 * W]) - 2.0 * (cy[s + 2 * W] - cy[s + W]) + (cy[s + W] - cy[s])) * invW
-                    if abs(d2f) < 0.35 or abs(d2y) > 2.5:
-                        continue
-                    w_rows.append((d2f, d2y))
-                    w_res.append(abs(d2y - th0 * d2f))
-                if not w_rows:
-                    continue
-                mad_w = float(np.median(w_res)) * 1.4826 if len(w_res) >= 3 else 0.0
-                if W == 4:
-                    mad_4 = mad_w if len(w_res) >= 3 else 1.0
-                sig0 = max(2e-4, 6e-5 * float(W * W), mad_w)
-                var0 = float(W) * (sig0 ** 2)
-                c_rob = max(0.0005, 0.0002 * float(W * W), 1.5 * mad_w)
-                for d2f, d2y in w_rows:
-                    samples.append((d2f, d2y, var0, c_rob))
-            pow_r = 1.5
-        else:
-            w_levels = (4, 6)
-            for W in w_levels:
-                if 3 * W > n:
-                    continue
-                stride = max(2, W // 2)
-                invW = 1.0 / float(W)
-                sig_tach = (4.55 * noise) / (float(W) * dt)
-                sig_turb = max(0.038, emp_r1) * math.sqrt(float(W) / 4.0)
-                overlap = float(W) / float(stride)
-                w_rows_n: list[tuple[float, float, float]] = []
-                w_res_n: list[float] = []
-                for s in range(0, n - 3 * W + 1, stride):
-                    if not np.all(valid[s : s + 3 * W]):
-                        continue
-                    d2f = ((cf[s + 3 * W] - cf[s + 2 * W]) - 2.0 * (cf[s + 2 * W] - cf[s + W]) + (cf[s + W] - cf[s])) * invW
-                    d2y = ((cy[s + 3 * W] - cy[s + 2 * W]) - 2.0 * (cy[s + 2 * W] - cy[s + W]) + (cy[s + W] - cy[s])) * invW
-                    d2fd = abs(((cd[s + 3 * W] - cd[s + 2 * W]) - 2.0 * (cd[s + 2 * W] - cd[s + W]) + (cd[s + W] - cd[s])) * invW)
-                    if abs(d2f) < 5.0 or abs(d2y) > 2.5:
-                        continue
-                    w_rows_n.append((d2f, d2y, d2fd))
-                    w_res_n.append(abs(d2y - th0 * d2f))
-                if not w_rows_n:
-                    continue
-                mad_w = float(np.median(w_res_n)) * 1.4826 if len(w_res_n) >= 4 else 0.0
-                corr_mult = overlap * float(len(w_levels))
-                for d2f, d2y, d2fd in w_rows_n:
-                    sig_drag = (0.18 * d2fd) / prior
-                    sig_model = math.sqrt((sig_tach ** 2) + (sig_turb ** 2) + (sig_drag ** 2))
-                    sig_tot = max(sig_model, mad_w)
-                    samples.append((d2f, d2y, corr_mult * (sig_tot ** 2), max(0.008, 1.5 * sig_tot)))
-            pow_r = 1.0
-
-        th = th0
-        ii = info0
-        rr = rhs0
-        for _ in range(5):
-            ii, rr = info0, rhs0
-            for d2f, d2y, var0, c_rob in samples:
-                res = abs(d2y - th * d2f)
-                rob = (1.0 + (res / c_rob) ** 2) ** pow_r
-                wt = 1.0 / (var0 * rob)
-                ii += wt * (d2f * d2f)
-                rr += wt * (d2f * d2y)
-            th = rr / max(1e-12, ii)
-        self.mass_info_sum = float(ii)
-        self.mass_rhs_sum = float(rr)
-        m_lo = max(70500.0, prior - 5000.0)
-        m_hi = min(98000.0, prior + 5000.0)
-        m_est = 1000.0 / ((1.0 + gamma) * max(1e-6, th))
-        return m_lo if m_est < m_lo else (m_hi if m_est > m_hi else float(m_est))
+        th0 = 1000.0 / ((1.0 + self.physics.gamma) * prior)
+        sig_th = th0 * (2500.0 / prior)
+        sig_anem = 0.018 if self.speed_sensor_noise_mps > 0.0 else 0.008
+        a11 = self._mid_info[0] + 1.0 / (sig_th * sig_th)
+        a12 = self._mid_info[1]
+        a22 = self._mid_info[2] + 1.0 / (sig_anem * sig_anem)
+        b1 = self._mid_rhs[0] + th0 / (sig_th * sig_th)
+        b2 = self._mid_rhs[1] + self.d_standstill / (sig_anem * sig_anem)
+        det = a11 * a22 - a12 * a12
+        if det <= 1e-12:
+            return prior, self.d_standstill
+        th = (a22 * b1 - a12 * b2) / det
+        d_post = (a11 * b2 - a12 * b1) / det
+        m_est = 1000.0 / ((1.0 + self.physics.gamma) * max(1e-6, th))
+        m_lo, m_hi = max(65000.0, prior - 9000.0), min(110000.0, prior + 9000.0)
+        return (m_lo if m_est < m_lo else (m_hi if m_est > m_hi else float(m_est))), float(d_post)
 
     def _ensure_feas_cache_epoch(self) -> None:
         if self._feas_cache_k != self.k_elapsed:
@@ -451,6 +394,79 @@ class MPCTransitionRailroadEnv:
         self._ot_slack_cache_map[cache_key] = slack
         return slack
 
+    def update_zone_eco_upper_bound(
+        self, a_start: float = 0.86, b_land: float = 0.74
+    ) -> tuple[float, bool]:
+        """
+        Eco upper bound on the commanded cruise speed, applied ONLY when the train is going too fast
+        (cached once per step). Returns (v_ub, is_binding):
+          1) v_track = minimal hold speed such that travelling at min(v_track, cap_i) over the remaining
+             zones plus the cosine stopping trajectory meets the deadline (`compute_feasible_deadline_pace`),
+             plus a headwind margin from the disturbance observer.
+          2) On-track test: holding min(v_meas, cap_i) + stop arrives early by `compute_on_track_slack_s`.
+             If v_meas >= v_track and slack > t_res + 0.5 s, any further acceleration is useless:
+             v_ub = max(v_track + 0.10, v_anchor), v_anchor = speed when the bound engaged (latched).
+          3) Acceleration that would have to be braked away (an upcoming lower speed zone within braking
+             reach, or the station braking spot) is evicted: v_ub <= max(v_target_after, v_anchor).
+        The anchor is latched (constant setpoint, no per-step re-anchoring on the measured speed, which
+        produced a staircase of shaper ramps) and released with hysteresis (slack < t_res - 0.5 s).
+        Otherwise v_ub = local speed cap (no bound).
+        """
+        if self._eco_ub_cache_k == self.k_elapsed:
+            return self._eco_ub_cached_res
+
+        cor = self.corridor
+        x = self.x_curr
+        v = max(0.0, float(self.v_meas))
+        v_cur_cap = cor.get_speed_limit(x)
+        res = (float(v_cur_cap), False)
+        if self.k_elapsed < 8 or self.shaper.in_landing or (cor.station_x_m - x) <= 200.0 or v < 1.8:
+            self._eco_anchor_v = None
+            self._eco_ub_cache_k = self.k_elapsed
+            self._eco_ub_cached_res = res
+            return res
+
+        v_feas, _ = self.compute_feasible_deadline_pace(a_start, b_land)
+        # Keep a schedule reserve t_res for the approach (pilot/landing variability): track the pace that
+        # arrives t_res early, i.e. scale the cruise pace by t_rem / (t_rem - t_res).
+        t_rem = max(cor.dt, cor.deadline_s - self.t_curr)
+        t_res = self.eco_slack_reserve_s
+        v_track = v_feas * (t_rem / max(0.5 * t_rem, t_rem - t_res)) + 0.25 * max(0.0, -float(self.d_hat))
+        slack = self.compute_on_track_slack_s(a_start, b_land)
+        latched = self._eco_anchor_v is not None
+        anchor = self._eco_anchor_v if latched else v
+        v_ub = v_cur_cap
+        on_track = (slack > t_res - 0.5) if latched else (v >= v_track and slack > t_res + 0.5)
+        if on_track:
+            v_ub = max(v_track + 0.10, anchor)
+
+        if slack > 0.0:
+            # Next lower speed zone within braking reach: do not accelerate above current speed.
+            k_land = 0.5 * math.pi if self.use_cosine_shaper else 1.66
+            b_drop = max(0.38, b_land * (0.65 if self.use_cosine_shaper else 0.60))
+            for z in cor.speed_zones:
+                if z.x_start > x and z.v_limit_mps < v_cur_cap:
+                    dx_brk = 0.5 * k_land * max(0.0, v * v - z.v_limit_mps * z.v_limit_mps) / b_drop
+                    if (z.x_start - x) < dx_brk + 8.0 * v:
+                        v_ub = min(v_ub, max(z.v_limit_mps + 0.08, anchor))
+                    break
+            # Station braking spot close ahead: no acceleration beyond what the schedule needs.
+            _, b_eff_land = self._get_remaining_time_geom(b_land)
+            dx_land = (0.5 * k_land / b_eff_land) * v * v
+            if (cor.station_x_m - dx_land - x) < 7.5 * v:
+                v_ub = min(v_ub, max(v_track + 0.06, anchor))
+
+        binding = bool(v_ub < v_cur_cap - 0.05)
+        if binding and not latched:
+            self._eco_anchor_v = v
+        elif not binding:
+            self._eco_anchor_v = None
+        res = (float(v_ub), binding)
+        self.v_eco_ub = res[0]
+        self._eco_ub_cache_k = self.k_elapsed
+        self._eco_ub_cached_res = res
+        return res
+
     def compute_feasible_deadline_pace(self, a_start: float, b_land: float) -> tuple[float, float]:
         self._ensure_feas_cache_epoch()
         cache_key = (round(a_start, 6), round(b_land, 6))
@@ -459,14 +475,17 @@ class MPCTransitionRailroadEnv:
             return cached
 
         t_rem = max(self.corridor.dt, self.corridor.deadline_s - self.t_curr)
-        x_rem, v_local_cap, x_curr, v_curr, station_x_m, zones, v_last_lim, inv_2b, inv_1b, dur_k, min_ramp_s, rate_up, rate_dn = self._remaining_time_args(a_start, b_land)
-        v_naive = x_rem / t_rem
-
-        if x_rem <= 15.0 or self.shaper.in_landing:
-            v_f = 0.0 if v_naive < 0.0 else (v_local_cap if v_naive > v_local_cap else float(v_naive))
-            res_f = (v_f, float(v_naive))
+        x_rem_fast = max(0.0, self.corridor.station_x_m - self.x_curr)
+        if x_rem_fast <= 15.0 or self.shaper.in_landing:
+            v_naive_f = x_rem_fast / t_rem
+            v_lim_f = self.corridor.get_speed_limit(self.x_curr)
+            v_f = 0.0 if v_naive_f < 0.0 else (v_lim_f if v_naive_f > v_lim_f else float(v_naive_f))
+            res_f = (v_f, float(v_naive_f))
             self._feas_cache_map[cache_key] = res_f
             return res_f
+
+        x_rem, v_local_cap, x_curr, v_curr, station_x_m, zones, v_last_lim, inv_2b, inv_1b, dur_k, min_ramp_s, rate_up, rate_dn = self._remaining_time_args(a_start, b_land)
+        v_naive = x_rem / t_rem
 
         n_bisect = 6 if self.use_cosine_shaper else 9
         lo, hi = 2.0, 17.8
@@ -551,13 +570,15 @@ class MPCTransitionRailroadEnv:
         b_land_cos = 0.78 + 0.12 * a2    # [0.66, 0.90] m/s^2
 
         v_feas, v_naive = self.compute_feasible_deadline_pace(a_start_cos, b_land_cos)
-        r99_margin = 2.576 * self.sigma_tube if self.traj_shield is not None else 0.0
         ceil_fn = (
             self.corridor.compute_smooth_spatial_ceiling
             if self.use_cosine_shaper
             else self.corridor.compute_free_spatial_ceiling
         )
-        v_cap = max(1.5, ceil_fn(self.x_curr, b_land_cos) - r99_margin)
+        # Tube-tightened action bound: the same 99% scissor radius z * sigma_tube that the shield certifies,
+        # so the decoded command never violates the order-1 speed margin by construction:
+        r99_nom = (self.traj_shield.cfg.z_sigma * self.sigma_tube) if self.traj_shield is not None else 0.0
+        v_cap = max(1.5, ceil_fn(self.x_curr, b_land_cos) - r99_nom)
 
         # Action[0] = 0.0 corresponds to naive pace; Action[0] in [-1, 1] gives full +-3.80 m/s authority
         v_raw = v_naive + 3.80 * a0
@@ -573,7 +594,19 @@ class MPCTransitionRailroadEnv:
     ) -> tuple[np.ndarray, float, bool, dict]:
         t_macro_0 = time.thread_time()
         v_cmd_rl, a_start_cos, b_land_cos, v_feas, v_naive = self.decode_rl_action(action)
+        if self.pilot_filter is not None:
+            v_cmd_rl, a_start_cos, b_land_cos = self.pilot_filter(self, v_cmd_rl, a_start_cos, b_land_cos, v_feas)
         v_cmd_unshielded = v_cmd_rl
+
+        # Eco governor (upstream of the shield; not a shield activation): upper bound only when going too fast.
+        eco_capped = False
+        if self.eco_governor and not self.shaper.in_landing:
+            self.eco_macro_steps += 1
+            v_ub_eco, eco_bind = self.update_zone_eco_upper_bound(a_start_cos, b_land_cos)
+            if eco_bind and v_cmd_rl > v_ub_eco + 0.02:
+                v_cmd_rl = v_ub_eco
+                eco_capped = True
+                self.eco_capped_steps += 1
 
         shield_intervened = False
         shield_diff = 0.0
@@ -588,15 +621,7 @@ class MPCTransitionRailroadEnv:
         t_macro_1 = time.thread_time()
         macro_shield_us = (t_macro_1 - t_macro_0) * 1e6
 
-        x_brake_est, _, _, _ = CosineTrajectoryShaper.dynamic_cosine_braking_spot(
-            self.corridor,
-            self.v_meas,
-            b_land_cos,
-            v_scissor_rad=0.0,
-            d_wind_hat=self.d_hat,
-            max_braking_decel=self.physics.max_braking_decel,
-        )
-        n_substeps = 1 if (self.shaper.in_landing or (x_brake_est - self.x_curr) < 180.0) else self.corridor.macro_steps
+        n_substeps = self.corridor.macro_steps
         d_hat_at_trigger = self.d_hat  # Record disturbance at macro-trigger instant k_t (Sun et al. 2024 Eq. 20)
 
         t0_leg = float(self.corridor.start_time_s)
@@ -625,6 +650,7 @@ class MPCTransitionRailroadEnv:
                 v_scissor_rad=0.0,
                 d_wind_hat=self.d_hat,
             )
+            v_ref0_step = float(v_ref_h[0])
 
             slope_iota = (
                 self.physics.grade_resistance(self.x_curr) + self.physics.curve_resistance(self.x_curr)
@@ -694,9 +720,7 @@ class MPCTransitionRailroadEnv:
                 v_next_meas = v_next
             inertia_mom_meas = 0.14 * (self.v_meas - self.v_meas_prev)
 
-            # Causal online mass identification via telescoping 3-block second-difference IRLS MAP (k_elapsed < 64)
-            # and strictly causal open-line DOB (k_elapsed >= 8). Block second-differencing retains per-step actuator
-            # lag inside f_k, telescopes intermediate tachometer noise, and cancels constant + linear wind drift.
+            # Dynamic weight identification (k = 0..7, station weather window) and open-line DOB:
             self.d_hat_prev = self.d_hat
             a_meas_no_mom = ((v_next_meas - self.v_meas) - inertia_mom_meas) / self.corridor.dt
             a_meas_obs = (v_next_meas - self.v_meas) / self.corridor.dt
@@ -706,29 +730,22 @@ class MPCTransitionRailroadEnv:
             f_grade_est = self.physics.grade_resistance(self.x_curr)
             f_curve_est = self.physics.curve_resistance(self.x_curr) * cwr_thermal_factor
 
-            if not self.mass_locked and self.k_elapsed < 64:
-                spec_gc_eff = (f_grade_est + f_curve_est) / self.physics.M_eff
-                y_k = a_meas_no_mom + spec_gc_eff
-                f_k = (f_prop_est - f_drag_est) / 1000.0
-                self.mass_hist_f.append(f_k)
-                self.mass_hist_y.append(y_k)
-                self.mass_hist_fd.append(f_drag_est)
-                self.mass_hist_v.append(self.v_meas)
-                if self.k_elapsed >= 8 and (self.k_elapsed % 2 == 1 or self.k_elapsed == 63):
-                    m_new = self._estimate_causal_mass_kg()
-                    if abs(m_new - self.mass_hat_kg) >= 80.0 or self.k_elapsed == 63:
-                        self.mass_hat_kg = m_new
-                        prev_u_saved, prev_v_saved, u_act_saved = self.mpc.prev_u, self.mpc.prev_v, self.u_act
-                        self._sync_physics_and_mpc(use_estimated_mass=True, reset_shaper=False)
-                        self.mpc.prev_u, self.mpc.prev_v, self.u_act = prev_u_saved, prev_v_saved, u_act_saved
-                        f_grade_est = self.physics.grade_resistance(self.x_curr)
-                        f_curve_est = self.physics.curve_resistance(self.x_curr) * cwr_thermal_factor
-                if self.k_elapsed == 63:
-                    self.mass_locked = True
-
             if self.k_elapsed < 8:
-                # Wayside platform departure telemetry: noisy station anemometer only
+                # Station weather telemetry is available ONLY in this departure window (k = 0..7):
                 self.d_hat = self.d_standstill
+                if not self.mass_locked:
+                    self._accumulate_departure_mass_step(
+                        f_prop_est - f_drag_est,
+                        (f_grade_est + f_curve_est) / self.physics.M_eff,
+                        (self.v_meas > 1e-3) or (u_clamped > 1e-3),
+                        v_next_meas,
+                    )
+                    if self.k_elapsed == 7:
+                        # Dynamic weight computed once at step 8, then locked for the rest of the leg:
+                        self.mass_hat_kg, d_post = self._solve_departure_mass_kg()
+                        self._sync_physics_and_mpc(use_estimated_mass=True, reset_shaper=False)
+                        self.mass_locked = True
+                        self.d_hat = d_post
             else:
                 # Open-line disturbance observer (k_elapsed >= 8) with Lyapunov-Adaptive & Fuzzy Rate
                 # (Hanna et al. 2023 Eqs. 35-45 + Wang, Wang, & Chen 2026 Eqs. 20-21, Table 2):
@@ -1156,18 +1173,26 @@ class CosineTrajectoryRLPolicy(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_dim, 1),
         )
-        m = self.actor_mean
-        self._actor_views = (
-            m[0].weight.detach().numpy().T,
-            m[0].bias.detach().numpy(),
-            m[2].weight.detach().numpy().T,
-            m[2].bias.detach().numpy(),
-            m[4].weight.detach().numpy().T,
-            m[4].bias.detach().numpy(),
-        )
         self._h1_buf = np.zeros(hidden_dim, dtype=np.float32)
         self._h2_buf = np.zeros(hidden_dim, dtype=np.float32)
         self._out_buf = np.zeros(act_dim, dtype=np.float32)
+        self._refresh_actor_views()
+
+    def _refresh_actor_views(self) -> None:
+        m = self.actor_mean
+        self._actor_views = (
+            np.ascontiguousarray(m[0].weight.detach().numpy().T),
+            np.ascontiguousarray(m[0].bias.detach().numpy()),
+            np.ascontiguousarray(m[2].weight.detach().numpy().T),
+            np.ascontiguousarray(m[2].bias.detach().numpy()),
+            np.ascontiguousarray(m[4].weight.detach().numpy().T),
+            np.ascontiguousarray(m[4].bias.detach().numpy()),
+        )
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        res = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        self._refresh_actor_views()
+        return res
 
     def get_action_and_value(self, obs: np.ndarray, deterministic: bool = True):
         if deterministic:
@@ -1216,6 +1241,7 @@ def train_pure_ppo_cosine_pilot(
     seed: int = 42,
     checkpoint_prefix: str = "ppo_cosine_pilot",
     use_cosine_shaper: bool = True,
+    pilot_filter=None,
 ) -> tuple[CosineTrajectoryRLPolicy, list[dict]]:
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -1223,13 +1249,19 @@ def train_pure_ppo_cosine_pilot(
     env = MPCTransitionRailroadEnv(
         corridor=base_corridor, traj_shield=None, emulator=emulator, use_cosine_shaper=use_cosine_shaper
     )
+    env.pilot_filter = pilot_filter
     policy = CosineTrajectoryRLPolicy(obs_dim=env.obs_dim, act_dim=env.act_dim, hidden_dim=64)
     optimizer = optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=lr * 0.12)
 
+    # Validation set for checkpoint selection: 6 journeys (1..5 stations), half with extreme weather.
+    # Seeds 70000+ are disjoint from tuning (5000+29k) and evaluation (9000+29k) seeds.
     val_scens = [
-        generate_multi_station_scenario(seed=seed + 777, n_legs=3, wind_mode=wind_mode, allow_infeasible_breaks=True),
-        generate_multi_station_scenario(seed=seed + 888, n_legs=2, wind_mode=wind_mode, allow_infeasible_breaks=False),
+        generate_multi_station_scenario(
+            seed=70000 + seed * 13 + v_i * 31, n_legs=0, wind_mode=wind_mode,
+            allow_infeasible_breaks=False, extreme_noise=(v_i % 2 == 1),
+        )
+        for v_i in range(6)
     ]
     history = []
     best_score = float("inf")
@@ -1250,8 +1282,10 @@ def train_pure_ppo_cosine_pilot(
             policy.log_std.fill_(target_log_std)
 
         for batch_sc in range(3):
+            # One of the three training journeys per epoch uses extreme weather (Table tab:extreme):
             scen = generate_multi_station_scenario(
-                seed=seed * 1000 + epoch * 53 + batch_sc * 17, n_legs=0, wind_mode=wind_mode, allow_infeasible_breaks=False
+                seed=seed * 1000 + epoch * 53 + batch_sc * 17, n_legs=0, wind_mode=wind_mode,
+                allow_infeasible_breaks=False, extreme_noise=(batch_sc == 2),
             )
             for leg in scen["legs"]:
                 obs = env.reset(corridor_override=leg["corridor"], wind_profile=leg["wind_profile"])
@@ -1319,6 +1353,9 @@ def train_pure_ppo_cosine_pilot(
         scheduler.step()
 
         if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
+            # The deterministic path runs on cached numpy copies of the actor weights; refresh them after the
+            # optimizer steps, otherwise validation evaluates the stale initial weights (bug fixed here).
+            policy._refresh_actor_views()
             with torch.no_grad():
                 leg_errs, leg_stops, det_ret = [], [], 0.0
                 val_smooth_vals, val_kwh, val_tkm = [], 0.0, 0.0
@@ -1383,10 +1420,14 @@ def evaluate_multi_station_journey(
     emulator: LearnedLinearizationModel | None = None,
     record_traj: bool = False,
     zero_wind_override: bool = False,
+    eco_governor: bool | None = None,
+    lit_pilot=None,
 ) -> dict:
     leg_sched_errs, leg_stop_errs, leg_land_decels, leg_peak_accels, leg_jerks = [], [], [], [], []
     tot_energy_kwh = 0.0
     tot_sh_steps, tot_sh_ints = 0, 0
+    tot_eco_steps, tot_eco_caps = 0, 0
+    mass_abs_err_kg, mass_prior_abs_err_kg = [], []
     prop_totals = {
         "speed_limit": 0, "smoothness": 0, "jerk_order3": 0,
         "energy": 0, "deadline": 0, "mpc_failure": 0,
@@ -1428,13 +1469,16 @@ def evaluate_multi_station_journey(
 
         is_free_mode = (mode == "RL_FREE_LEARNED")
         env = MPCTransitionRailroadEnv(
-            corridor=cor_leg, traj_shield=sh_obj, emulator=emulator, use_cosine_shaper=(not is_free_mode)
+            corridor=cor_leg, traj_shield=sh_obj, emulator=emulator, use_cosine_shaper=(not is_free_mode),
+            eco_governor=eco_governor,
         )
         obs = env.reset(corridor_override=cor_leg, wind_profile=wind_prof)
         # True Static Plan: computed at t=0 assuming nominal 85t mass, dry rails, and zero wind:
         v_naive_0 = cor_leg.station_x_m / max(1.0, cor_leg.deadline_s - cor_leg.start_time_s)
         v_static_target = v_naive_0 + 1.05  # Fixed nominal schedule offset (does not adapt to leg zones/wind/mass)
         bilbao_ctrl = BilbaoCBTCATOController(cor_leg, env.physics) if mode == "BILBAO_CBTC_ATO" else None
+        if mode == "LIT_PILOT":
+            lit_pilot.reset_leg(env)
 
         done = False
         leg_micro = []
@@ -1453,6 +1497,9 @@ def evaluate_multi_station_journey(
             if mode in ("RL_LEARNED", "RL_FREE_LEARNED"):
                 assert rl_policy is not None
                 act, _, _ = rl_policy.get_action_and_value(obs, deterministic=True)
+                mpc_gain = 0.95
+            elif mode == "LIT_PILOT":
+                act = lit_pilot.act(env, obs)
                 mpc_gain = 0.95
             elif mode == "MAX_SPEED_GREEDY":
                 v_feas_g, v_naive_g = env.compute_feasible_deadline_pace(1.18, 0.90)
@@ -1524,6 +1571,11 @@ def evaluate_multi_station_journey(
         leg_stop_errs.append(abs(info["stop_error_m"]))
         tot_energy_kwh += info["energy_kwh"]
 
+        tot_eco_steps += env.eco_macro_steps
+        if mode != "BILBAO_CBTC_ATO":
+            mass_abs_err_kg.append(abs(env.mass_hat_kg - float(leg["mass_kg"])))
+            mass_prior_abs_err_kg.append(abs(env.mass_prior_kg - float(leg["mass_kg"])))
+        tot_eco_caps += env.eco_capped_steps
         if sh_obj is not None:
             tot_sh_steps += sh_obj.total_steps
             tot_sh_ints += sh_obj.total_interventions
@@ -1620,6 +1672,9 @@ def evaluate_multi_station_journey(
         "spec_energy_wh_tkm": spec_energy_wh_tkm,
         "multi_obj_score": multi_obj_score,
         "shield_rate_pct": 100.0 * tot_sh_ints / max(1, tot_sh_steps) if shield_mode is not None else 0.0,
+        "eco_rate_pct": 100.0 * tot_eco_caps / max(1, tot_eco_steps),
+        "mass_abs_err_kg": mass_abs_err_kg,
+        "mass_prior_abs_err_kg": mass_prior_abs_err_kg,
         "property_counts": prop_totals,
         "contract_selections": contract_selections_tot,
         "peak_pressures": peak_pressures,
@@ -1979,6 +2034,17 @@ def main():
         help="Extreme noise injection mode (default: mixed when --real-data, none otherwise): mixed (50%% baseline + 50%% extreme), always, raw/none",
     )
     ap.add_argument(
+        "--no-pin-cpu",
+        action="store_true",
+        help="Do not pin the benchmark process to a single CPU core (pinning removes migration jitter from latency maxima)",
+    )
+    ap.add_argument("--pin-core", type=int, default=-1, help="CPU core to pin to (default: highest available core)")
+    ap.add_argument(
+        "--no-literature",
+        action="store_true",
+        help="Skip literature baselines 11-17 (docs/RelatedWork_Survey.tex)",
+    )
+    ap.add_argument(
         "--data-dir",
         type=str,
         default="data",
@@ -1994,6 +2060,12 @@ def main():
         harsh_mode_eff = "none"
 
     import os, gc
+    if not args.no_pin_cpu and hasattr(os, "sched_setaffinity"):
+        try:
+            # Single-core pinning for the real-time latency benchmark (avoids cross-core migrations/cold caches):
+            os.sched_setaffinity(0, {args.pin_core if args.pin_core >= 0 else max(os.sched_getaffinity(0))})
+        except OSError:
+            pass
     script_dir = Path(__file__).resolve().parent
     ckpt_dir = script_dir / "checkpoints"
     figures_dir = script_dir / "figures"
@@ -2030,6 +2102,11 @@ def main():
         f"MULTI-PROPERTY PPO ({args.epochs} EPOCHS) + HIERARCHICAL CONTRACT SHIELD | "
         f"{mode_tag} | {args.eval_runs} SCENARIOS"
     )
+    if harsh_mode_eff in ("mixed", "always"):
+        print("-" * 152)
+        print("PHYSICAL EXTREME WEATHER REGIMES (BEAUFORT <=10, GUSTS <= 30 m/s [108 km/h]; d_wind FROM PLANT DAVIS DRAG A=14.5 N s^2/m^2, M_eff=91.8 t):")
+        for reg_k, reg_spec in EXTREME_WEATHER_REGIME_SPECS.items():
+            print(f"  * {reg_k:<15s}: {reg_spec}")
     print("=" * 152, flush=True)
 
     emu_ckpt_path = _resolve_ckpt("best_emulator.pt")
@@ -2090,6 +2167,12 @@ def main():
         ("9. Stable-Accel PPO + Jerk-Horizon UCB-DMPS", "RL_FREE_LEARNED", "mps_rollout"),
         ("10. Bilbao (2025) CBTC-ATO (RMBTP + PI)", "BILBAO_CBTC_ATO", None),
     ]
+    lit_factories = {}
+    if not args.no_literature:
+        from literature_baselines import load_literature_pilots
+        print("\n=== 2c. Loading Literature Baselines 11-17 (RelatedWork_Survey.tex) ===", flush=True)
+        lit_factories = load_literature_pilots(emulator, train_if_missing=True)
+        method_specs.extend((nm, "LIT_PILOT", None) for nm in lit_factories)
 
     agg_results = {name: [] for name, _, _ in method_specs}
     scenarios_list = []
@@ -2169,6 +2252,7 @@ def main():
                 shield_mode=sh_mode,
                 emulator=emulator,
                 record_traj=need_traj,
+                lit_pilot=(lit_factories[name]() if mode_str == "LIT_PILOT" else None),
             )
             agg_results[name].append(res)
             if capture_base or capture_fallback_ep0:
@@ -2296,7 +2380,7 @@ def main():
         print("-" * 168)
         print(
             f"{'Trajectory Pilot + Contract Shield Method':<42} | {'|TimeErr| (s)':>13} | {'|StopErr|':>9} | "
-            f"{'SmoothLoss':>10} | {'SpecEnergy':>13} | {'LossScore':>9} | {'Shield%':>7} | "
+            f"{'SmoothLoss':>10} | {'SpecEnergy':>13} | {'LossScore':>9} | {'Shield%':>7} | {'Eco%':>6} | "
             f"{'Core Step':>9} | {'Total (Mean/P99/Max)':>22}"
         )
         print("-" * 168)
@@ -2308,14 +2392,23 @@ def main():
             e_m = float(np.mean([r["spec_energy_wh_tkm"] for r in runs]))
             s_m = float(np.mean([r["multi_obj_score"] for r in runs]))
             sh_m = float(np.mean([r["shield_rate_pct"] for r in runs]))
+            eco_m = float(np.mean([r.get("eco_rate_pct", 0.0) for r in runs]))
             mpc_us = float(np.mean([r["mean_step_us"] for r in runs]))
             tot_us = float(np.mean([r["mean_total_us"] for r in runs]))
             p99_us = float(np.mean([r["p99_total_us"] for r in runs]))
             max_us = float(np.max([r["max_total_us"] for r in runs]))
             print(
-                f"{name:<42} | {t_m:11.2f} s | {x_m:7.3f} m | "
-                f"{c_m:10.4f} | {e_m:8.2f} Wh/tk | {s_m:9.4f} | {sh_m:6.1f}% | "
+                f"{name[:42]:<42} | {t_m:11.2f} s | {x_m:7.3f} m | "
+                f"{c_m:10.4f} | {e_m:8.2f} Wh/tk | {s_m:9.4f} | {sh_m:6.1f}% | {eco_m:5.1f}% | "
                 f"{mpc_us:6.1f} us | {tot_us:5.1f}/{p99_us:5.1f}/{max_us:6.1f} us"
+            )
+        mass_runs = [r for r in agg_results["7. Contract-Shielded PPO (UCB-DMPS Cosine)"] if filter_fn(r)]
+        m_err = [e for r in mass_runs for e in r.get("mass_abs_err_kg", [])]
+        m_pri = [e for r in mass_runs for e in r.get("mass_prior_abs_err_kg", [])]
+        if m_err:
+            print(
+                f"  Departure mass ID (closed-form, k=0..7, {len(m_err)} legs): MAE={np.mean(m_err):.1f} kg "
+                f"(max {np.max(m_err):.1f}) vs ticket prior MAE={np.mean(m_pri):.1f} kg (max {np.max(m_pri):.1f})"
             )
         print("=" * 168, flush=True)
 
@@ -2408,8 +2501,9 @@ def main():
 
     short_labels = [
         "Greedy", "Naive", "Static", "PPO Unsh", "PPO+Sw",
-        "PPO+DCBF", "PPO+DMPS", "Stab Unsh", "Stab+DMPS", "Bilbao'25"
-    ]
+        "PPO+DCBF", "PPO+DMPS", "Stab Unsh", "Stab+DMPS", "Bilbao'25",
+        "Xiao'23", "Zhong'22", "CDQ'25", "S-SARSA'23", "EITOP'25", "SRL'23", "SSA-DRL'25",
+    ][: len(method_specs)]
     x_pos = np.arange(len(method_specs))
     w_b = 0.26
 

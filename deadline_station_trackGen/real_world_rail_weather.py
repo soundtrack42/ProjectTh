@@ -28,7 +28,14 @@ import urllib.parse
 import urllib.request
 import numpy as np
 
-from railroad_corridor import RailroadCorridor, _build_leg_zones
+from railroad_corridor import (
+    RailroadCorridor,
+    _build_leg_zones,
+    MAX_WIND_SPEED_MPS,
+    wind_speed_to_longitudinal_accel,
+    wind_speed_series_to_accel_profile,
+    _extract_wind_events,
+)
 
 DIGITRAFFIC_HEADERS = {
     "Digitraffic-User": "ProjectTh-ATO-ContractShield-Research/1.0",
@@ -52,6 +59,37 @@ ROLLING_STOCK_TARE_TONNES = {
 }
 
 HARSH_REGIMES = ("Storm-Gale", "Heat-Thermal", "Arctic-Cold", "Heavy-Rain", "Blizzard-Snow")
+
+# Physically meaningful railway extreme weather specifications (EN 14067-6 / Beaufort 8-10 storm scale;
+# peak gusts strictly bounded <= 30 m/s [108 km/h], never unphysical >50-100 m/s hurricane/tornado forces):
+# Physically defined extreme regimes. Wind is bounded by Beaufort 10 ("storm", 24.5-28.4 m/s) with
+# gusts capped at 30 m/s (108 km/h); the train disturbance |d_wind| is not a free parameter but follows
+# from the plant's Davis drag coefficient through `wind_speed_to_longitudinal_accel` (A = 14.5 N s^2/m^2,
+# M_eff = 91.8 t, cruise v_ref = 15 m/s), air density rho(T) and the precipitation drag multiplier.
+#   name: (sustained m/s, gust m/s, T_amb C, drag multiplier, mu_adh range, extra description)
+_EXTREME_REGIME_DEFS = {
+    "Storm-Gale": ((20.0, 24.0), (26.0, 30.0), (5.0, 15.0), 1.10, (0.86, 0.92), "Beaufort 9-10 gale/storm"),
+    "Heavy-Rain": ((8.0, 14.0), (14.0, 21.0), (5.0, 16.0), 1.12, (0.76, 0.84), "torrential rain 18-35 mm/h, wet-rail lubrication"),
+    "Blizzard-Snow": ((9.0, 15.0), (15.0, 23.0), (-12.0, -1.0), 1.14, (0.72, 0.80), "heavy snow/slush 5-12 cm/h, +14% snow drag"),
+    "Arctic-Cold": ((7.0, 13.0), (12.0, 19.0), (-22.0, -12.0), 1.10, (0.82, 0.88), "sub-zero freeze, +9-17% dense-air drag, frost"),
+    "Heat-Thermal": ((6.0, 11.0), (10.0, 17.0), (35.0, 42.0), 1.05, (0.89, 0.94), "heatwave, CWR rail 52-60 C (+5-8% curve drag, +6-9% Cu I^2R loss)"),
+}
+
+
+def _regime_spec_text(sus, gust, temp, drag, mu, extra) -> str:
+    rho_hi = 293.15 / max(250.0, 273.15 + temp[0])
+    d_head = wind_speed_to_longitudinal_accel(gust[1], 0.0, 15.0, rho_hi, drag)
+    d_tail = wind_speed_to_longitudinal_accel(-gust[1], 0.0, 15.0, rho_hi, drag)
+    d_stat = wind_speed_to_longitudinal_accel(sus[1], 0.0, 0.0, rho_hi, drag)
+    return (
+        f"{extra}; sustained {sus[0]:.0f}-{sus[1]:.0f} m/s, gusts {gust[0]:.0f}-{gust[1]:.0f} m/s "
+        f"({gust[1] * 3.6:.0f} km/h), T_amb {temp[0]:.0f}..{temp[1]:.0f} C, mu_adh {mu[0]:.2f}-{mu[1]:.2f} -> "
+        f"d_wind in [{d_head:+.2f}, {d_tail:+.2f}] m/s^2 at 15 m/s cruise (station |d| <= {abs(d_stat):.2f}); "
+        f"plus tachometer noise 0.0025 m/s, anemometer noise 0.018 m/s^2, unmodeled drag +3-8%"
+    )
+
+
+EXTREME_WEATHER_REGIME_SPECS = {k: _regime_spec_text(*v) for k, v in _EXTREME_REGIME_DEFS.items()}
 
 # In-process session caches to avoid redundant API hits across multi-run benchmarks
 _STATIONS_CACHE: dict[str, dict] | None = None
@@ -498,53 +536,54 @@ def apply_harsh_weather_stress_noise(
     w = dict(weather_dict)
 
     if regime == "Storm-Gale":
-        w["wind_speed_ms"] = float(w["wind_speed_ms"] + rng.uniform(14.0, 23.0))
-        w["wind_gust_ms"] = float(max(w["wind_speed_ms"] + 8.0, w["wind_gust_ms"] + rng.uniform(20.0, 32.0)))
+        w["wind_speed_ms"] = float(np.clip(w["wind_speed_ms"] + rng.uniform(14.0, 18.0), 20.0, 24.0))
+        w["wind_gust_ms"] = float(np.clip(max(w["wind_speed_ms"] + 4.0, w["wind_gust_ms"] + rng.uniform(14.0, 20.0)), 26.0, 30.0))
         w["wind_dir_deg"] = float((w["wind_dir_deg"] + rng.uniform(-25.0, 25.0)) % 360.0)
-        w["source"] = f"{weather_dict['source']} + Extreme[Storm-Gale]"
-        mu_adhesion = float(np.clip(raw_mu * rng.uniform(0.84, 0.94), 0.80, 0.92))
-        return w, "Storm-Gale", mu_adhesion, 1.15, True
+        w["temp_c"] = float(np.clip(float(w["temp_c"]), 5.0, 15.0))
+        w["source"] = f"{weather_dict['source']} + Extreme[Storm-Gale <=30m/s]"
+        mu_adhesion = float(np.clip(raw_mu * rng.uniform(0.88, 0.94), 0.86, 0.92))
+        return w, "Storm-Gale", mu_adhesion, 1.10, True
 
     if regime == "Heat-Thermal":
-        # Extreme summer heatwave: ambient 37..45 C -> CWR rail temp ~55..63 C, oxide-softened dry adhesion
-        w["temp_c"] = float(np.clip(max(float(w["temp_c"]), 6.0) + rng.uniform(31.0, 40.0), 37.0, 45.0))
+        # Extreme summer heatwave: ambient 35..42 C -> CWR rail temp ~52..60 C, oxide-softened dry adhesion
+        w["temp_c"] = float(np.clip(max(float(w["temp_c"]), 6.0) + rng.uniform(29.0, 36.0), 35.0, 42.0))
         w["rain_mm"] = 0.0
         w["snow_cm"] = 0.0
-        w["wind_speed_ms"] = float(w["wind_speed_ms"] + rng.uniform(6.0, 12.0))
-        w["wind_gust_ms"] = float(max(w["wind_speed_ms"] + 6.0, w["wind_gust_ms"] + rng.uniform(11.0, 19.0)))
-        w["source"] = f"{weather_dict['source']} + Extreme[Heat-Thermal]"
-        mu_adhesion = float(rng.uniform(0.87, 0.92))
-        return w, "Heat-Thermal", mu_adhesion, 1.08, True
+        w["wind_speed_ms"] = float(np.clip(w["wind_speed_ms"] + rng.uniform(3.0, 6.0), 6.0, 11.0))
+        w["wind_gust_ms"] = float(np.clip(max(w["wind_speed_ms"] + 4.0, w["wind_gust_ms"] + rng.uniform(5.0, 9.0)), 10.0, 17.0))
+        w["source"] = f"{weather_dict['source']} + Extreme[Heat-Thermal 35..42C]"
+        mu_adhesion = float(rng.uniform(0.89, 0.94))
+        return w, "Heat-Thermal", mu_adhesion, 1.05, True
 
     if regime == "Arctic-Cold":
-        # Severe winter cold snap: -26..-12 C -> +11..+18% air density + frost/condensation adhesion loss
-        w["temp_c"] = float(np.clip(min(float(w["temp_c"]), 2.0) - rng.uniform(13.0, 25.0), -26.0, -12.0))
+        # Severe winter cold snap: -22..-12 C -> +9..+17% air density + frost/condensation adhesion loss
+        w["temp_c"] = float(np.clip(min(float(w["temp_c"]), 2.0) - rng.uniform(14.0, 22.0), -22.0, -12.0))
         w["rain_mm"] = 0.0
-        w["wind_speed_ms"] = float(w["wind_speed_ms"] + rng.uniform(8.0, 15.0))
-        w["wind_gust_ms"] = float(max(w["wind_speed_ms"] + 6.0, w["wind_gust_ms"] + rng.uniform(13.0, 22.0)))
-        w["source"] = f"{weather_dict['source']} + Extreme[Arctic-Cold]"
-        mu_adhesion = float(rng.uniform(0.80, 0.88))
-        return w, "Cold-Humid", mu_adhesion, 1.16, True
+        w["wind_speed_ms"] = float(np.clip(w["wind_speed_ms"] + rng.uniform(4.0, 8.0), 7.0, 13.0))
+        w["wind_gust_ms"] = float(np.clip(max(w["wind_speed_ms"] + 5.0, w["wind_gust_ms"] + rng.uniform(6.0, 11.0)), 12.0, 19.0))
+        w["source"] = f"{weather_dict['source']} + Extreme[Arctic-Cold -22..-12C]"
+        mu_adhesion = float(rng.uniform(0.82, 0.88))
+        return w, "Cold-Humid", mu_adhesion, 1.10, True
 
     if regime == "Heavy-Rain":
-        w["rain_mm"] = float(w["rain_mm"] + rng.uniform(18.0, 38.0))
+        w["rain_mm"] = float(np.clip(w["rain_mm"] + rng.uniform(18.0, 32.0), 18.0, 35.0))
         w["snow_cm"] = 0.0
-        w["temp_c"] = float(np.clip(max(float(w["temp_c"]), 3.5), 3.5, 18.0))
-        w["wind_speed_ms"] = float(w["wind_speed_ms"] + rng.uniform(9.0, 16.0))
-        w["wind_gust_ms"] = float(max(w["wind_speed_ms"] + 7.0, w["wind_gust_ms"] + rng.uniform(14.0, 24.0)))
-        w["source"] = f"{weather_dict['source']} + Extreme[Heavy-Rain]"
-        mu_adhesion = float(np.clip(0.80 - 0.003 * w["rain_mm"], 0.68, 0.78))
-        return w, "Rain-WetRail", mu_adhesion, 1.20, True
+        w["temp_c"] = float(np.clip(max(float(w["temp_c"]), 5.0), 5.0, 16.0))
+        w["wind_speed_ms"] = float(np.clip(w["wind_speed_ms"] + rng.uniform(5.0, 9.0), 8.0, 14.0))
+        w["wind_gust_ms"] = float(np.clip(max(w["wind_speed_ms"] + 5.0, w["wind_gust_ms"] + rng.uniform(7.0, 12.0)), 14.0, 21.0))
+        w["source"] = f"{weather_dict['source']} + Extreme[Heavy-Rain 18..35mm/h]"
+        mu_adhesion = float(np.clip(0.85 - 0.0025 * w["rain_mm"], 0.76, 0.84))
+        return w, "Rain-WetRail", mu_adhesion, 1.12, True
 
     # Blizzard-Snow
-    w["snow_cm"] = float(w["snow_cm"] + rng.uniform(7.0, 16.0))
+    w["snow_cm"] = float(np.clip(w["snow_cm"] + rng.uniform(5.0, 11.0), 5.0, 12.0))
     w["rain_mm"] = 0.0
-    w["temp_c"] = float(np.clip(min(float(w["temp_c"]), 0.0) - rng.uniform(2.5, 12.0), -15.0, -2.0))
-    w["wind_speed_ms"] = float(w["wind_speed_ms"] + rng.uniform(11.0, 19.0))
-    w["wind_gust_ms"] = float(max(w["wind_speed_ms"] + 8.0, w["wind_gust_ms"] + rng.uniform(16.0, 26.0)))
-    w["source"] = f"{weather_dict['source']} + Extreme[Blizzard-Snow]"
-    mu_adhesion = float(np.clip(0.74 - 0.008 * w["snow_cm"], 0.60, 0.72))
-    return w, "Snow-Slush", mu_adhesion, 1.26, True
+    w["temp_c"] = float(np.clip(min(float(w["temp_c"]), 0.0) - rng.uniform(2.0, 10.0), -12.0, -1.0))
+    w["wind_speed_ms"] = float(np.clip(w["wind_speed_ms"] + rng.uniform(6.0, 10.0), 9.0, 15.0))
+    w["wind_gust_ms"] = float(np.clip(max(w["wind_speed_ms"] + 6.0, w["wind_gust_ms"] + rng.uniform(8.0, 14.0)), 15.0, 23.0))
+    w["source"] = f"{weather_dict['source']} + Extreme[Blizzard-Snow 5..12cm/h]"
+    mu_adhesion = float(np.clip(0.81 - 0.007 * w["snow_cm"], 0.72, 0.80))
+    return w, "Snow-Slush", mu_adhesion, 1.14, True
 
 
 def build_directional_wind_acceleration_profile(
@@ -557,104 +596,68 @@ def build_directional_wind_acceleration_profile(
     is_harsh: bool = False,
 ) -> tuple[np.ndarray, str, list[tuple[float, float, float]]]:
     """
-    Converts sustained wind speed, peak gusts, wind direction (deg) relative to track bearing,
-    and air density rho_air(T_amb) into a 0.5 s micro-step longitudinal disturbance acceleration
-    array `wind_profile` (m/s^2) combining:
-      1) Directional aerodynamic base wind load,
-      2) Localized gust fronts, and
-      3) Band-limited Ornstein-Uhlenbeck stochastic turbulence noise.
+    Builds the 0.5 s longitudinal wind disturbance profile (m/s^2) from Open-Meteo wind *speeds*
+    (sustained <= 24 m/s, gusts <= 30 m/s [108 km/h]) and direction relative to the track bearing,
+    through the plant-consistent Davis-drag wind model `wind_speed_to_longitudinal_accel`:
+      1) Station departure window k = 0..7 (t < 4 s, v_ref = 0): constant sustained-wind load,
+         i.e. exactly what the wayside anemometer measures;
+      2) Open line (t >= 4 s, v_ref = 15 m/s): sustained head/tail component + gust fronts whose
+         wind speed reaches the reported gust value (alternating head/tail frontal shifts);
+      3) Band-limited Ornstein-Uhlenbeck turbulence with 12% (harsh) / 8% turbulence intensity.
+    Air density rho(T)/rho_0 and the precipitation drag multiplier scale the aerodynamic force.
     """
     rng = np.random.default_rng(seed)
     n_steps = int(np.ceil(total_duration_s / dt)) + 40
     t_grid = np.arange(n_steps, dtype=np.float64) * dt
 
-    v_wind = float(weather_dict["wind_speed_ms"])
-    v_gust = max(v_wind, float(weather_dict["wind_gust_ms"]))
+    v_wind = min(24.0, float(weather_dict["wind_speed_ms"]))
+    v_gust = min(MAX_WIND_SPEED_MPS, max(v_wind, float(weather_dict["wind_gust_ms"])))
     w_dir = float(weather_dict["wind_dir_deg"])
     temp_c = float(weather_dict["temp_c"])
     rho_ratio = 293.15 / max(250.0, 273.15 + temp_c)
 
-    # Meteorological wind_dir is where wind blows FROM:
-    # cos(w_dir - track_bearing) > 0 => opposing Headwind (d_wind < 0)
-    # cos(w_dir - track_bearing) < 0 => pushing Tailwind (d_wind > 0)
+    # Meteorological wind_dir is where wind blows FROM: cos(w_dir - track_bearing) > 0 => headwind.
     angle_rad = math.radians(w_dir - track_bearing_deg)
-    longitudinal_proj = -math.cos(angle_rad)
-    crosswind_proj = abs(math.sin(angle_rad))
+    head_proj = math.cos(angle_rad)
+    cross_proj = abs(math.sin(angle_rad))
+    w_head_sus = v_wind * head_proj
+    w_cross = v_wind * cross_proj
 
-    # Sustained directional headwind/tailwind baseline (scaled by air density & precipitation drag)
-    base_raw = (
-        (0.0085 * v_wind * longitudinal_proj - 0.006 * crosswind_proj * (v_wind / 10.0))
-        * rho_ratio
-        * regime_drag_mult
-    )
-    base_cap = 0.34 if is_harsh else 0.24
-    base_amp = float(base_cap * math.tanh(base_raw / base_cap))
-    if abs(base_amp) < 0.03:
-        base_amp = 0.0
-    ramp_in = np.clip(t_grid / 10.0, 0.0, 1.0)
-    w_profile = base_amp * ramp_in
+    open_line_gate = np.clip((t_grid - 4.0) / 6.0, 0.0, 1.0)
+    w_head = np.full(n_steps, w_head_sus, dtype=np.float64)
 
-    # Localized gust fronts from (v_gust - v_wind) + synoptic frontal shifts
-    dv_gust = max(1.0, v_gust - 0.5 * v_wind)
-    gust_cap = 0.68 if is_harsh else 0.42
-    gust_mag = min(gust_cap, (0.015 * dv_gust + 0.007 * v_wind) * rho_ratio * regime_drag_mult)
-    if is_harsh:
-        gust_mag = max(0.42, gust_mag)
-
-    sign_primary = -1.0 if longitudinal_proj <= 0.15 else 1.0
-    n_gusts = 4 if is_harsh else 2
+    # Gust fronts: the longitudinal wind component swings to +-v_gust (frontal shift alternates sign).
+    sign_primary = 1.0 if head_proj >= -0.15 else -1.0
+    n_gusts = 3 if is_harsh else 2
     for f_i in range(n_gusts):
-        frac_lo = 0.10 + (0.20 if is_harsh else 0.27) * f_i
-        frac_hi = min(0.88, frac_lo + (0.14 if is_harsh else 0.18))
+        frac_lo = 0.14 + (0.24 if is_harsh else 0.30) * f_i
+        frac_hi = min(0.86, frac_lo + (0.15 if is_harsh else 0.18))
         center_s = float(rng.uniform(frac_lo, frac_hi) * total_duration_s)
-        width_s = float(rng.uniform(14.0, 26.0) if is_harsh else rng.uniform(20.0, 34.0))
-        sign = sign_primary if (f_i % 2 == 0) else (-sign_primary if crosswind_proj > 0.35 or is_harsh else sign_primary)
-        peak_lo, peak_hi = (-0.82, 0.72) if is_harsh else (-0.46, 0.42)
-        peak = float(np.clip(sign * gust_mag * rng.uniform(0.85, 1.18), peak_lo, peak_hi))
-        w_profile += peak * np.exp(-0.5 * ((t_grid - center_s) / width_s) ** 2)
+        width_s = float(rng.uniform(16.0, 26.0) if is_harsh else rng.uniform(20.0, 32.0))
+        sign = sign_primary if (f_i % 2 == 0) else -sign_primary
+        target = sign * v_gust * float(rng.uniform(0.88, 1.0))
+        w_head += (target - w_head_sus) * np.exp(-0.5 * ((t_grid - center_s) / width_s) ** 2) * open_line_gate
 
-    # 2nd-order smooth aerodynamic turbulence (spatial averaging across 75-150m train body, C^1 continuous)
-    tau_ou = 4.2 if is_harsh else 5.5
-    phi_ou = math.exp(-dt / tau_ou)
-    alpha_lp = dt / ((2.8 if is_harsh else 4.0) + dt)
-    sigma_ou = (0.115 if is_harsh else 0.032) * min(1.50 if is_harsh else 1.35, 0.75 + 0.025 * v_gust)
+    ti = 0.12 if is_harsh else 0.08
+    phi_ou = math.exp(-dt / (4.8 if is_harsh else 5.8))
+    alpha_lp = dt / ((3.2 if is_harsh else 4.2) + dt)
     ou_stage1 = 0.0
     ou_smooth = np.zeros(n_steps, dtype=np.float64)
-    for k in range(1, n_steps):
-        ou_stage1 = phi_ou * ou_stage1 + sigma_ou * math.sqrt(1.0 - phi_ou * phi_ou) * float(rng.normal())
+    for k in range(8, n_steps):
+        ou_stage1 = phi_ou * ou_stage1 + ti * v_gust * math.sqrt(1.0 - phi_ou * phi_ou) * float(rng.normal())
         ou_smooth[k] = (1.0 - alpha_lp) * ou_smooth[k - 1] + alpha_lp * ou_stage1
-    w_profile += ou_smooth * ramp_in
+    w_head = np.clip(w_head + ou_smooth * open_line_gate, -MAX_WIND_SPEED_MPS, MAX_WIND_SPEED_MPS)
 
-    # Smooth saturation: allow extreme wind gusts up to [-0.88, +0.76] m/s^2 in extreme scenarios
-    pos_sat = 0.76 if is_harsh else 0.50
-    neg_sat = 0.88 if is_harsh else 0.56
-    w_profile = np.where(
-        w_profile >= 0.0,
-        pos_sat * np.tanh(w_profile / pos_sat),
-        neg_sat * np.tanh(w_profile / neg_sat),
+    w_profile = wind_speed_series_to_accel_profile(
+        w_head, w_head_sus, w_cross=w_cross, dt=dt, rho_ratio=rho_ratio, drag_mult=regime_drag_mult
     )
-    w_profile = np.where(np.abs(w_profile) > 0.015, w_profile, 0.0)
-
-    # Extract significant gust events for diagnostics
-    event_meta = []
-    active_mask = np.abs(w_profile) > 0.10
-    k = 0
-    while k < n_steps:
-        if active_mask[k]:
-            k_start = k
-            while k < n_steps and active_mask[k] and (np.sign(w_profile[k]) == np.sign(w_profile[k_start])):
-                k += 1
-            if (k - k_start) * dt >= 6.0:
-                seg = w_profile[k_start:k]
-                peak_val = float(seg[np.argmax(np.abs(seg))])
-                event_meta.append((k_start * dt, k * dt, peak_val))
-        else:
-            k += 1
+    event_meta, _ = _extract_wind_events(w_profile, dt, thresh=0.06)
 
     desc = (
         f"{weather_dict['source']}: Wind={v_wind:.1f}m/s (Gust={v_gust:.1f}m/s @ {w_dir:.0f}deg vs "
         f"Track={track_bearing_deg:.0f}deg), T={temp_c:.1f}C, "
-        f"Rain={weather_dict['rain_mm']:.1f}mm/h, Snow={weather_dict['snow_cm']:.1f}cm/h"
+        f"Rain={weather_dict['rain_mm']:.1f}mm/h, Snow={weather_dict['snow_cm']:.1f}cm/h, "
+        f"d in [{w_profile.min():+.2f},{w_profile.max():+.2f}]m/s^2"
     )
     return w_profile, desc, event_meta
 
@@ -868,26 +871,26 @@ def fetch_real_world_multi_station_scenario(
             is_harsh=is_harsh_leg,
         )
         mean_headwind = max(0.0, -float(np.mean(w_prof[: int(min_feas_s * 2.0)])))
-        headwind_adder = mean_headwind * 18.0
+        headwind_adder = mean_headwind * 22.0
+        short_leg_adder = max(0.0, (5000.0 - leg_len_m) / 140.0)
+        eff_min_feas_s = min_feas_s + short_leg_adder + mass_adder + adhesion_adder + headwind_adder
         if is_harsh_leg:
-            # Extreme scenarios face genuine schedule pressure without over-padded storm slack
-            eff_min_feas_s = min_feas_s + mass_adder + 0.35 * (adhesion_adder + headwind_adder)
-            slack_lo, slack_hi = 11.0, 24.0
+            # Extreme scenarios face genuine schedule pressure while remaining physically solvable
+            slack_lo, slack_hi = 15.0, 28.0
         else:
-            eff_min_feas_s = min_feas_s + mass_adder + adhesion_adder + headwind_adder
-            slack_lo, slack_hi = 16.0, 36.0
+            slack_lo, slack_hi = 18.0, 36.0
 
-        if eff_min_feas_s + 8.0 <= raw_scaled_sched <= eff_min_feas_s + 52.0:
+        if eff_min_feas_s + 15.0 <= raw_scaled_sched <= eff_min_feas_s + 50.0:
             leg_budget_s = float(np.round(raw_scaled_sched * 2.0) / 2.0)
         else:
             leg_budget_s = float(np.round((eff_min_feas_s + rng.uniform(slack_lo, slack_hi)) * 2.0) / 2.0)
 
         leg_deadline_s = t_clock + leg_budget_s
         dwell_s = 25.0 if leg_idx < len(hops) - 1 else 0.0
-        anem_noise_std = 0.040 if is_harsh_leg else 0.012
+        anem_noise_std = 0.018 if is_harsh_leg else 0.008
         station_wind_reading = float(w_prof[0] + rng.normal(0.0, anem_noise_std))
-        speed_noise_std = 0.004 if is_harsh_leg else 0.0
-        unmodeled_drag = float(rng.uniform(1.06, 1.18)) if is_harsh_leg else 1.0
+        speed_noise_std = 0.0025 if is_harsh_leg else 0.0
+        unmodeled_drag = float(rng.uniform(1.03, 1.08)) if is_harsh_leg else 1.0
         temp_c = float(weather_eff["temp_c"])
 
         line_tag = f"Line {commuter_line} " if commuter_line else f"{train_cat} "

@@ -142,6 +142,56 @@ class CosineTrajectoryShaper:
         x_brake = corridor.station_x_m - dx_brake
         return float(x_brake), float(dx_brake), float(t_land), b_target
 
+    def _shift_ramp_duration(
+        self, v_curr: float, dv: float, a_start_cos: float, b_land_cos: float, d_wind_hat: float, departing: bool
+    ) -> float:
+        """Half-cosine S-curve duration T = max(T_min, T_accel, T_jerk) for a speed shift dv."""
+        if dv >= 0.0:
+            ar_raw = a_start_cos / 0.96
+            a_ratio = 0.72 if ar_raw < 0.72 else (1.28 if ar_raw > 1.28 else ar_raw)
+            cruise_scale = 1.0 if departing else (0.62 * a_ratio)
+            rate = self.feasible_comfort_accel(v_curr, a_start_cos * cruise_scale, d_wind_hat)
+            j_comf = (0.38 if departing else 0.20) * (a_ratio ** 1.6)
+            min_sinusoid_dur = (16.0 if departing else 12.0) / a_ratio
+        else:
+            br_raw = b_land_cos / 0.78
+            b_ratio = 0.75 if br_raw < 0.75 else (1.25 if br_raw > 1.25 else br_raw)
+            rate = self.feasible_comfort_braking(b_land_cos * (0.72 * b_ratio), d_wind_hat)
+            j_comf = 0.20 * (b_ratio ** 1.6)
+            min_sinusoid_dur = 12.0 / b_ratio
+        # Order-3 Cosine Jerk bound: |j_max| = pi^2 * |dv| / (2 * T^2) <= j_comf
+        abs_dv = abs(dv)
+        t_from_acc = (math.pi * abs_dv) / (2.0 * (rate if rate > 0.30 else 0.30))
+        t_from_jrk = math.pi * math.sqrt(abs_dv / (2.0 * j_comf))
+        return float(max(min_sinusoid_dur, t_from_acc, t_from_jrk))
+
+    def predict_shift_peak_jerk(
+        self, v_curr: float, v_goal: float, a_start_cos: float, b_land_cos: float, d_wind_hat: float = 0.0
+    ) -> float:
+        """
+        Exact peak reference jerk pi^2 |dv| / (2 T^2) of the S-curve this shaper WOULD execute for the
+        candidate (v_goal, a_start, b_land), without mutating the ramp state (used by the shield's
+        order-3 certificate).
+        """
+        in_departure_climb = (self.ramp_v_start < 1.0 and 0.01 < self.ramp_u_phase < 0.92)
+        retrigger_tol = 0.15 if self.ramp_u_phase >= 0.98 else 0.45
+        if in_departure_climb or abs(v_goal - self.ramp_v_goal) <= retrigger_tol:
+            if self.ramp_u_phase >= 1.0:
+                return 0.0
+            dv_c = abs(self.ramp_v_goal - self.ramp_v_start)
+            return (math.pi * math.pi * dv_c) / (2.0 * self.ramp_t_dur * self.ramp_t_dur)
+        v_anchor = (
+            self.ramp_v_start + (self.ramp_v_goal - self.ramp_v_start) * 0.5 * (1.0 - math.cos(math.pi * self.ramp_u_phase))
+            if self.ramp_u_phase < 0.99
+            else float(v_curr)
+        )
+        dv = v_goal - v_anchor
+        if abs(dv) <= 0.04:
+            return 0.0
+        departing = (v_curr < 1.35 and self.ramp_v_start < 1.0)
+        t_dur = self._shift_ramp_duration(v_curr, dv, a_start_cos, b_land_cos, d_wind_hat, departing)
+        return (math.pi * math.pi * abs(dv)) / (2.0 * t_dur * t_dur)
+
     def _update_smooth_shift_ramp(
         self,
         x_curr: float,
@@ -174,28 +224,11 @@ class CosineTrajectoryShaper:
                 self.ramp_t_dur = self.corridor.dt
                 self.ramp_u_phase = 1.0
             else:
-                if dv >= 0.0:
-                    ar_raw = a_start_cos / 0.96
-                    a_ratio = 0.72 if ar_raw < 0.72 else (1.28 if ar_raw > 1.28 else ar_raw)
-                    cruise_scale = 1.0 if is_departing_from_rest else (0.62 * a_ratio)
-                    rate = self.feasible_comfort_accel(v_curr, a_start_cos * cruise_scale, d_wind_hat)
-                    j_comf = (0.38 if is_departing_from_rest else 0.20) * (a_ratio ** 1.6)
-                    min_sinusoid_dur = (16.0 if is_departing_from_rest else 12.0) / a_ratio
-                else:
-                    br_raw = b_land_cos / 0.78
-                    b_ratio = 0.75 if br_raw < 0.75 else (1.25 if br_raw > 1.25 else br_raw)
-                    rate = self.feasible_comfort_braking(b_land_cos * (0.72 * b_ratio), d_wind_hat)
-                    j_comf = 0.20 * (b_ratio ** 1.6)
-                    min_sinusoid_dur = 12.0 / b_ratio
-
-                # Order-3 Cosine Jerk bound: |j_max| = pi^2 * |dv| / (2 * T^2) <= j_comf
-                abs_dv = abs(dv)
-                t_from_acc = (math.pi * abs_dv) / (2.0 * (rate if rate > 0.30 else 0.30))
-                t_from_jrk = math.pi * math.sqrt(abs_dv / (2.0 * j_comf))
-
                 self.ramp_v_start = float(v_anchor)
                 self.ramp_v_goal = float(v_goal_now)
-                self.ramp_t_dur = float(max(min_sinusoid_dur, t_from_acc, t_from_jrk))
+                self.ramp_t_dur = self._shift_ramp_duration(
+                    v_curr, dv, a_start_cos, b_land_cos, d_wind_hat, is_departing_from_rest
+                )
                 self.ramp_u_phase = 0.0
         else:
             # Softly update goal for small drift while advancing phase u strictly by dt / T_ramp

@@ -302,12 +302,15 @@ class GoodallTrajectoryShield:
         ot_slack_pre: float | None = None,
     ) -> float | None:
         """
-        Single causal source of truth for C4_ECO_REGEN_COAST (curve/downhill coasting &
-        forward 'we're on track' trajectory-time overspeed gating). Returns capped speed
-        target when eco intervention is active, or None if nominal control passes.
+        C4_ECO_REGEN_COAST recovery target (only used once another property has triggered the
+        shield): pre-zone and downhill coasting when positive on-track schedule slack is available.
+        The "going too fast" eco upper bound itself is applied upstream of the shield by
+        `env.update_zone_eco_upper_bound` and is not a shield trigger.
+        Returns capped speed target if commanding excess speed above the eco upper bound,
+        or None if nominal control passes.
         """
         use_cos = getattr(env.shaper, "use_cosine", True)
-        shaper_ready = (env.k_elapsed > (16 if use_cos else 24)) and (not env.shaper.in_landing)
+        shaper_ready = (env.k_elapsed >= 8) and (not env.shaper.in_landing)
         if not (shaper_ready and env.d_hat >= -0.55):
             return None
 
@@ -332,30 +335,17 @@ class GoodallTrajectoryShield:
             ot_fn = getattr(env, "compute_on_track_slack_s", None)
             ot_slack = ot_fn(a_start, b_land) if ot_fn is not None else self._schedule_slack_s(env)
 
-        # 1) Pre-zone natural coasting into upcoming lower speed section (cut throttle early, no hard brake)
+        # 1) Pre-zone natural coasting into upcoming lower speed section
         if env.d_hat >= -0.04 and v_obs > 13.0 and v_lim_180 < v_obs - 0.8 and ot_slack > 0.8:
             v_pre_targ = max(v_lim_180 + 0.15, v_obs - 0.18)
             if v_cmd_cand > v_pre_targ + 0.05:
                 return min(v_cmd_cand, v_pre_targ)
 
-        # 2) Downhill gravity assist: disengage traction when gravity sustains schedule pace
+        # 2) Downhill gravity assist: disengage traction when gravity sustains pace
         if env.d_hat >= -0.04 and slope_120 < -0.004 and x_rem > 320.0 and env.u_act > 0.02 and v_obs >= v_pace_feasible + 0.05 and ot_slack > 1.0:
             v_dh_targ = max(v_pace_feasible + 0.05, v_obs - 0.14)
             if v_cmd_cand > v_dh_targ + 0.05:
                 return min(v_cmd_cand, v_dh_targ)
-
-        # 3a) Anti-overspeed eco cruise cap in calm/tailwind (gentle <= 0.12 m/s natural coast)
-        if env.d_hat >= -0.02 and x_rem > 350.0 and ot_slack > 1.8 and env.u_act > 0.04 and v_lim_180 >= v_obs - 0.7:
-            v_eco_targ = max(v_pace_feasible + 0.16, v_obs - 0.12)
-            if v_cmd_cand > v_eco_targ + 0.12:
-                return min(v_cmd_cand, v_eco_targ)
-
-        # 3b) Upper traction-peak limiter under moderate/strong winds: prevent high-I^2*R surges well above feasible pace
-        head_neg = max(0.0, -env.d_hat)
-        if x_rem > 320.0 and ot_slack > 0.2 and env.u_act > 0.10 and v_lim_180 >= v_obs - 0.7:
-            v_hi_cap = max(v_pace_feasible + 0.28 * head_neg + 0.20, v_obs - 0.08)
-            if v_cmd_cand > v_hi_cap + 0.08:
-                return min(v_cmd_cand, v_hi_cap)
         return None
 
     @staticmethod
@@ -407,8 +397,8 @@ class GoodallTrajectoryShield:
         )
 
         # 1. Order-1 Velocity Pressure: rho_1 = (v_cmd + r99_cmd) / v_ceil(x)
-        rho_1 = (v_cmd_cand + r99_cmd) / max(1.0, v_ceil + 0.01)
-        h_speed = (v_ceil + 0.01) - (v_cmd_cand + r99_cmd)
+        rho_1 = (v_cmd_cand + r99_cmd) / max(1.0, v_ceil + 0.001)
+        h_speed = (v_ceil + 0.001) - (v_cmd_cand + r99_cmd)
 
         # 2. Order-2 Acceleration/Braking Smoothness Certifier:
         x_rem = max(0.0, self.corridor.station_x_m - env.x_curr)
@@ -424,12 +414,18 @@ class GoodallTrajectoryShield:
         h_smooth = min(a_comf_hi - a_start_cand, b_comf_hi - b_land_cand, b_land_cand - 0.62) * 2.5
 
         # 3. Order-3 Jerk Pressure
-        min_dv_jerk = (1.50 if shaper_ready else 2.20) if is_ucb_dmps else 0.25
-        if dv_actual > min_dv_jerk:
-            a_rate_eff = (a_start_cand * 0.64) if (v_cmd_cand >= v_obs) else (b_land_cand * 0.74)
-            j_cos_peak = (2.0 * (a_rate_eff * a_rate_eff)) / max(1.7, dv_actual)
+        if use_cos_loc:
+            # Exact peak jerk pi^2|dv|/(2T^2) of the S-curve the cosine shaper would execute for this candidate:
+            j_cos_peak = env.shaper.predict_shift_peak_jerk(
+                v_obs, (v_cmd_cand if v_cmd_cand < v_ceil else v_ceil), a_start_cand, b_land_cand, env.d_hat
+            )
         else:
-            j_cos_peak = 0.0
+            min_dv_jerk = (1.50 if shaper_ready else 2.20) if is_ucb_dmps else 0.25
+            if dv_actual > min_dv_jerk:
+                a_rate_eff = (a_start_cand * 0.64) if (v_cmd_cand >= v_obs) else (b_land_cand * 0.74)
+                j_cos_peak = (2.0 * (a_rate_eff * a_rate_eff)) / max(1.7, dv_actual)
+            else:
+                j_cos_peak = 0.0
         jerk_est = max(j_cos_peak, abs(env.prev_accel) / 3.0)
         rho_3 = jerk_est / self.cfg.max_jerk_mps3
         h_jerk = self.cfg.max_jerk_mps3 - jerk_est
@@ -468,52 +464,41 @@ class GoodallTrajectoryShield:
         else:
             ot_slack_now = 0.0
 
-        if is_ucb_dmps:
-            v_eco_lim = self._compute_eco_speed_limit(
-                env,
-                v_cmd_cand,
-                a_start_cand,
-                b_land_cand,
-                v_pace_feasible,
-                v_obs,
-                v_lim_180_pre=v_lim_180_pre,
-                slope_120_pre=slope_120_pre,
-                ot_slack_pre=ot_slack_now,
-            )
-            h_energy = -(v_cmd_cand - v_eco_lim) if (v_eco_lim is not None and v_cmd_cand > v_eco_lim + 1e-4) else 0.50
-        else:
-            h_energy = 0.50
+        # Energy is scored (rho_E feeds the Tchebycheff tree objective) but is not a safety trigger:
+        # the eco "going too fast" upper bound acts upstream of the shield (env.update_zone_eco_upper_bound).
+        h_energy = 0.50
 
         # 5. Deadline Gust-Compensation & Schedule-Cone Certifier (C3_DEADLINE_RECOVERY)
         v_max_w1_est = max(1.5, v_ceil - r99_cmd)
         is_braking_station = (x_rem < 370.0 and v_cmd_cand < v_obs - 0.50)
         min_xrem_brk = 220.0 if use_cos_loc else 330.0
         before_brake = (
-            (env.x_curr > (15.0 if use_cos_loc else 100.0))
+            (env.x_curr > (15.0 if use_cos_loc else 80.0))
             and (x_rem > min_xrem_brk)
             and (env.x_curr < x_brk_est - (35.0 if use_cos_loc else 55.0))
             and (True if use_cos_loc else (not is_braking_station))
         )
-        dv_tol = 0.35 if use_cos_loc else 0.58
+        dv_tol = 0.30 if use_cos_loc else 0.38
         ot_check = ot_slack_now if is_ucb_dmps else 0.0
         head_trigger = (
-            (env.d_hat < -0.38 and ot_check < 2.2)
-            if use_cos_loc
-            else (env.d_hat < -0.35 and v_cmd_cand < v_pace_feasible + 0.22 and ot_check < 2.2)
+            (env.d_hat < -0.20 and ot_check < 1.8)
+            or (is_ucb_dmps and ot_check < -0.55 and v_cmd_cand < v_pace_feasible + 0.12)
         )
         if before_brake and (
             head_trigger
             or v_cmd_cand < v_pace_feasible - dv_tol
-            or (env.x_curr > 450.0 and v_obs < v_pace_feasible - (0.60 if use_cos_loc else 0.72))
+            or (env.x_curr > 400.0 and v_obs < v_pace_feasible - (0.50 if use_cos_loc else 0.58))
         ):
-            head_boost = 0.25 if (use_cos_loc and env.d_hat < -0.30) else (0.28 * max(0.0, -env.d_hat))
-            v_req_min = min(v_max_w1_est - 0.05, v_pace_feasible + head_boost)
+            head_boost = 0.28 * max(0.0, -env.d_hat) + (0.08 if ot_check < -0.55 else 0.04)
+            v_req_min = min(v_max_w1_est - 0.04, v_pace_feasible + head_boost)
             dv_mismatch = max(0.0, v_req_min - v_cmd_cand)
         else:
             dv_mismatch = 0.0
 
         v_sq = max(36.0, v_pace_feasible ** 2)
         dt_proj_err = (x_rem * dv_mismatch) / v_sq
+        if is_ucb_dmps and dv_mismatch > 0.06 and ot_check < -0.55:
+            dt_proj_err = max(dt_proj_err, -ot_check + 2.80)
         rho_T = dt_proj_err / self.cfg.deadline_time_tol_s
         if (not before_brake) or dv_mismatch <= 0.0:
             h_deadline = 0.50
@@ -755,6 +740,10 @@ class GoodallTrajectoryShield:
         v_pace_feasible: float,
     ) -> tuple[float, float, float, bool, float, str]:
         self.total_steps += 1
+        if env.shaper.in_landing:
+            self.active_contract = "C0_NOMINAL_BALANCED"
+            return v_cmd_task, a_start_task, b_land_task, False, 0.0, "none"
+
         use_cos = getattr(env.shaper, "use_cosine", True)
         ceil_fn = (
             self.corridor.compute_smooth_spatial_ceiling
@@ -815,10 +804,6 @@ class GoodallTrajectoryShield:
             pk["rho_E_energy"] = rE
         if rT > pk["rho_T_deadline"]:
             pk["rho_T_deadline"] = rT
-
-        if env.shaper.in_landing:
-            self.active_contract = "C0_NOMINAL_BALANCED"
-            return v_cmd_task, a_start_task, b_land_task, False, 0.0, "none"
 
         margins_tuple = (h0, h1, h2, h3, h4, h5)
         worst_idx = 0

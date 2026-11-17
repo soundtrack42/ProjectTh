@@ -202,86 +202,161 @@ class RailroadCorridor:
         return float(v_here)
 
 
-def generate_disjoint_wind_events(
-    total_duration_s: float = 600.0,
+# ===========================================================================
+# Physical wind model: wind speed (m/s) -> longitudinal train disturbance (m/s^2)
+# ===========================================================================
+# The plant's own Davis aerodynamic coefficient (NonlinearTrainPhysics.A = 14.5 N s^2/m^2) and
+# nominal effective mass M_eff = 85 t * (1 + 0.08) translate a relative-air-speed change into a
+# longitudinal acceleration, so the wind disturbance is consistent with the plant's drag model:
+#     d_wind = -[A * ((v_ref + w_head) |v_ref + w_head| - v_ref^2) + k_yaw * A * w_cross^2] * rho/rho_0 * c_reg / M_eff
+# Reference speeds: v_ref = 0 m/s inside the sheltered station departure window (k = 0..7, t < 4 s,
+# where the train is still below ~1 m/s), and v_ref = 15 m/s (typical cruise) on the open line.
+# Wind speeds are capped at 30 m/s (108 km/h, upper end of Beaufort 10 "storm"), which bounds
+# |d_wind| at about 0.28 m/s^2 head-on (x drag/air-density multipliers) and about 0.07 m/s^2 tailwind.
+AERO_DAVIS_A_NS2_M2 = 14.5
+WIND_REF_CRUISE_MPS = 15.0
+WIND_REF_M_EFF_KG = 85000.0 * 1.08
+WIND_YAW_SIDE_DRAG_K = 0.15
+MAX_WIND_SPEED_MPS = 30.0
+STATION_WINDOW_STEPS = 8          # k = 0..7 (t < 4.0 s): wayside station weather telemetry available
+STATION_WINDOW_S = 4.0
+
+
+def wind_speed_to_longitudinal_accel(
+    w_head_mps,
+    w_cross_mps=0.0,
+    v_ref_mps: float = WIND_REF_CRUISE_MPS,
+    rho_ratio: float = 1.0,
+    drag_mult: float = 1.0,
+):
+    """Longitudinal disturbance (m/s^2, <0 = retarding) from the head- (+) / tail- (-) wind component."""
+    w_h = np.clip(np.asarray(w_head_mps, dtype=np.float64), -MAX_WIND_SPEED_MPS, MAX_WIND_SPEED_MPS)
+    w_c = np.clip(np.abs(np.asarray(w_cross_mps, dtype=np.float64)), 0.0, MAX_WIND_SPEED_MPS)
+    v_rel = v_ref_mps + w_h
+    f_long = AERO_DAVIS_A_NS2_M2 * (v_rel * np.abs(v_rel) - v_ref_mps * v_ref_mps)
+    f_side = WIND_YAW_SIDE_DRAG_K * AERO_DAVIS_A_NS2_M2 * (w_c * w_c)
+    d = -(f_long + f_side) * float(rho_ratio) * float(drag_mult) / WIND_REF_M_EFF_KG
+    return float(d) if np.ndim(d) == 0 else d
+
+
+def wind_speed_series_to_accel_profile(
+    w_head_series: np.ndarray,
+    w_head_station: float,
+    w_cross: float = 0.0,
     dt: float = 0.50,
-    calm_deadband_mps2: float = 0.34,
-    seed: int | None = None,
-) -> tuple[np.ndarray, str, list[tuple[float, float, float]]]:
+    rho_ratio: float = 1.0,
+    drag_mult: float = 1.0,
+) -> np.ndarray:
     """
-    Generates a continuous scalar wind field w_raw(t) where active gusts are casual,
-    isolated events (~15-20% of the trip) separated by long stretches of calm air (0.0 m/s^2).
+    Maps a head-wind speed series (m/s) to the plant disturbance profile (m/s^2):
+    constant station wind (v_ref = 0) over the k = 0..7 telemetry window, then a smooth 6 s blend
+    to the open-line value (v_ref = 15 m/s) including gusts/turbulence.
     """
-    rng = np.random.default_rng(seed)
+    n = len(w_head_series)
+    t_grid = np.arange(n, dtype=np.float64) * dt
+    d_station = wind_speed_to_longitudinal_accel(w_head_station, w_cross, 0.0, rho_ratio, drag_mult)
+    d_open = wind_speed_to_longitudinal_accel(w_head_series, w_cross, WIND_REF_CRUISE_MPS, rho_ratio, drag_mult)
+    gate = np.clip((t_grid - STATION_WINDOW_S) / 6.0, 0.0, 1.0)
+    prof = (1.0 - gate) * d_station + gate * d_open
+    prof[:STATION_WINDOW_STEPS] = d_station
+    return prof
+
+
+def _extract_wind_events(profile: np.ndarray, dt: float, thresh: float = 0.04, min_len_s: float = 6.0):
+    event_meta, descriptions = [], []
+    active = np.abs(profile) > thresh
+    k, n, ev_id = 0, len(profile), 1
+    while k < n:
+        if active[k]:
+            k0 = k
+            while k < n and active[k] and (np.sign(profile[k]) == np.sign(profile[k0])):
+                k += 1
+            if (k - k0) * dt >= min_len_s:
+                seg = profile[k0:k]
+                pk = float(seg[np.argmax(np.abs(seg))])
+                event_meta.append((k0 * dt, k * dt, pk))
+                tag = "Headwind" if pk < 0 else "Tailwind"
+                descriptions.append(f"E{ev_id}:{tag}({pk:+.2f}m/s²,[{k0 * dt:.0f}s,{k * dt:.0f}s])")
+                ev_id += 1
+        else:
+            k += 1
+    return event_meta, descriptions
+
+
+def _disjoint_head_wind_speed(total_duration_s: float, dt: float, rng: np.random.Generator,
+                              peak_lo: float = 10.0, peak_hi: float = 17.0,
+                              calm_mps: float = 2.0) -> np.ndarray:
+    """Two isolated gust fronts (one head-, one tail-wind), moderate 10-17 m/s (Beaufort 5-7), calm elsewhere."""
     n_steps = int(np.ceil(total_duration_s / dt)) + 40
     t_grid = np.arange(n_steps, dtype=np.float64) * dt
-
-    # Generate 2 distinct casual weather fronts per leg: one Headwind (<0) and one Tailwind (>0)
-    first_sign = -1.0 if (rng.random() < 0.5) else 1.0
-    w_raw = np.zeros(n_steps, dtype=np.float64)
+    first_sign = 1.0 if (rng.random() < 0.5) else -1.0
+    w = np.zeros(n_steps, dtype=np.float64)
     for f_i in range(2):
         center_s = float(rng.uniform(0.08 + 0.45 * f_i, 0.35 + 0.45 * f_i) * total_duration_s)
         width_s = float(rng.uniform(24.0, 36.0))
         sign = first_sign if (f_i == 0) else -first_sign
-        peak = sign * float(rng.uniform(0.62, 0.82))
-        w_raw += peak * np.exp(-0.5 * ((t_grid - center_s) / width_s) ** 2)
+        w += sign * float(rng.uniform(peak_lo, peak_hi)) * np.exp(-0.5 * ((t_grid - center_s) / width_s) ** 2)
+    # Calm air below 2 m/s (light air, Beaufort 1) -> genuinely disjoint events:
+    return np.sign(w) * np.maximum(0.0, np.abs(w) - calm_mps)
 
-    # Smooth C^1 deadband thresholding
-    wind_profile = np.where(
-        np.abs(w_raw) > calm_deadband_mps2,
-        np.sign(w_raw) * (np.abs(w_raw) - calm_deadband_mps2) * 1.25,
-        0.0,
-    )
-    wind_profile = np.clip(wind_profile, -0.58, 0.52)
 
-    # 2. Measure the emergent disjoint intervals [t_s, t_e] from the generated trace
-    active_mask = np.abs(wind_profile) > 0.02
-    event_meta = []
-    descriptions = []
-    k = 0
-    ev_id = 1
-    while k < n_steps:
-        if active_mask[k]:
-            k_start = k
-            while k < n_steps and active_mask[k] and (np.sign(wind_profile[k]) == np.sign(wind_profile[k_start])):
-                k += 1
-            k_end = k
-            if (k_end - k_start) * dt >= 8.0:
-                t_s, t_e = k_start * dt, k_end * dt
-                seg = wind_profile[k_start:k_end]
-                peak_val = float(seg[np.argmax(np.abs(seg))])
-                event_meta.append((t_s, t_e, peak_val))
-                tag = "Headwind" if peak_val < 0 else "Tailwind"
-                descriptions.append(f"E{ev_id}:{tag}({peak_val:+.2f}m/s²,[{t_s:.0f}s,{t_e:.0f}s])")
-                ev_id += 1
-        else:
-            k += 1
+def generate_disjoint_wind_events(
+    total_duration_s: float = 600.0,
+    dt: float = 0.50,
+    calm_deadband_mps2: float = 0.0,
+    seed: int | None = None,
+    drag_mult: float = 1.0,
+) -> tuple[np.ndarray, str, list[tuple[float, float, float]]]:
+    """
+    Isolated head/tail gust fronts (moderate 10-17 m/s wind speed) mapped through the physical
+    Davis-drag wind model; calm at the station departure window (k = 0..7).
+    `calm_deadband_mps2` is kept for API compatibility (calm air is now defined in wind speed).
+    """
+    rng = np.random.default_rng(seed)
+    w_head = _disjoint_head_wind_speed(total_duration_s, dt, rng)
+    prof = wind_speed_series_to_accel_profile(w_head, w_head_station=0.0, dt=dt, drag_mult=drag_mult)
+    meta, desc = _extract_wind_events(prof, dt)
+    return prof, (" | ".join(desc) if desc else "Calm"), meta
 
-    return wind_profile, (" | ".join(descriptions) if descriptions else "Calm"), event_meta
+
+def _continuous_head_wind_speed(max_duration_s: float, dt: float, rng: np.random.Generator):
+    n_steps = int(np.ceil(max_duration_s / dt)) + 40
+    tau = (np.arange(n_steps, dtype=np.float64) * dt) / 400.0
+    t_cross = float(rng.uniform(0.40, 0.60))
+    if rng.random() < 0.5:
+        w1, w2 = -float(rng.uniform(9.0, 14.0)), float(rng.uniform(11.0, 17.0))
+    else:
+        w1, w2 = float(rng.uniform(11.0, 17.0)), -float(rng.uniform(9.0, 14.0))
+    blend = 0.5 * (1.0 + np.tanh((tau - t_cross) / 0.16))
+    return w1 * (1.0 - blend) + w2 * blend, w1, w2
 
 
 def generate_continuous_evolving_wind(
     max_duration_s: float = 600.0,
     dt: float = 0.50,
     seed: int | None = None,
+    drag_mult: float = 1.0,
 ) -> tuple[np.ndarray, str, list[tuple[float, float, float]]]:
+    """Continuously veering wind (head <-> tail, 9-17 m/s) through the physical wind model."""
     rng = np.random.default_rng(seed)
-    n_steps = int(np.ceil(max_duration_s / dt)) + 40
-    t_rel = np.arange(n_steps, dtype=np.float64) * dt
-    tau = t_rel / 400.0
-    t_cross = float(rng.uniform(0.40, 0.60))
-    width = 0.16
+    w_head, w1, w2 = _continuous_head_wind_speed(max_duration_s, dt, rng)
+    prof = wind_speed_series_to_accel_profile(w_head, w_head_station=float(w_head[0]), dt=dt, drag_mult=drag_mult)
+    tag = lambda w: ("Headwind" if w > 0 else "Tailwind") + f"({abs(w):.0f}m/s)"
+    desc = f"Cont: {tag(w1)}->{tag(w2)} | d in [{prof.min():+.2f},{prof.max():+.2f}]m/s²"
+    return prof, desc, [(8.0, 400.0, float(prof[-1]))]
 
-    if rng.random() < 0.5:
-        amp_1, amp_2 = float(rng.uniform(0.32, 0.45)), -float(rng.uniform(0.38, 0.54))
-        desc = f"Cont: Tailwind(+{amp_1:.2f})->Headwind({amp_2:.2f}m/s²)"
-    else:
-        amp_1, amp_2 = -float(rng.uniform(0.38, 0.54)), float(rng.uniform(0.30, 0.44))
-        desc = f"Cont: Headwind({amp_1:.2f})->Tailwind(+{amp_2:.2f}m/s²)"
 
-    w = 0.5 * (1.0 + np.tanh((tau - t_cross) / width))
-    profile = (amp_1 * (1.0 - w) + amp_2 * w) * np.clip(t_rel / 8.0, 0.0, 1.0)
-    return profile, desc, [(8.0, 400.0, amp_2)]
+def _ou_turbulence(n_steps: int, dt: float, sigma: float, tau_s: float, rng: np.random.Generator,
+                   lp_tau_s: float = 3.2, start_k: int = STATION_WINDOW_STEPS) -> np.ndarray:
+    """2nd-order band-limited Ornstein-Uhlenbeck turbulence (m/s), zero inside the station window."""
+    phi = math.exp(-dt / tau_s)
+    alpha = dt / (lp_tau_s + dt)
+    s1 = 0.0
+    out = np.zeros(n_steps, dtype=np.float64)
+    for k in range(start_k, n_steps):
+        s1 = phi * s1 + sigma * math.sqrt(1.0 - phi * phi) * float(rng.normal())
+        out[k] = (1.0 - alpha) * out[k - 1] + alpha * s1
+    return out
 
 
 def _build_leg_zones(leg_length_m: float, rng: np.random.Generator) -> tuple[list[SpeedLimitZone], float]:
@@ -408,58 +483,65 @@ def generate_multi_station_scenario(
         leg_deadline_s = t_clock + leg_budget_s
         dwell_s = 25.0 if leg_idx < n_legs - 1 else 0.0
 
+        drag_mult_reg = {0: 1.00, 1: 1.15, 2: 1.12, 3: 1.20, 4: 1.05}.get(w_type, 1.0)
+        rho_ratio_leg = 293.15 / max(250.0, 273.15 + temp_c)
+        n_st = int(np.ceil((leg_budget_s + 150.0) / 0.50)) + 40
+        w_cross_leg = 0.0
         if not is_weather_active:
-            n_st = int(np.ceil((leg_budget_s + 150.0) / 0.50)) + 40
-            w_prof, w_desc, w_meta = np.zeros(n_st, dtype=np.float64), "Clean (No Weather)", []
+            w_head = np.zeros(n_st, dtype=np.float64)
+            w_desc = "Clean (No Weather)"
+        elif wind_mode == "continuous":
+            w_head, w1, w2 = _continuous_head_wind_speed(leg_budget_s + 150.0, 0.50, np.random.default_rng(seed * 31 + leg_idx))
+            w_desc = f"Cont wind {w1:+.0f}->{w2:+.0f} m/s (head>0)"
         else:
-            if wind_mode == "continuous":
-                w_prof, w_desc, w_meta = generate_continuous_evolving_wind(
-                    leg_budget_s + 150.0, 0.50, seed=seed * 31 + leg_idx
-                )
-            else:
-                w_prof, w_desc, w_meta = generate_disjoint_wind_events(
-                    leg_budget_s + 150.0, 0.50, calm_deadband_mps2=0.22, seed=seed * 31 + leg_idx
-                )
-            if w_type == 1:
-                w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.15, 0.0)
-            elif w_type == 2:
-                w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.12, 0.0)
-            elif w_type == 3:
-                w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.20, 0.0)
-            elif w_type == 4:
-                w_prof = np.where(np.abs(w_prof) > 0.01, w_prof * 1.05, 0.0)
+            w_head = _disjoint_head_wind_speed(leg_budget_s + 150.0, 0.50, np.random.default_rng(seed * 31 + leg_idx))
+            w_desc = "Disjoint gust fronts 10-17 m/s"
+        w_head_station = float(w_head[0])
 
-        # Wayside station sensor at departure (t=0):
-        anem_std = 0.040 if extreme_noise else 0.01
+        # Wayside station sensor at departure (first 8 steps, t < 4.0 s):
+        anem_std = 0.018 if extreme_noise else 0.008
         if extreme_noise:
-            if not is_weather_active:
-                n_st = int(np.ceil((leg_budget_s + 150.0) / 0.50)) + 40
-                w_prof = np.zeros(n_st, dtype=np.float64)
-            # Inject extreme storm/turbulence bursts, harsher adhesion loss, and sensor noise
-            t_grid = np.arange(len(w_prof), dtype=np.float64) * 0.50
-            ramp_in = np.clip(t_grid / 8.0, 0.0, 1.0)
-            for _ in range(3):
-                c_s = float(rng.uniform(0.10, 0.85) * leg_budget_s)
-                w_s = float(rng.uniform(14.0, 26.0))
-                sgn = -1.0 if rng.random() < 0.65 else 1.0
-                pk = sgn * float(rng.uniform(0.45, 0.82))
-                w_prof = w_prof + pk * np.exp(-0.5 * ((t_grid - c_s) / w_s) ** 2) * ramp_in
-            ou_s = 0.0
-            ou_arr = np.zeros_like(w_prof)
-            phi_ou = math.exp(-0.50 / 4.5)
-            for k_ou in range(1, len(w_prof)):
-                ou_s = phi_ou * ou_s + 0.095 * math.sqrt(1.0 - phi_ou * phi_ou) * float(rng.normal())
-                ou_arr[k_ou] = 0.85 * ou_arr[k_ou - 1] + 0.15 * ou_s
-            w_prof = np.clip(w_prof + ou_arr * ramp_in, -0.86, 0.74)
-            mu_adhesion = float(np.clip(mu_adhesion * rng.uniform(0.76, 0.90), 0.60, 0.92))
+            # Beaufort 9-10 storm: sustained 20-24 m/s at a random bearing, gust fronts up to 26-30 m/s
+            # (<= 30 m/s cap) alternating head/tail on the open line, 12% turbulence intensity.
+            n_st = max(n_st, len(w_head))
+            t_grid = np.arange(n_st, dtype=np.float64) * 0.50
+            v_sus = float(rng.uniform(20.0, 24.0))
+            ang = float(rng.uniform(0.0, 2.0 * math.pi))
+            w_head_sus = v_sus * math.cos(ang)
+            w_cross_leg = abs(v_sus * math.sin(ang))
+            w_head = np.full(n_st, w_head_sus, dtype=np.float64)
+            open_line_gate = np.clip((t_grid - STATION_WINDOW_S) / 6.0, 0.0, 1.0)
+            sgn0 = 1.0 if w_head_sus >= 0.0 else -1.0
+            for g_i in range(3):
+                c_s = float(rng.uniform(0.14 + 0.24 * g_i, 0.30 + 0.24 * g_i) * leg_budget_s)
+                w_s = float(rng.uniform(16.0, 26.0))
+                sgn = sgn0 if (g_i % 2 == 0) else -sgn0
+                target = sgn * float(rng.uniform(26.0, 30.0))
+                w_head = w_head + (target - w_head_sus) * np.exp(-0.5 * ((t_grid - c_s) / w_s) ** 2) * open_line_gate
+            w_head = w_head + _ou_turbulence(n_st, 0.50, 0.12 * 28.0, 4.8, rng) * open_line_gate
+            w_head = np.clip(w_head, -MAX_WIND_SPEED_MPS, MAX_WIND_SPEED_MPS)
+            w_head_station = w_head_sus
+            drag_mult_reg = max(drag_mult_reg, 1.10)
+            mu_adhesion = float(np.clip(mu_adhesion * rng.uniform(0.86, 0.94), 0.72, 0.94))
             is_weather_active = True
             if weather_name == "Clear-Dry":
-                weather_name = "Extreme-Storm"
-            w_desc = f"Extreme-Noise({weather_name}, max|w|={float(np.max(np.abs(w_prof))):.2f})"
+                weather_name = "Storm-Gale"
+
+        w_prof = wind_speed_series_to_accel_profile(
+            w_head, w_head_station, w_cross=w_cross_leg, dt=0.50, rho_ratio=rho_ratio_leg, drag_mult=drag_mult_reg
+        )
+        w_meta, ev_desc = _extract_wind_events(w_prof, 0.50)
+        if extreme_noise:
+            w_desc = (
+                f"Extreme-Noise({weather_name}, sustained {abs(w_head_station):.0f}m/s head-comp, gusts<=30m/s, "
+                f"d in [{w_prof.min():+.2f},{w_prof.max():+.2f}]m/s^2)"
+            )
+        elif ev_desc:
+            w_desc = f"{w_desc}: " + " | ".join(ev_desc)
 
         station_wind_reading = float(w_prof[0] + rng.normal(0.0, anem_std)) if is_weather_active else 0.0
-        speed_noise_std = 0.004 if extreme_noise else 0.0
-        unmodeled_drag = float(rng.uniform(1.06, 1.18)) if extreme_noise else 1.0
+        speed_noise_std = 0.0025 if extreme_noise else 0.0
+        unmodeled_drag = float(rng.uniform(1.03, 1.08)) if extreme_noise else 1.0
 
         corridor = RailroadCorridor(
             route_name=f"Leg {leg_idx+1} ({station_names[leg_idx]} -> {station_names[leg_idx+1]})",

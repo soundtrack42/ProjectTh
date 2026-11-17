@@ -49,9 +49,12 @@ class PureLiuMPC:
         self.gamma = gamma_rot
 
         # Mass-normalized Davis basic resistance coefficients (Liu et al. 2025 Eq. 4-5; Havaei 2022 Eq. 5)
-        self.a_a = davis_c_const / self.M
-        self.b_a = davis_b_lin / self.M
-        self.c_a = davis_a_quad / self.M
+        self._davis_c = float(davis_c_const)
+        self._davis_b = float(davis_b_lin)
+        self._davis_a = float(davis_a_quad)
+        self.a_a = self._davis_c / self.M
+        self.b_a = self._davis_b / self.M
+        self.c_a = self._davis_a / self.M
 
         self.f_a_max_unit = max_traction_accel * (1.0 + self.gamma)
         self.f_b_max_unit = max_braking_decel * (1.0 + self.gamma)
@@ -92,6 +95,17 @@ class PureLiuMPC:
         self._q1_stop_t = tuple(float(x) for x in self._q1_stop)
         self._q1_cruise_t = tuple(float(x) for x in self._q1_cruise)
         self._q1_fixed_t = tuple(float(x) for x in self._q1_fixed)
+
+    def update_mass_and_limits(
+        self, mass_kg: float, max_traction_accel: float, max_braking_decel: float
+    ) -> None:
+        """Zero-allocation in-place update of vehicle mass and adhesion-scaled force bounds."""
+        self.M = float(mass_kg)
+        self.a_a = self._davis_c / self.M
+        self.b_a = self._davis_b / self.M
+        self.c_a = self._davis_a / self.M
+        self.f_a_max_unit = float(max_traction_accel) * (1.0 + self.gamma)
+        self.f_b_max_unit = float(max_braking_decel) * (1.0 + self.gamma)
 
     def reset(self) -> None:
         self.prev_u = 0.0
