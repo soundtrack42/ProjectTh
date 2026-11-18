@@ -81,7 +81,8 @@ class BilbaoCBTCATOController:
 
     def _effective_rates(self, d_obs: float) -> tuple[float, float]:
         """Effective 90% RMBTP acceleration and braking rates accounting for mass and disturbance."""
-        mass_scale = 85000.0 / max(65000.0, self.physics.M)
+        s_car = getattr(self.physics, "car_scale", 1.0)  # plant reference mass of the consist (1.0 = 4 cars)
+        mass_scale = (85000.0 * s_car) / max(65000.0 * s_car, self.physics.M)
         adh_mu = getattr(self.corridor, "adhesion_mu_factor", 1.0)
         a_eff = _clamp(self.a_plan_cap * mass_scale * adh_mu + 0.45 * d_obs, 0.42, 1.15)
         b_eff = _clamp(self.b_plan_cap * mass_scale * adh_mu - 0.35 * d_obs, 0.42, 0.88)

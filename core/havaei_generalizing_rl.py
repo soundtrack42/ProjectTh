@@ -150,15 +150,31 @@ COMPUTED_PID_BANK = optimize_heuristic_pid_bank()
 # 2. True Nonlinear Train Physics (Equations 2 - 10 of Havaei & Sandidzadeh)
 # ===========================================================================
 class NonlinearTrainPhysics:
-    def __init__(self, mass_kg: float = 85000.0, sample_dist_d: float = 8.33):
+    # Piecewise-constant track profile, periodic every 1000 m: (start, end, value).
+    GRADE_SEGMENTS = ((300.0, 470.0, 9.81 * 0.01999866669333308), (620.0, 760.0, -9.81 * 0.01199971200345597))
+    CURVE_SEGMENTS = ((180.0, 280.0, 9.81 / 650.0), (500.0, 600.0, 9.81 / 550.0))
+    AERO_NOSE_TAIL_FRACTION = 0.5   # share of the 4-car aerodynamic coefficient from nose/tail pressure drag
+
+    def __init__(self, mass_kg: float = 85000.0, sample_dist_d: float = 8.33,
+                 car_scale: float = 1.0, length_m: float = 0.0):
+        """
+        car_scale = n_cars / 4 (1.0 = the calibrated 4-car unit). Mass-proportional terms (rolling and
+        mechanical resistance B, C) scale with the consist; the aerodynamic v^2 coefficient A splits into a
+        length-independent nose/tail part and a skin-friction part proportional to length.
+        length_m > 0 distributes the mass along the train, so grade and curve forces are averaged over
+        [x - length_m, x] (x = head position); length_m = 0 is the point-mass model.
+        """
         self.M = mass_kg
         self.gamma = 0.08
         self.M_eff = self.M * (1.0 + self.gamma)
         self.g = 9.81
         self.d = sample_dist_d
-        self.A = 14.5
-        self.B = 185.0
-        self.C = 1450.0
+        self.car_scale = float(car_scale)
+        self.length_m = float(length_m)
+        f = self.AERO_NOSE_TAIL_FRACTION
+        self.A = 14.5 * (f + (1.0 - f) * self.car_scale)
+        self.B = 185.0 * self.car_scale
+        self.C = 1450.0 * self.car_scale
         self.max_traction_accel = 1.85
         self.max_braking_decel = 1.65
 
@@ -166,21 +182,39 @@ class NonlinearTrainPhysics:
     def step_window(x: float, b: float, a: float) -> float:
         return 1.0 if (b <= x < a) else 0.0
 
-    def grade_resistance(self, x: float) -> float:
+    @staticmethod
+    def _profile_at(x: float, segs) -> float:
         x_mod = x % 1000.0
-        if 300.0 <= x_mod < 470.0:
-            return self.M * (9.81 * 0.01999866669333308)
-        if 620.0 <= x_mod < 760.0:
-            return self.M * (-9.81 * 0.01199971200345597)
+        for a, b, val in segs:
+            if a <= x_mod < b:
+                return val
         return 0.0
 
+    @staticmethod
+    def _profile_mean(x: float, length: float, segs) -> float:
+        """Exact mean of the periodic piecewise-constant profile over [x - length, x]."""
+        x0 = x - length
+        p0 = int(x0 // 1000.0)
+        p1 = int(x // 1000.0)
+        acc = 0.0
+        for p in range(p0, p1 + 1):
+            base = p * 1000.0
+            for a, b, val in segs:
+                lo = base + a if base + a > x0 else x0
+                hi = base + b if base + b < x else x
+                if hi > lo:
+                    acc += (hi - lo) * val
+        return acc / length
+
+    def grade_resistance(self, x: float) -> float:
+        if self.length_m > 0.0:
+            return self.M * self._profile_mean(x, self.length_m, self.GRADE_SEGMENTS)
+        return self.M * self._profile_at(x, self.GRADE_SEGMENTS)
+
     def curve_resistance(self, x: float) -> float:
-        x_mod = x % 1000.0
-        if 180.0 <= x_mod < 280.0:
-            return self.M * (9.81 / 650.0)
-        if 500.0 <= x_mod < 600.0:
-            return self.M * (9.81 / 550.0)
-        return 0.0
+        if self.length_m > 0.0:
+            return self.M * self._profile_mean(x, self.length_m, self.CURVE_SEGMENTS)
+        return self.M * self._profile_at(x, self.CURVE_SEGMENTS)
 
     def basic_resistance(self, v: float) -> float:
         return 0.0 if v <= 1e-4 else (self.A * (v ** 2) + self.B * v + self.C)

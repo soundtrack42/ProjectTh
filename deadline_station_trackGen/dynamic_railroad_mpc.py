@@ -69,6 +69,15 @@ from goodall_trajectory_shield import (
 #          gusts may start after 4 s.
 STATION_ANEMOMETER2_X_M = 10.0
 
+# Pre-landing coasting for the proposed PPO methods (2-7); off by default, --coast enables it.
+PILOT_COASTING = False
+
+# Centre of the departure/shift-up acceleration rate decoded from the pilot action (a_start = centre + 0.22 a1)
+# for the proposed PPO methods (2-7); literature pilots always use 0.96. Default 0.96 (pilots trained with it).
+# Ablation: --a-start-center 0.81 lowers drivetrain slew/copper losses (-1.3..-2.2% energy) but, without
+# retraining, costs ~0.1 s punctuality on methods 2-4 (UCB-DMPS methods 5/7 compensate via C3).
+OUR_A_START_CENTER = 0.96
+
 class MPCTransitionRailroadEnv:
     def __init__(
         self,
@@ -91,6 +100,22 @@ class MPCTransitionRailroadEnv:
         )
         self.obs_dim = 18
         self.act_dim = 3
+        # Pre-landing coasting (cruise -> coast -> brake), enabled for the proposed PPO methods. Coasting starts
+        # only if traction-off rolling to the braking spot plus the landing still arrives >= enter margin before
+        # the deadline, and stops (normal pace) as soon as the predicted arrival loses the keep margin, or when a
+        # shield certifies a deadline recovery. Selected on tuning seeds 5000+29k.
+        self.coast_enabled = False
+        self.coast_enter_margin_s = 2.0
+        self.coast_keep_margin_s = 1.0
+        self.coast_window_m = 3000.0
+        self.coast_v_min = 4.0
+        self.coast_lockout_macro = 6          # after a punctuality abort, no re-entry for 6 macro steps (24 s)
+        # Training-only pace shaping (0 = off; evaluation never uses it): steady cruise command and "on time
+        # throughout" (predicted arrival at the current speed within +-band of the deadline, early or late).
+        self.rew_pace_change_w = 0.0
+        self.rew_ontrack_w = 0.0
+        self.rew_ontrack_band_s = 4.0
+        self.a_start_center = 0.96
         # Optional rule layer of a literature pilot (e.g. EITOP expert rules), applied right after decoding:
         self.pilot_filter = None
         self.wind_profile = np.zeros(1600, dtype=np.float64)
@@ -103,15 +128,17 @@ class MPCTransitionRailroadEnv:
 
     def _sync_physics_and_mpc(self, use_estimated_mass: bool = True, reset_shaper: bool = True) -> None:
         # True nonlinear plant uses actual passenger weight and station-measured adhesion:
-        self.true_physics = NonlinearTrainPhysics(mass_kg=self.corridor.mass_kg)
+        s_car = self.corridor.car_scale
+        len_m = float(getattr(self.corridor, "train_length_m", 0.0))
+        self.true_physics = NonlinearTrainPhysics(mass_kg=self.corridor.mass_kg, car_scale=s_car, length_m=len_m)
         self.true_physics.max_traction_accel = self.corridor.max_traction_accel
         self.true_physics.max_braking_decel = self.corridor.max_service_braking
 
         # Controller (MPC + Shaper) knows station weather telemetry (adhesion_mu_factor) and online mass_hat_kg:
-        ctrl_mass = self.mass_hat_kg if use_estimated_mass else 85000.0
-        mass_ratio = 85000.0 / max(65000.0, ctrl_mass)
+        ctrl_mass = self.mass_hat_kg if use_estimated_mass else 85000.0 * s_car
+        mass_ratio = (85000.0 * s_car) / max(65000.0 * s_car, ctrl_mass)
         adh_mu = getattr(self.corridor, "adhesion_mu_factor", 1.0)
-        self.physics = NonlinearTrainPhysics(mass_kg=ctrl_mass)
+        self.physics = NonlinearTrainPhysics(mass_kg=ctrl_mass, car_scale=s_car, length_m=len_m)
         self.physics.max_traction_accel = self.corridor.base_max_traction_accel * mass_ratio * adh_mu
         self.physics.max_braking_decel = self.corridor.base_max_service_braking * mass_ratio * adh_mu
         if reset_shaper or not hasattr(self, "shaper"):
@@ -168,6 +195,13 @@ class MPCTransitionRailroadEnv:
         self.eco_capped_steps = 0
         self._eco_ub_cached_res: tuple[float, bool] = (15.0, False)
         self._eco_anchor_v: float | None = None   # latched "no further acceleration" speed (None = released)
+        self.coast_active = False
+        self.coast_u_cap = 1.0
+        self.coast_macro_steps = 0
+        self.coast_aborts = 0
+        self.macro_steps_total = 0
+        self._coast_lock_until = -1
+        self._v_cmd_pilot_prev: float | None = None
         # Departure mass ID accumulators (cumulative regressors of the telescoped force balance):
         self._mid_cum_f = 0.0     # sum F_k dt   [kN s]   (traction - Davis drag, from mu_adh & T_amb)
         self._mid_cum_c = 0.0     # sum gate_k dt [s]     (wind acts only when moving or tractive)
@@ -240,7 +274,8 @@ class MPCTransitionRailroadEnv:
         """Closed-form 2x2 MAP solve (ticket-mass prior on theta, anemometer prior on d)."""
         prior = self.mass_prior_kg
         th0 = 1000.0 / ((1.0 + self.physics.gamma) * prior)
-        sig_th = th0 * (2500.0 / prior)
+        s_car = self.corridor.car_scale
+        sig_th = th0 * (2500.0 * s_car / prior)
         sig_anem = 0.018 if self.speed_sensor_noise_mps > 0.0 else 0.008
         a11 = self._mid_info[0] + 1.0 / (sig_th * sig_th)
         a12 = self._mid_info[1]
@@ -253,7 +288,7 @@ class MPCTransitionRailroadEnv:
         th = (a22 * b1 - a12 * b2) / det
         d_post = (a11 * b2 - a12 * b1) / det
         m_est = 1000.0 / ((1.0 + self.physics.gamma) * max(1e-6, th))
-        m_lo, m_hi = max(65000.0, prior - 9000.0), min(110000.0, prior + 9000.0)
+        m_lo, m_hi = max(65000.0 * s_car, prior - 9000.0 * s_car), min(110000.0 * s_car, prior + 9000.0 * s_car)
         return (m_lo if m_est < m_lo else (m_hi if m_est > m_hi else float(m_est))), float(d_post)
 
     def _ensure_feas_cache_epoch(self) -> None:
@@ -404,6 +439,49 @@ class MPCTransitionRailroadEnv:
         self._ot_slack_cache_map[cache_key] = slack
         return slack
 
+    def _coast_accel(self, x: float, v: float) -> float:
+        """Traction-off acceleration (m/s^2) predicted by the controller model (mass_hat, station weather, DOB)."""
+        rho = 293.15 / max(250.0, 273.15 + self.station_temp_c)
+        cwr = 1.0 + 0.0045 * max(0.0, self.station_temp_c - 25.0)
+        ph = self.physics
+        f_res = ph.basic_resistance(v) * rho + ph.grade_resistance(x) + ph.curve_resistance(x) * cwr
+        return -f_res / ph.M_eff + float(self.d_hat)
+
+    def coast_arrival_slack_s(self, b_land: float) -> float | None:
+        """
+        Predicted arrival slack (s) if traction is cut now: coast (speed capped by the local limit) until the
+        landing braking spot of the current speed, then land. None when coasting is not admissible here (far
+        from the station, or the coast would decay below coast_v_min). Higher speed limits ahead are simply not
+        used while coasting; lower ones cap the predicted speed (the MPC brakes for them).
+        Integrated in 100 m distance steps (<= 30 iterations) once per macro step.
+        """
+        cor = self.corridor
+        x = float(self.x_curr)
+        v = float(self.v_meas)
+        st = cor.station_x_m
+        if st - x > self.coast_window_m or v < self.coast_v_min + 0.5:
+            return None
+        _, b_eff = self._get_remaining_time_geom(b_land)
+        land_k = 0.5 * math.pi if self.use_cosine_shaper else 1.66
+        inv_2b, inv_1b = 0.5 * land_k / b_eff, land_k / b_eff
+        t = 0.0
+        for _ in range(40):
+            if x >= st - inv_2b * v * v:
+                break
+            dx = min(100.0, max(1.0, st - inv_2b * v * v - x))
+            v2 = v * v + 2.0 * self._coast_accel(x, v) * dx
+            v_new = math.sqrt(v2) if v2 > 0.0 else 0.0
+            v_lim = cor.get_speed_limit(x + dx)
+            if v_new > v_lim:
+                v_new = v_lim
+            if v_new < self.coast_v_min:
+                return None
+            t += dx / (0.5 * (v + v_new))
+            x += dx
+            v = v_new
+        t_arr = t + inv_1b * v
+        return float((cor.deadline_s - self.t_curr) - t_arr)
+
     def update_zone_eco_upper_bound(
         self, a_start: float = 0.86, b_land: float = 0.74
     ) -> tuple[float, bool]:
@@ -546,7 +624,7 @@ class MPCTransitionRailroadEnv:
         ) / (3.0 * mg_est)
         adh_deficit_norm = (1.0 - self.station_mu) * 4.0
         d_trend = (self.d_hat - self.d_hat_prev) / self.corridor.dt
-        mass_norm = (self.mass_hat_kg - 85000.0) / 15000.0
+        mass_norm = (self.mass_hat_kg / self.corridor.car_scale - 85000.0) / 15000.0
 
         return np.array([
             self.x_curr / self.corridor.station_x_m,
@@ -576,7 +654,7 @@ class MPCTransitionRailroadEnv:
         a0 = -1.0 if a0_raw < -1.0 else (1.0 if a0_raw > 1.0 else a0_raw)
         a1 = -1.0 if a1_raw < -1.0 else (1.0 if a1_raw > 1.0 else a1_raw)
         a2 = -1.0 if a2_raw < -1.0 else (1.0 if a2_raw > 1.0 else a2_raw)
-        a_start_cos = 0.96 + 0.22 * a1   # [0.74, 1.18] m/s^2
+        a_start_cos = self.a_start_center + 0.22 * a1   # default [0.74, 1.18] m/s^2; ours [0.59, 1.03]
         b_land_cos = 0.78 + 0.12 * a2    # [0.66, 0.90] m/s^2
 
         v_feas, v_naive = self.compute_feasible_deadline_pace(a_start_cos, b_land_cos)
@@ -603,6 +681,7 @@ class MPCTransitionRailroadEnv:
         policy_infer_us: float = 0.0,
     ) -> tuple[np.ndarray, float, bool, dict]:
         t_macro_0 = time.thread_time()
+        self.macro_steps_total += 1
         v_cmd_rl, a_start_cos, b_land_cos, v_feas, v_naive = self.decode_rl_action(action)
         if self.pilot_filter is not None:
             v_cmd_rl, a_start_cos, b_land_cos = self.pilot_filter(self, v_cmd_rl, a_start_cos, b_land_cos, v_feas)
@@ -628,6 +707,23 @@ class MPCTransitionRailroadEnv:
                     self, v_cmd_rl, a_start_cos, b_land_cos, v_pace_feasible=v_feas
                 )
             )
+        # Pre-landing coasting: traction off while the predicted arrival keeps its margin (punctuality first).
+        coast_now = False
+        if self.coast_enabled and self.mass_locked and not self.shaper.in_landing:
+            deadline_rescue = shield_intervened and violated_prop == "deadline"
+            if not deadline_rescue and self.macro_steps_total > self._coast_lock_until:
+                c_slack = self.coast_arrival_slack_s(b_land_cos)
+                margin = self.coast_keep_margin_s if self.coast_active else self.coast_enter_margin_s
+                coast_now = c_slack is not None and c_slack >= margin
+            if self.coast_active and not coast_now:
+                self.coast_aborts += 1
+                self._coast_lock_until = self.macro_steps_total + self.coast_lockout_macro
+            if coast_now:
+                if not self.coast_active:
+                    self.coast_u_cap = max(0.0, self.u_act)
+                self.coast_macro_steps += 1
+                v_cmd_rl = min(v_cmd_rl, float(self.v_meas))   # no new acceleration while coasting
+        self.coast_active = coast_now
         t_macro_1 = time.thread_time()
         macro_shield_us = (t_macro_1 - t_macro_0) * 1e6
 
@@ -660,6 +756,13 @@ class MPCTransitionRailroadEnv:
                 v_scissor_rad=0.0,
                 d_wind_hat=self.d_hat,
             )
+            coasting = self.coast_active and not self.shaper.in_landing
+            if coasting:
+                a_c = self._coast_accel(self.x_curr, self.v_meas)
+                for i_h in range(len(v_ref_h)):
+                    v_c_i = self.v_meas + a_c * self.corridor.dt * (i_h + 1)
+                    if v_c_i < v_ref_h[i_h]:
+                        v_ref_h[i_h] = v_c_i if v_c_i > 0.0 else 0.0
             v_ref0_step = float(v_ref_h[0])
 
             slope_iota = (
@@ -676,6 +779,11 @@ class MPCTransitionRailroadEnv:
                 u_act_prev=self.u_act,
                 disturbance_accel=eff_ff_gain * self.d_hat,
             )
+            if coasting:
+                # Traction fades out smoothly (jerk-limited); braking stays available for limits/curves.
+                self.coast_u_cap = max(0.0, self.coast_u_cap - 0.05)
+                if u_cmd > self.coast_u_cap:
+                    u_cmd = self.coast_u_cap
             t1 = time.thread_time()
             mpc_only_us = (t1 - t0) * 1e6
 
@@ -959,6 +1067,17 @@ class MPCTransitionRailroadEnv:
 
         if shield_intervened:
             macro_reward -= 0.15 * shield_diff
+
+        if (self.rew_pace_change_w > 0.0 or self.rew_ontrack_w > 0.0) and not self.shaper.in_landing:
+            cruising = self.v_meas > 5.0 and (self.corridor.station_x_m - self.x_curr) > 300.0
+            if self._v_cmd_pilot_prev is not None and cruising:
+                macro_reward -= self.rew_pace_change_w * (v_cmd_unshielded - self._v_cmd_pilot_prev) ** 2
+            if cruising and self.rew_ontrack_w > 0.0:
+                ot = self.compute_on_track_slack_s(a_start_cos, b_land_cos)
+                excess = abs(ot) - self.rew_ontrack_band_s
+                if excess > 0.0:
+                    macro_reward -= self.rew_ontrack_w * min(excess, 30.0)
+        self._v_cmd_pilot_prev = v_cmd_unshielded
 
         if done:
             sched_err = abs(self.t_curr - self.corridor.deadline_s)
@@ -1254,6 +1373,11 @@ def train_pure_ppo_cosine_pilot(
     checkpoint_prefix: str = "ppo_cosine_pilot",
     use_cosine_shaper: bool = True,
     pilot_filter=None,
+    coast: bool = False,
+    init_state: dict | None = None,
+    pace_change_w: float = 0.0,
+    ontrack_w: float = 0.0,
+    a_start_center: float = 0.96,
 ) -> tuple[CosineTrajectoryRLPolicy, list[dict]]:
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -1262,7 +1386,15 @@ def train_pure_ppo_cosine_pilot(
         corridor=base_corridor, traj_shield=None, emulator=emulator, use_cosine_shaper=use_cosine_shaper
     )
     env.pilot_filter = pilot_filter
+    env.coast_enabled = bool(coast)
+    env.rew_pace_change_w = float(pace_change_w)
+    env.rew_ontrack_w = float(ontrack_w)
+    env.a_start_center = float(a_start_center)
     policy = CosineTrajectoryRLPolicy(obs_dim=env.obs_dim, act_dim=env.act_dim, hidden_dim=64)
+    if init_state is not None:
+        # Fine-tuning (e.g. after enabling coasting): start from a trained pilot instead of random weights.
+        policy.load_state_dict(init_state)
+        policy._refresh_actor_views()
     optimizer = optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=lr * 0.12)
 
@@ -1434,11 +1566,13 @@ def evaluate_multi_station_journey(
     zero_wind_override: bool = False,
     eco_governor: bool | None = None,
     lit_pilot=None,
+    coast: bool | None = None,
 ) -> dict:
     leg_sched_errs, leg_stop_errs, leg_land_decels, leg_peak_accels, leg_jerks = [], [], [], [], []
     tot_energy_kwh = 0.0
     tot_sh_steps, tot_sh_ints = 0, 0
     tot_eco_steps, tot_eco_caps = 0, 0
+    tot_macro, tot_coast, tot_coast_aborts = 0, 0, 0
     mass_abs_err_kg, mass_prior_abs_err_kg = [], []
     prop_totals = {
         "speed_limit": 0, "smoothness": 0, "jerk_order3": 0,
@@ -1484,6 +1618,9 @@ def evaluate_multi_station_journey(
             corridor=cor_leg, traj_shield=sh_obj, emulator=emulator, use_cosine_shaper=(not is_free_mode),
             eco_governor=eco_governor,
         )
+        env.coast_enabled = bool(PILOT_COASTING if coast is None else coast) and mode in ("RL_LEARNED", "RL_FREE_LEARNED")
+        if mode in ("RL_LEARNED", "RL_FREE_LEARNED"):
+            env.a_start_center = OUR_A_START_CENTER
         obs = env.reset(corridor_override=cor_leg, wind_profile=wind_prof)
         bilbao_ctrl = BilbaoCBTCATOController(cor_leg, env.physics) if mode == "BILBAO_CBTC_ATO" else None
         if mode == "LIT_PILOT":
@@ -1574,6 +1711,9 @@ def evaluate_multi_station_journey(
             mass_abs_err_kg.append(abs(env.mass_hat_kg - float(leg["mass_kg"])))
             mass_prior_abs_err_kg.append(abs(env.mass_prior_kg - float(leg["mass_kg"])))
         tot_eco_caps += env.eco_capped_steps
+        tot_macro += env.macro_steps_total
+        tot_coast += env.coast_macro_steps
+        tot_coast_aborts += env.coast_aborts
         if sh_obj is not None:
             tot_sh_steps += sh_obj.total_steps
             tot_sh_ints += sh_obj.total_interventions
@@ -1671,6 +1811,8 @@ def evaluate_multi_station_journey(
         "multi_obj_score": multi_obj_score,
         "shield_rate_pct": 100.0 * tot_sh_ints / max(1, tot_sh_steps) if shield_mode is not None else 0.0,
         "eco_rate_pct": 100.0 * tot_eco_caps / max(1, tot_eco_steps),
+        "coast_rate_pct": 100.0 * tot_coast / max(1, tot_macro),
+        "coast_aborts": tot_coast_aborts,
         "mass_abs_err_kg": mass_abs_err_kg,
         "mass_prior_abs_err_kg": mass_prior_abs_err_kg,
         "property_counts": prop_totals,
@@ -2010,7 +2152,7 @@ def _print_spike_profiler(dmps_runs: list[dict], subset_label: str) -> None:
 
 
 def main():
-    global STATION_ANEMOMETER2_X_M
+    global STATION_ANEMOMETER2_X_M, PILOT_COASTING, OUR_A_START_CENTER
     ap = argparse.ArgumentParser(description="Multi-Property PPO + Hierarchical Contract Shielding (3-Station ~16.5 km)")
     ap.add_argument("--epochs", type=int, default=220, help="PPO training epochs (logarithmic convergence around ~180-220)")
     ap.add_argument("--eval-runs", type=int, default=30, help="Number of 3-station multi-km test scenarios")
@@ -2056,8 +2198,22 @@ def main():
         help="Departure mass-ID approach: position (m) of the 2nd platform-end anemometer; the window runs until "
         "the train passes it. 0 = station-only approach (station anemometer, fixed 8-step window).",
     )
+    ap.add_argument("--coast", action="store_true", help="Enable pre-landing coasting (punctuality-guarded) for methods 2-7")
+    ap.add_argument("--free-checkpoint", type=str, default="best_ppo_free_pilot.pt",
+                    help="Checkpoint of the no-cosine PPO pilot (methods 6-7)")
+    ap.add_argument("--a-start-center", type=float, default=OUR_A_START_CENTER,
+                    help="Acceleration-rate centre (m/s^2) for methods 2-7 (ablation: 0.81)")
+    ap.add_argument("--train-cars", type=float, default=None,
+                    help="Distributed-length train with N cars (18.75 m each): length-averaged grade/curve forces, "
+                         "nose/tail + skin-friction drag split, tail-clearance speed limits. 0 = real Digitraffic "
+                         "composition length on --real-data. Omit for the calibrated 4-car point-mass benchmark.")
     args = ap.parse_args()
+    if args.train_cars is not None:
+        import railroad_corridor as _rc
+        _rc.TRAIN_CARS = float(args.train_cars)
     STATION_ANEMOMETER2_X_M = float(args.anemometer2_x_m)
+    OUR_A_START_CENTER = float(args.a_start_center)
+    PILOT_COASTING = bool(args.coast)
 
     if args.harsh_weather is not None:
         harsh_mode_eff = "raw" if args.harsh_weather == "none" else args.harsh_weather
@@ -2142,7 +2298,7 @@ def main():
             base_corridor, emulator=emulator, epochs=args.epochs, wind_mode=args.wind_mode, seed=args.seed
         )
 
-    free_ckpt_path = _resolve_ckpt("best_ppo_free_pilot.pt")
+    free_ckpt_path = _resolve_ckpt(args.free_checkpoint)
     if load_ckpt_resolved and os.path.exists(load_ckpt_resolved):
         if os.path.exists(free_ckpt_path):
             free_sd = torch.load(free_ckpt_path, map_location="cpu")
@@ -2415,6 +2571,16 @@ def main():
                 f"  Departure mass ID (closed-form, {'stop..2nd anemometer @ %g m' % STATION_ANEMOMETER2_X_M if STATION_ANEMOMETER2_X_M > 0 else 'station-only, 8 steps'}, {len(m_err)} legs): MAE={np.mean(m_err):.1f} kg "
                 f"(max {np.max(m_err):.1f}) vs ticket prior MAE={np.mean(m_pri):.1f} kg (max {np.max(m_pri):.1f})"
             )
+        coast_txt = []
+        for name, _, _ in method_specs:
+            runs = [r for r in agg_results[name] if filter_fn(r)]
+            if runs and any(r.get("coast_rate_pct", 0.0) > 0.0 for r in runs):
+                coast_txt.append(
+                    f"{name.split('.')[0]}: {np.mean([r['coast_rate_pct'] for r in runs]):.1f}% "
+                    f"({sum(r.get('coast_aborts', 0) for r in runs)} aborts)"
+                )
+        if coast_txt:
+            print("  Pre-landing coasting (macro steps coasting, punctuality aborts): " + " | ".join(coast_txt))
         print("=" * 168, flush=True)
 
     # Diagnostic Profiler & Scissor Diagnostics separated for Baseline vs Extreme Scenarios
