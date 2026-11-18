@@ -191,7 +191,7 @@ class GoodallTrajectoryShield:
             fb[2] = u_clamped
             fb[3] = ext_f_norm
             fb[4] = v_norm * v_norm
-            fb[5] = (physics.M - 85000.0) / 10000.0
+            fb[5] = (physics.M / getattr(physics, "car_scale", 1.0) - 85000.0) / 10000.0
             fb[6] = (rho_air - 1.0) * 5.0
             fb[7] = (adh_mu - 1.0) * 5.0
 
@@ -889,8 +889,9 @@ class GoodallTrajectoryShield:
             r99_now = self.cfg.z_sigma * self.sigma_tube_curr
             v_max_w1 = max(1.5, v_ceil_cached - r99_now - 0.02)
             v_sw = self._clamp(v_pace_feasible + 0.28 * max(0.0, -env.d_hat) + 0.06, 1.5, v_max_w1)
-            diff = abs(v_sw - v_cmd_task) + abs(0.96 - a_start_task) + abs(0.78 - b_land_task)
-            return v_sw, 0.96, 0.78, True, diff, worst_prop
+            a_nom = float(getattr(env, "a_start_center", 0.96))
+            diff = abs(v_sw - v_cmd_task) + abs(a_nom - a_start_task) + abs(0.78 - b_land_task)
+            return v_sw, a_nom, 0.78, True, diff, worst_prop
 
         if self.cfg.mode == "cbf_opt":
             r99_now = self.cfg.z_sigma * self.sigma_tube_curr
@@ -1090,7 +1091,7 @@ class GoodallTrajectoryShield:
                         env, v_obs, v_leaf, na, nb, dt_horizon_window
                     )
                     dx_win_m = max(5.0, abs(x_leaf - env.x_curr))
-                    wh_tkm_win = (e_win_kwh * 1000.0) / ((max(70000.0, mass_used_now) / 1000.0) * (dx_win_m / 1000.0))
+                    wh_tkm_win = (e_win_kwh * 1000.0) / ((max(70000.0 * self.corridor.car_scale, mass_used_now) / 1000.0) * (dx_win_m / 1000.0))
                     rho_E_leaf = min(1.35, max(0.0, 0.35 * nrE + 0.65 * (wh_tkm_win / 52.0)))
                     r_si_leaf = self._tchebycheff_scalars(
                         rho_T_leaf, nr2, rho_3_leaf, rho_E_leaf

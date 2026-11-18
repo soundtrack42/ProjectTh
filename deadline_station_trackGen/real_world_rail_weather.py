@@ -35,7 +35,12 @@ from railroad_corridor import (
     wind_speed_to_longitudinal_accel,
     wind_speed_series_to_accel_profile,
     _extract_wind_events,
+    train_size_config,
+    apply_tail_clearance,
+    tail_clearance_time_s,
+    CAR_LENGTH_M,
 )
+import railroad_corridor as _rc
 
 DIGITRAFFIC_HEADERS = {
     "Digitraffic-User": "ProjectTh-ATO-ContractShield-Research/1.0",
@@ -363,7 +368,7 @@ def _estimate_composition_mass(comp_data: dict | None, train_category: str) -> t
     """
     if not comp_data or not comp_data.get("journeySections"):
         raw_t = 122.0 if train_category == "Commuter" else 320.0
-        return 72000.0, raw_t, f"Default-{train_category} (~{raw_t:.0f}t)"
+        return 72000.0, raw_t, f"Default-{train_category} (~{raw_t:.0f}t)", 75.0
 
     sec = comp_data["journeySections"][0]
     total_len_m = float(sec.get("totalLength") or 75.0)
@@ -402,7 +407,7 @@ def _estimate_composition_mass(comp_data: dict | None, train_category: str) -> t
     # (so tare + [40..280] passengers stays cleanly inside the plant's [76t, 94t] envelope)
     norm_tare_kg = float(np.clip(70500.0 + (raw_tonnes / 500.0) * 5500.0, 70500.0, 76000.0))
     desc = f"{loco_label} ({total_len_m:.0f}m, Vmax={max_spd_kmh}km/h, RealTare={raw_tonnes:.0f}t)"
-    return norm_tare_kg, float(raw_tonnes), desc
+    return norm_tare_kg, float(raw_tonnes), desc, total_len_m
 
 
 def fetch_open_meteo_corridor_weather(
@@ -594,6 +599,7 @@ def build_directional_wind_acceleration_profile(
     seed: int = 42,
     regime_drag_mult: float = 1.0,
     is_harsh: bool = False,
+    car_scale: float = 1.0,
 ) -> tuple[np.ndarray, str, list[tuple[float, float, float]]]:
     """
     Builds the 0.5 s longitudinal wind disturbance profile (m/s^2) from Open-Meteo wind *speeds*
@@ -649,7 +655,8 @@ def build_directional_wind_acceleration_profile(
     w_head = np.clip(w_head + ou_smooth * open_line_gate, -MAX_WIND_SPEED_MPS, MAX_WIND_SPEED_MPS)
 
     w_profile = wind_speed_series_to_accel_profile(
-        w_head, w_head_sus, w_cross=w_cross, dt=dt, rho_ratio=rho_ratio, drag_mult=regime_drag_mult
+        w_head, w_head_sus, w_cross=w_cross, dt=dt, rho_ratio=rho_ratio, drag_mult=regime_drag_mult,
+        car_scale=car_scale,
     )
     event_meta, _ = _extract_wind_events(w_profile, dt, thresh=0.06)
 
@@ -803,7 +810,14 @@ def fetch_real_world_multi_station_scenario(
             })
             t0 += 360.0
 
-    norm_tare_kg, real_tare_tonnes, comp_desc = _estimate_composition_mass(comp_obj, train_cat)
+    norm_tare_kg, real_tare_tonnes, comp_desc, real_len_m = _estimate_composition_mass(comp_obj, train_cat)
+    # Train size: --train-cars N forces N cars; --train-cars 0 takes the real composition length.
+    if _rc.TRAIN_CARS is not None and _rc.TRAIN_CARS <= 0:
+        n_cars_eff, train_len_m, length_fx = train_size_config(max(1.0, real_len_m / CAR_LENGTH_M))
+    else:
+        n_cars_eff, train_len_m, length_fx = train_size_config()
+    s_car = n_cars_eff / 4.0
+    norm_tare_kg *= s_car
 
     # Peak-hour commuter loading prior based on departure hour
     first_hour = hops[0]["hour_utc"]
@@ -853,12 +867,16 @@ def fetch_real_world_multi_station_scenario(
         curr_tickets = int(np.clip(curr_passengers + missed_pax - untracked_pax, 30, 360))
 
         avg_pax_weight_kg = float(rng.normal(77.5, 5.5 if is_harsh_leg else 4.0))
-        leg_mass_kg = float(np.clip(norm_tare_kg + curr_passengers * avg_pax_weight_kg, 76000.0, 94000.0))
-        ticket_est_mass_kg = float(np.clip(norm_tare_kg + curr_tickets * 75.0, 74500.0, 96000.0))
+        pax_phys = int(round(curr_passengers * s_car))
+        tickets_phys = int(round(curr_tickets * s_car))
+        leg_mass_kg = float(np.clip(norm_tare_kg + pax_phys * avg_pax_weight_kg, 76000.0 * s_car, 94000.0 * s_car))
+        ticket_est_mass_kg = float(np.clip(norm_tare_kg + tickets_phys * 75.0, 74500.0 * s_car, 96000.0 * s_car))
+        if length_fx:
+            zones = apply_tail_clearance(zones, train_len_m)
 
         # Generate directional wind + turbulence profile
         raw_scaled_sched = hop["raw_sched_dur_s"] * (leg_len_m / max(500.0, curved_dist_m))
-        mass_adder = max(0.0, (leg_mass_kg - 85000.0) / 2200.0)
+        mass_adder = max(0.0, (leg_mass_kg / s_car - 85000.0) / 2200.0) + tail_clearance_time_s(zones, train_len_m)
         adhesion_adder = max(0.0, (0.90 - mu_adhesion) * 38.0)
 
         w_prof, w_desc, w_meta = build_directional_wind_acceleration_profile(
@@ -869,6 +887,7 @@ def fetch_real_world_multi_station_scenario(
             seed=seed * 31 + leg_idx,
             regime_drag_mult=drag_mult,
             is_harsh=is_harsh_leg,
+            car_scale=s_car,
         )
         mean_headwind = max(0.0, -float(np.mean(w_prof[: int(min_feas_s * 2.0)])))
         headwind_adder = mean_headwind * 22.0
@@ -904,9 +923,9 @@ def fetch_real_world_multi_station_scenario(
             deadline_s=leg_deadline_s,
             mass_kg=leg_mass_kg,
             ticket_estimated_mass_kg=ticket_est_mass_kg,
-            passengers=curr_passengers,
-            sold_tickets=curr_tickets,
-            max_capacity=360,
+            passengers=pax_phys,
+            sold_tickets=tickets_phys,
+            max_capacity=int(round(360 * s_car)),
             weather_condition=weather_name,
             adhesion_mu_factor=mu_adhesion,
             temp_celsius=temp_c,
@@ -917,6 +936,8 @@ def fetch_real_world_multi_station_scenario(
             sensor_noise_seed=int(seed * 101 + leg_idx * 17),
             is_extreme_scenario=bool(is_harsh_leg),
             speed_zones=zones,
+            n_cars=n_cars_eff,
+            train_length_m=train_len_m,
         )
 
         cum_x_m += leg_len_m
@@ -931,8 +952,8 @@ def fetch_real_world_multi_station_scenario(
             "deadline_s": leg_deadline_s,
             "budget_s": leg_budget_s,
             "dwell_s": dwell_s,
-            "passengers": curr_passengers,
-            "sold_tickets": curr_tickets,
+            "passengers": pax_phys,
+            "sold_tickets": tickets_phys,
             "n_join": n_join,
             "n_leave": n_leave,
             "mass_kg": leg_mass_kg,
