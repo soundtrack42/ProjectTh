@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import re
 import os
 import sys
 from pathlib import Path
@@ -417,15 +418,13 @@ def generate_empirical_figures(fig_dir: Path) -> None:
 
     specs = [
         ("1. Greedy", "MAX_SPEED_GREEDY", None, None, "steelblue", "--"),
-        ("2. Naive", "NAIVE_NO_OVERSHOOT", None, None, "darkorange", ":"),
-        ("3. Static", "STATIC_NO_WIND_REPLAN", None, None, "purple", "-."),
-        ("4. PPO Unsh", "RL_LEARNED", pol_cos, None, "seagreen", "--"),
-        ("5. Switch", "RL_LEARNED", pol_cos, "switch", "magenta", ":"),
-        ("6. 1-Step DCBF", "RL_LEARNED", pol_cos, "cbf_opt", "saddlebrown", "-."),
-        ("7. UCB-DMPS", "RL_LEARNED", pol_cos, "mps_rollout", "crimson", "-"),
-        ("8. NonCos Unsh", "RL_FREE_LEARNED", pol_free, None, "slategray", "--"),
-        ("9. NonCos UCB", "RL_FREE_LEARNED", pol_free, "mps_rollout", "teal", "-."),
-        ("10. Bilbao'25", "BILBAO_CBTC_ATO", None, None, "goldenrod", "-."),
+        ("2. PPO Unsh", "RL_LEARNED", pol_cos, None, "seagreen", "--"),
+        ("3. Switch", "RL_LEARNED", pol_cos, "switch", "magenta", ":"),
+        ("4. 1-Step DCBF", "RL_LEARNED", pol_cos, "cbf_opt", "saddlebrown", "-."),
+        ("5. UCB-DMPS", "RL_LEARNED", pol_cos, "mps_rollout", "crimson", "-"),
+        ("6. NonCos Unsh", "RL_FREE_LEARNED", pol_free, None, "slategray", "--"),
+        ("7. NonCos UCB", "RL_FREE_LEARNED", pol_free, "mps_rollout", "teal", "-."),
+        ("8. Bilbao'25", "BILBAO_CBTC_ATO", None, None, "goldenrod", "-."),
     ]
 
     trajs_base = {nm: evaluate_multi_station_journey(nm, sc_base, md, rl_policy=pl, shield_mode=sh, emulator=emu, record_traj=True) for nm, md, pl, sh, _, _ in specs}
@@ -440,9 +439,9 @@ def generate_empirical_figures(fig_dir: Path) -> None:
         ("Raw Open-Meteo Baseline (4 Stops, 16.15 km, Train #8311)", sc_base, trajs_base),
         ("Extreme Noise & Storm Slush (4 Stops, 15.60 km, mu_min=0.62)", sc_ext, trajs_ext),
     ]):
-        tr_sh = tr_map["7. UCB-DMPS"]["traj"]
-        tr_un = tr_map["4. PPO Unsh"]["traj"]
-        tr_bb = tr_map["10. Bilbao'25"]["traj"]
+        tr_sh = tr_map["5. UCB-DMPS"]["traj"]
+        tr_un = tr_map["2. PPO Unsh"]["traj"]
+        tr_bb = tr_map["8. Bilbao'25"]["traj"]
         x_sh = tr_sh["x"]
         xg_c, vc_g = _compute_scenario_ceil_grid(scen_obj)
 
@@ -484,15 +483,19 @@ def generate_empirical_figures(fig_dir: Path) -> None:
     plt.close(fig)
 
     # ------------------------------------------------------------------
-    # Appendix Full-Page Figure: 9-Panel Confrontation Across All 10 Methods
+    # Appendix Full-Page Figure: 9-Panel Confrontation Across All Methods
     # Reads actual exported CSVs in data/ for exact 30-run statistics!
     # ------------------------------------------------------------------
+    def _canon(name: str) -> str:
+        return re.sub(r"^\d+\.\s*", "", name)
+
     def _load_csv_means(*csv_paths: Path) -> dict[str, dict[str, float]]:
         grouped: dict[str, list[dict[str, str]]] = {}
         for csv_path in csv_paths:
             with open(csv_path, encoding="utf-8") as f:
                 for row in csv.DictReader(f):
-                    grouped.setdefault(row["method"], []).append(row)
+                    # Key by the name without its number, so CSVs written before a renumbering still match.
+                    grouped.setdefault(_canon(row["method"]), []).append(row)
         out: dict[str, dict[str, float]] = {}
         for m, rows in grouped.items():
             out[m] = {
@@ -514,23 +517,24 @@ def generate_empirical_figures(fig_dir: Path) -> None:
 
     full_method_keys = [
         "1. Max-Speed Greedy Cosine + MPC",
-        "2. Naive Pace (No Cruise Overshoot) + MPC",
-        "3. Static Plan (No Wind/Mass Replan) + MPC",
-        "4. Multi-Property PPO Pilot (Unshielded)",
-        "5. Contract-Shielded PPO (Switch MPS)",
-        "6. Contract-Shielded PPO (1-Step DCBF)",
-        "7. Contract-Shielded PPO (UCB-DMPS Cosine)",
-        "8. Stable-Accel PPO (No Cosine, Unshielded)",
-        "9. Stable-Accel PPO + Jerk-Horizon UCB-DMPS",
-        "10. Bilbao (2025) CBTC-ATO (RMBTP + PI)",
+        "2. Multi-Property PPO Pilot (Unshielded)",
+        "3. Contract-Shielded PPO (Switch MPS)",
+        "4. Contract-Shielded PPO (1-Step DCBF)",
+        "5. Contract-Shielded PPO (UCB-DMPS Cosine)",
+        "6. Stable-Accel PPO (No Cosine, Unshielded)",
+        "7. Stable-Accel PPO + Jerk-Horizon UCB-DMPS",
+        "8. Bilbao (2025) CBTC-ATO (RMBTP + PI)",
     ]
-    short_lbls = ["Greedy", "Naive", "Static", "PPO Unsh", "Switch", "DCBF", "UCB-Cos", "NonCos", "NonCos+UCB", "Bilbao'25"]
-    lit_short = {"11.": "Xiao'23", "12.": "Zhong'22", "13.": "CDQ'25", "14.": "S-SARSA'23",
-                 "15.": "EITOP'25", "16.": "SRL'23", "17.": "SSA-DRL'25"}
-    for k_lit in sorted((k for k in csv_real_b if k.split(" ")[0] in lit_short), key=lambda k: int(k.split(".")[0])):
-        if k_lit in csv_real_e and k_lit in csv_synth:
+    short_lbls = ["Greedy", "PPO Unsh", "Switch", "DCBF", "UCB-Cos", "NonCos", "NonCos+UCB", "Bilbao'25"]
+    full_method_keys = [_canon(k) for k in full_method_keys]
+    lit_short = [("Xiao (2023)", "Xiao'23"), ("Zhong (2022)", "Zhong'22"), ("Chen (2025)", "CDQ'25"),
+                 ("Zhao (2023)", "S-SARSA'23"), ("Huang (2025)", "EITOP'25"), ("Li (2023)", "SRL'23"),
+                 ("Zhao (2025)", "SSA-DRL'25")]
+    for prefix, lbl in lit_short:
+        k_lit = next((k for k in csv_real_b if k.startswith(prefix)), None)
+        if k_lit is not None and k_lit in csv_real_e and k_lit in csv_synth:
             full_method_keys.append(k_lit)
-            short_lbls.append(lit_short[k_lit.split(" ")[0]])
+            short_lbls.append(lbl)
     n_meth = len(full_method_keys)
 
     fig_a, ax_a = plt.subplots(3, 3, figsize=(16.5, 19.5), dpi=200)
@@ -538,13 +542,13 @@ def generate_empirical_figures(fig_dir: Path) -> None:
     for nm, _, _, _, col, ls in specs:
         r = trajs_base[nm]
         ax_a[0, 0].plot(r["traj"]["x"], r["traj"]["v"], color=col, ls=ls, lw=1.35, label=nm)
-    ax_a[0, 0].set_title("1. Speed Trajectories v(x) — All 10 Methods (Real #8311)", fontweight="bold", fontsize=10.5)
+    ax_a[0, 0].set_title("1. Speed Trajectories v(x) — All Methods (Real #8311)", fontweight="bold", fontsize=10.5)
     ax_a[0, 0].set_xlabel("Position x (m)")
     ax_a[0, 0].set_ylabel("Speed (m/s)")
     ax_a[0, 0].legend(fontsize=6.3, ncol=2, loc="lower left")
     ax_a[0, 0].grid(True, alpha=0.28)
 
-    tr_dmps = trajs_base["7. UCB-DMPS"]["traj"]
+    tr_dmps = trajs_base["5. UCB-DMPS"]["traj"]
     ax_a[0, 1].plot(tr_dmps["t"], tr_dmps["accel"], color="crimson", lw=1.3, label="Accel a(t) [d=2]")
     ax_a[0, 1].plot(tr_dmps["t"], tr_dmps["jerk"], color="teal", alpha=0.65, lw=1.0, label="Jerk j(t) [d=3]")
     ax_a[0, 1].axhline(-0.92, color="darkorange", ls=":", label="Comfort Brake (-0.92)")
@@ -601,7 +605,7 @@ def generate_empirical_figures(fig_dir: Path) -> None:
     ax_lat.bar(xp - bw, m_lat, bw, color="teal", label="Mean Total (Real Ext)")
     ax_lat.bar(xp, p_lat, bw, color="darkorange", label="P99 Total (Real Ext)")
     ax_lat.bar(xp + bw, mx_e, bw, color="purple", alpha=0.78, label="Max (Real Ext)")
-    ax_lat.axhline(400.0, color="red", ls="--", lw=1.4, label="400 us target (methods 4-9)")
+    ax_lat.axhline(400.0, color="red", ls="--", lw=1.4, label="400 us target (methods 2-7)")
     ax_lat.set_yscale("log")
     ax_lat.set_title("9. Step Inference Latency (us, log scale)", fontweight="bold", fontsize=10.5)
     ax_lat.set_ylabel("Microseconds")
@@ -632,7 +636,7 @@ def generate_empirical_figures(fig_dir: Path) -> None:
         ax_d[0, c_i].legend(fontsize=6.8, ncol=2, loc="lower left")
         ax_d[0, c_i].grid(True, alpha=0.28)
 
-        tr7 = tmap["7. UCB-DMPS"]["traj"]
+        tr7 = tmap["5. UCB-DMPS"]["traj"]
         ax_d[1, c_i].plot(tr7["x"], tr7["wind_true"], color="navy", lw=1.4, label="Wind d_wind (m/s^2)")
         ax_d[1, c_i].plot(tr7["x"], tr7["wind_hat"], color="dodgerblue", ls=":", lw=1.3, label="DOB d_hat")
         ax_d[1, c_i].plot(tr7["x"], tr7["u_act"], color="crimson", alpha=0.75, lw=1.1, label="u_act (UCB-DMPS)")
