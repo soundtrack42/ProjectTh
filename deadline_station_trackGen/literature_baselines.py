@@ -148,48 +148,114 @@ def solve_qp_admm(P, q, A, l, u, iters: int = 2000, rho: float = 0.1, sigma: flo
     return x * D
 
 
-def solve_qp_ipm(P, q, C, d, G, h, iters: int = 40, tol: float = 1e-7):
+def solve_qp_ipm(P, q, C, d, G, h, lb=None, ub=None, iters: int = 30, tol: float = 1e-6,
+                 budget_s: float | None = None, deadline: float | None = None):
     """Dense primal-dual interior-point QP solver (Mehrotra predictor-corrector):
-    min 0.5 x'Px + q'x  s.t.  C x = d,  G x <= h."""
-    n, me, mi = P.shape[0], C.shape[0], G.shape[0]
-    x = np.zeros(n)
-    s = np.maximum(1.0, h - G @ x)
-    z = np.ones(mi)
+        min 0.5 x'Px + q'x   s.t.  C x = d,  G x <= h,  lb <= x <= ub.
+    Simple bounds are kept as diagonal barrier terms (never as dense rows), so each iteration costs one
+    (n+me) symmetric KKT factorisation reused for predictor and corrector.  With `budget_s` the solver is
+    anytime: it stops at the wall-clock budget and returns its last (interior) iterate.  Returns (x, converged)."""
+    t_end = deadline if deadline is not None else (None if budget_s is None else time.perf_counter() + budget_s)
+    n, me = P.shape[0], C.shape[0]
+    lb = np.full(n, -np.inf) if lb is None else lb
+    ub = np.full(n, np.inf) if ub is None else ub
+    iu = np.flatnonzero(np.isfinite(ub)); il = np.flatnonzero(np.isfinite(lb))
+    mg, mu_n, ml = G.shape[0], len(iu), len(il)
+    m = mg + mu_n + ml
+    hf = np.concatenate([h, ub[iu], -lb[il]])
+
+    def Gx(v):
+        return np.concatenate([G @ v, v[iu], -v[il]])
+
+    def GTz(w):
+        r = G.T @ w[:mg]
+        r[iu] += w[mg:mg + mu_n]                  # bound indices are unique: plain fancy-index update
+        r[il] -= w[mg + mu_n:]
+        return r
+
+    # Row equilibration of the general inequalities / equalities (unit inf-norm rows):
+    gn = np.maximum(1e-12, np.max(np.abs(G), axis=1)) if mg else np.ones(0)
+    G = G / gn[:, None]; h = h / gn
+    cn = np.maximum(1e-12, np.max(np.abs(C), axis=1)) if me else np.ones(0)
+    C = C / cn[:, None]; d = d / cn
+    hf = np.concatenate([h, ub[iu], -lb[il]])
+    K = np.zeros((n + me, n + me))
+    K[n:, :n] = C
+    K[:n, n:] = C.T
+    # Mehrotra/CVXOPT starting point: least-squares solution of the KKT system with unit barrier weights,
+    # then slacks and duals shifted into the strictly positive orthant.
+    H0 = P + G.T @ G
+    H0[iu, iu] += 1.0
+    H0[il, il] += 1.0
+    K[:n, :n] = H0
+    try:
+        sol0 = np.linalg.solve(K + 1e-9 * np.eye(n + me), np.concatenate([-q + GTz(hf), d]))
+        x = sol0[:n]
+    except np.linalg.LinAlgError:
+        x = np.zeros(n)
+    r0 = hf - Gx(x)
+    s = r0.copy()
+    z = -r0.copy()
+    a_p = -np.min(s); a_d = -np.min(z)
+    s = s + max(0.0, a_p) + 1.0 if a_p >= -1e-8 else s
+    z = z + max(0.0, a_d) + 1.0 if a_d >= -1e-8 else z
+    s = np.maximum(s, 1e-3); z = np.maximum(z, 1e-3)
     y = np.zeros(me)
+    best = x.copy()
+    converged = False
+    scale = 1.0 + max(np.max(np.abs(q)), 1.0)
+    mu0 = max(1.0, float(s @ z) / m)
     for _ in range(iters):
-        r_d = P @ x + q + G.T @ z + C.T @ y
+        r_d = P @ x + q + GTz(z) + C.T @ y
         r_e = C @ x - d
-        r_i = G @ x + s - h
-        mu = float(s @ z) / mi
-        if mu < tol and np.max(np.abs(r_e), initial=0.0) < 1e-6 and np.max(np.abs(r_i)) < 1e-6 \
-                and np.max(np.abs(r_d)) < 1e-6:
+        r_i = Gx(x) + s - hf
+        mu = float(s @ z) / m
+        res = max(np.max(np.abs(r_e), initial=0.0), np.max(np.abs(r_i)), np.max(np.abs(r_d)) / scale)
+        if mu < tol * mu0 and res < 1e-6 * (1.0 + np.max(np.abs(hf))):
+            converged = True
+            break
+        if t_end is not None and time.perf_counter() > t_end:
+            # Escape: accept the iterate only if it is already converged to a looser tolerance.
+            converged = bool(mu < 1e-3 * mu0 and res < 1e-4 * (1.0 + np.max(np.abs(hf))))
             break
         W = z / s
-        H = P + G.T @ (W[:, None] * G)
-        KKT = np.block([[H, C.T], [C, np.zeros((me, me))]])
-        KKT[:n, :n] += 1e-10 * np.eye(n)
-        KKT_inv = np.linalg.inv(KKT)
+        H = P + G.T @ (W[:mg, None] * G)
+        H[iu, iu] += W[mg:mg + mu_n]
+        H[il, il] += W[mg + mu_n:]
+        K[:n, :n] = H
+        K[np.arange(n), np.arange(n)] += 1e-9
+        try:
+            lu = np.linalg.inv(K)
+        except np.linalg.LinAlgError:
+            break
 
         def newton(r_cent):
-            rhs = np.concatenate([-r_d + G.T @ (r_cent / s - W * r_i), -r_e])
-            sol = KKT_inv @ rhs
+            rhs = np.concatenate([-r_d + GTz(r_cent / s - W * r_i), -r_e])
+            sol = lu @ rhs
             dx = sol[:n]
-            ds = -r_i - G @ dx
+            ds = -r_i - Gx(dx)
             dz = (-r_cent - z * ds) / s
             return dx, sol[n:], ds, dz
 
         def max_step(v, dv):
-            neg = dv < 0
-            return min(1.0, float(np.min(-v[neg] / dv[neg]))) if np.any(neg) else 1.0
+            return min(1.0, float((-v / np.minimum(dv, -1e-12)).min()))
 
-        dx, dy, ds, dz = newton(s * z)                                   # affine (predictor) step
+        dx, dy, ds, dz = newton(s * z)
         a_aff = min(max_step(s, ds), max_step(z, dz))
-        mu_aff = float((s + a_aff * ds) @ (z + a_aff * dz)) / mi
+        mu_aff = float((s + a_aff * ds) @ (z + a_aff * dz)) / m
         sigma = (mu_aff / max(1e-16, mu)) ** 3
-        dx, dy, ds, dz = newton(s * z + ds * dz - sigma * mu)          # combined (corrector) step
+        dx, dy, ds, dz = newton(s * z + ds * dz - sigma * mu)
         a = 0.99 * min(max_step(s, ds), max_step(z, dz))
-        x += a * dx; y += a * dy; s += a * ds; z += a * dz
-    return x
+        xn = x + a * dx
+        if not np.all(np.isfinite(xn)):
+            break
+        x = xn; y = y + a * dy; s = s + a * ds; z = z + a * dz
+        best = x
+    return best, converged
+
+
+class PlannerTimeout(Exception):
+    """Raised when a planner call reaches its wall-clock escape deadline before the QP solve starts."""
 
 
 class _QPBuilder:
@@ -200,8 +266,13 @@ class _QPBuilder:
         self.rows, self.lo, self.hi = [], [], []
         self.P = np.zeros((n, n))
         self.q = np.zeros(n)
+        self.lb = np.full(n, -np.inf)
+        self.ub = np.full(n, np.inf)
+        self.converged = True
+        self.dyn = []
 
-    def row(self, coeffs: dict, lo: float, hi: float) -> None:
+    def row(self, coeffs: dict, lo: float, hi: float, dyn: bool = False) -> None:
+        self.dyn.append(dyn)
         r = np.zeros(self.n)
         for j, c in coeffs.items():
             r[j] += c
@@ -210,17 +281,54 @@ class _QPBuilder:
         self.hi.append(hi)
 
     def box(self, j: int, lo: float, hi: float) -> None:
-        self.row({j: 1.0}, lo, hi)
+        self.lb[j] = max(self.lb[j], lo)
+        self.ub[j] = min(self.ub[j], hi)
 
-    def solve(self) -> np.ndarray:
+    def solve(self, states=None, iters: int = 30, budget_s: float | None = None,
+              deadline: float | None = None) -> np.ndarray:
+        """Solve the QP.  With `states`, the equality rows flagged `dyn=True` (one per state variable) are used
+        to condense the states out (x_S = affine(x_U)), as in condensed MPC: the KKT system then only involves
+        the inputs, and state bounds become general inequality rows."""
         A = np.array(self.rows)
         lo, hi = np.array(self.lo), np.array(self.hi)
+        n = self.n
+        P = self.P + 1e-6 * np.eye(n)
+        q = self.q
+        lb, ub = self.lb, np.maximum(self.ub, self.lb)
+        if states is None:
+            T, t0 = np.eye(n), np.zeros(n)
+            keep = np.ones(len(lo), bool)
+            lb_u, ub_u = lb, ub
+            extra_G = np.zeros((0, n)); extra_h = np.zeros(0)
+        else:
+            S = np.asarray(states)
+            U = np.setdiff1d(np.arange(n), S)
+            dyn = np.array(self.dyn, bool)
+            Ad, bd = A[dyn], lo[dyn]
+            inv_SS = np.linalg.inv(Ad[:, S])
+            T = np.zeros((n, len(U))); t0 = np.zeros(n)
+            T[U, np.arange(len(U))] = 1.0
+            T[S] = -inv_SS @ Ad[:, U]
+            t0[S] = inv_SS @ bd
+            keep = ~dyn
+            lb_u, ub_u = lb[U], ub[U]
+            TS, tS = T[S], t0[S]
+            fu, fl = np.isfinite(ub[S]), np.isfinite(lb[S])
+            extra_G = np.vstack([TS[fu], -TS[fl]])
+            extra_h = np.concatenate([ub[S][fu] - tS[fu], -(lb[S][fl] - tS[fl])])
+        A, lo, hi = A[keep] @ T, lo[keep] - A[keep] @ t0, hi[keep] - A[keep] @ t0
         eq = np.abs(hi - lo) < 1e-12
         up = (~eq) & np.isfinite(hi)
         dn = (~eq) & np.isfinite(lo)
-        G = np.vstack([A[up], -A[dn]])
-        h = np.concatenate([hi[up], -lo[dn]])
-        return solve_qp_ipm(self.P + 1e-6 * np.eye(self.n), self.q, A[eq], lo[eq], G, h)
+        G = np.vstack([A[up], -A[dn], extra_G])
+        h = np.concatenate([hi[up], -lo[dn], extra_h])
+        Pu = T.T @ P @ T
+        qu = T.T @ (P @ t0 + q)
+        if deadline is not None and time.perf_counter() >= deadline:
+            raise PlannerTimeout()
+        u, self.converged = solve_qp_ipm(Pu, qu, A[eq], lo[eq], G, h, lb_u, ub_u, iters=iters, budget_s=budget_s,
+                                         deadline=deadline)
+        return T @ u + t0
 
 
 def _plan_physics(env):
@@ -251,22 +359,26 @@ def _lookahead_target(xs: np.ndarray, vs: np.ndarray, x: float, v: float, horizo
 # 11. Xiao et al. (2023): space-domain convex shrinking-horizon eco-driving MPC (RTI QP per macro step)
 # ===========================================================================
 class XiaoConvexSHMPCPilot:
-    name = "11. Xiao (2023) Convex SHMPC Eco-Driving"
+    name = "9. Xiao (2023) Convex SHMPC Eco-Driving"
 
-    def __init__(self, n_seg: int = 30, w_late: float = 60.0, w_jerk: float = 40.0, t_reserve: float = 12.0,
-                 n_rti: int = 1):
+    def __init__(self, n_seg: int = 30, w_late: float = 60.0, w_jerk: float = 40.0, t_reserve: float = 14.0,
+                 n_rti: int = 1, budget_s: float = 2.5e-3):
         self.t_reserve = t_reserve
         self.n_rti = n_rti
         self.n_seg = n_seg
         self.w_late = w_late
         self.w_jerk = w_jerk
+        self.budget_s = budget_s
         self.prev = None
+        self._last_ok = False
+        self.calls = 0
+        self.escapes = 0
 
     def reset_leg(self, env) -> None:
         self.prev = None
         env.pilot_filter = None
 
-    def _solve_once(self, env, s_nodes, v_lin, v0, T_rem):
+    def _solve_once(self, env, s_nodes, v_lin, v0, T_rem, deadline=None):
         cor = env.corridor
         ph, m_eff, rho_air = _plan_physics(env)
         N = self.n_seg
@@ -274,14 +386,15 @@ class XiaoConvexSHMPCPilot:
         # Variables: E_0..E_N | Fp_0..Fp_{N-1} | Fb_0..Fb_{N-1} | late slack
         iE, iP, iB, iS = 0, N + 1, 2 * N + 1, 3 * N + 1
         qp = _QPBuilder(3 * N + 2)
-        qp.row({iE: 1.0}, 0.5 * v0 * v0, 0.5 * v0 * v0)
+        qp.row({iE: 1.0}, 0.5 * v0 * v0, 0.5 * v0 * v0, dyn=True)
         qp.row({iE + N: 1.0}, 0.0, 0.0)
         for i in range(1, N + 1):
             vl = cor.get_speed_limit(min(cor.station_x_m, s_nodes[i])) - 0.25
             # speed limit + RTI trust region around the linearisation point
             lo_v = max(0.0, v_lin[i] - 2.5)
             hi_v = min(vl, v_lin[i] + 2.5)
-            qp.box(iE + i, 0.5 * lo_v * lo_v if i < N else 0.0, 0.5 * max(hi_v, lo_v + 0.1) ** 2)
+            if i < N:                                # E_N is pinned by the terminal equality
+                qp.box(iE + i, 0.5 * lo_v * lo_v, 0.5 * max(hi_v, lo_v + 0.1) ** 2)
         time_row = {}
         time_rhs = max(1.0, T_rem - self.t_reserve)
         for i in range(N):
@@ -289,7 +402,7 @@ class XiaoConvexSHMPCPilot:
             v_mid = max(1.0, 0.5 * (v_lin[i] + v_lin[i + 1]))
             c0, c1 = _resistance_lin(ph, m_eff, rho_air, x_mid, v_mid, env.d_hat)
             qp.row({iE + i + 1: 1.0 + 0.5 * ds * c1, iE + i: -1.0 + 0.5 * ds * c1, iP + i: -ds, iB + i: ds},
-                   -ds * c0, -ds * c0)
+                   -ds * c0, -ds * c0, dyn=True)
             a_tr = ph.max_traction_accel * (1.0 if v_mid <= 14.0 else 14.0 / v_mid)
             qp.box(iP + i, 0.0, min(cor.comfort_accel_max, a_tr))
             # Final approach is executed by the shared cosine landing (mean decel 2/pi * b_land):
@@ -310,10 +423,12 @@ class XiaoConvexSHMPCPilot:
         qp.row(time_row, -np.inf, time_rhs)
         qp.box(iS, 0.0, np.inf)
         qp.q[iS] = self.w_late
-        sol = qp.solve()
+        sol = qp.solve(states=np.arange(iE, iE + N + 1), deadline=deadline)
+        self._last_ok = qp.converged
         return sol, iE, iP
 
     def act(self, env, obs) -> np.ndarray:
+        t_end = time.perf_counter() + self.budget_s      # hard escape for the whole call (build + solve)
         cor = env.corridor
         x0, v0 = env.x_curr, max(0.0, env.v_meas)
         S = cor.station_x_m - x0
@@ -330,9 +445,24 @@ class XiaoConvexSHMPCPilot:
             n_iter = 4                               # converge the first plan of the leg
         v_lin = np.maximum(1.0, v_lin)
         v_lin[0] = max(1.0, v0)
-        for _ in range(n_iter):
-            sol, iE, iP = self._solve_once(env, s_nodes, v_lin, v0, T_rem)
+        self.calls += 1
+        sol = None
+        for it in range(n_iter):
+            if it > 0 and t_end - time.perf_counter() < 5e-4:
+                break
+            try:
+                sol_it, iE, iP = self._solve_once(env, s_nodes, v_lin, v0, T_rem, deadline=t_end)
+            except (np.linalg.LinAlgError, PlannerTimeout):
+                break
+            if not self._last_ok:                    # unfinished solve at the escape deadline: discard it
+                break
+            sol = sol_it
             v_lin = np.sqrt(2.0 * np.maximum(0.0, sol[iE:iE + N + 1]))
+        if sol is None:                              # escape / numerical failure: keep flying the previous plan
+            self.escapes += 1
+            if self.prev is None:
+                return encode_action(env, naive_pace(env))
+            return encode_action(env, _lookahead_target(self.prev[0], self.prev[1], x0, v0))
         v_plan = v_lin
         self.prev = (s_nodes, v_plan)
         v_tgt = _lookahead_target(s_nodes, v_plan, x0, v0)
@@ -369,10 +499,12 @@ def _flipped_lgr(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 class ZhongPseudospectralMPCPilot:
-    name = "12. Zhong (2022) Pseudospectral MPC (Energy/Time)"
+    name = "10. Zhong (2022) Pseudospectral MPC (Energy/Time)"
 
-    def __init__(self, horizon_m: float = 1600.0, n_col: int = 5, w_jerk: float = 30.0, t_reserve: float = 8.0):
+    def __init__(self, horizon_m: float = 1600.0, n_col: int = 5, w_jerk: float = 30.0, t_reserve: float = 12.0,
+                 budget_s: float = 2.5e-3):
         self.t_reserve = t_reserve
+        self.budget_s = budget_s
         self.horizon_m = horizon_m
         self.n_col = n_col
         self.tau, self.w, self.D = _flipped_lgr(n_col)
@@ -380,6 +512,7 @@ class ZhongPseudospectralMPCPilot:
         self.prev = None
         self.time_mode_steps = 0
         self.steps = 0
+        self.escapes = 0
 
     def reset_leg(self, env) -> None:
         self.prev = None
@@ -390,6 +523,7 @@ class ZhongPseudospectralMPCPilot:
         return [(cuts[i], cuts[i + 1]) for i in range(len(cuts) - 1)]
 
     def act(self, env, obs) -> np.ndarray:
+        t_end = time.perf_counter() + self.budget_s      # hard escape for the whole call (build + solve)
         cor = env.corridor
         x0, v0 = env.x_curr, max(0.0, env.v_meas)
         x_rem = cor.station_x_m - x0
@@ -425,8 +559,8 @@ class ZhongPseudospectralMPCPilot:
             v_lin = np.maximum(1.0, np.interp(s_sup, self.prev[0], self.prev[1]))
         else:
             v_lin = np.maximum(1.0, np.minimum([cor.get_speed_limit(s) for s in s_sup], max(3.0, v_feas)))
-        qp.row({iE: 1.0}, 0.5 * v0 * v0, 0.5 * v0 * v0)
-        for k in range(1, n_sup):
+        qp.row({iE: 1.0}, 0.5 * v0 * v0, 0.5 * v0 * v0, dyn=True)
+        for k in range(1, n_sup - (1 if reaches_station else 0)):   # the terminal state is pinned when reached
             vl = cor.get_speed_limit(min(cor.station_x_m, s_sup[k] - 1e-3)) - 0.25
             qp.box(iE + k, 0.0, 0.5 * vl * vl)
         if reaches_station:
@@ -447,7 +581,7 @@ class ZhongPseudospectralMPCPilot:
                 coeffs[iE + si] = coeffs.get(iE + si, 0.0) + c1
                 coeffs[iP + ci] = -1.0
                 coeffs[iB + ci] = 1.0
-                qp.row(coeffs, -c0, -c0)
+                qp.row(coeffs, -c0, -c0, dyn=True)
                 a_tr = ph.max_traction_accel * (1.0 if v_lin[si] <= 14.0 else 14.0 / v_lin[si])
                 qp.box(iP + ci, 0.0, min(cor.comfort_accel_max, a_tr))
                 qp.box(iB + ci, 0.0, cor.comfort_braking_max if s_sup[si] < cor.station_x_m - 250.0 else 0.5)
@@ -468,7 +602,15 @@ class ZhongPseudospectralMPCPilot:
         qp.row({**time_row, iS: -1.0}, -np.inf, max(1.0, T_alloc))
         qp.box(iS, 0.0, np.inf)
         qp.q[iS] = 60.0
-        sol = qp.solve()
+        try:
+            sol = qp.solve(states=np.arange(iE, iE + n_sup), deadline=t_end)
+            if not qp.converged:                       # unfinished solve at the escape deadline: discard it
+                raise PlannerTimeout()
+        except (np.linalg.LinAlgError, PlannerTimeout):
+            self.escapes += 1                  # numerical failure: keep flying the previous plan
+            if self.prev is None:
+                return encode_action(env, naive_pace(env))
+            return encode_action(env, _lookahead_target(self.prev[0], self.prev[1], x0, v0))
         v_plan = np.sqrt(2.0 * np.maximum(0.0, sol[iE:iE + n_sup]))
         self.prev = (s_sup, v_plan)
         v_tgt = _lookahead_target(s_sup, v_plan, x0, v0)
@@ -528,7 +670,7 @@ class _TabularPilotBase:
 
 class CDQPilot(_TabularPilotBase):
     """Chen et al. (2025): distributional (quantile) Q-learning with CVaR_alpha action selection."""
-    name = "13. Chen (2025) CVaR Distributional Q (CDQ)"
+    name = "11. Chen (2025) CVaR Distributional Q (CDQ)"
 
     def __init__(self, n_q: int = 21, cvar_alpha: float = 0.25, seed: int = 0):
         super().__init__(seed)
@@ -565,7 +707,7 @@ class CDQPilot(_TabularPilotBase):
 
 class ShieldSARSAPilot(_TabularPilotBase):
     """Zhao et al. (2023): on-policy SARSA with a hard overspeed shield (action replaced before execution)."""
-    name = "14. Zhao (2023) Shield SARSA"
+    name = "12. Zhao (2023) Shield SARSA"
 
     def __init__(self, seed: int = 0):
         super().__init__(seed)
@@ -867,9 +1009,9 @@ LIT_METHOD_NAMES = [
     ZhongPseudospectralMPCPilot.name,
     CDQPilot.name,
     ShieldSARSAPilot.name,
-    "15. Huang (2025) EITOP (Expert + PPO + DMTD)",
-    "16. Li (2023) SRL-IETTO (ARTSOM + DDPG)",
-    "17. Zhao (2025) SSA-DRL (Shield + Tree + DRL)",
+    "13. Huang (2025) EITOP (Expert + PPO + DMTD)",
+    "14. Li (2023) SRL-IETTO (ARTSOM + DDPG)",
+    "15. Zhao (2025) SSA-DRL (Shield + Tree + DRL)",
 ]
 
 

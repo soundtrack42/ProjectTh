@@ -60,6 +60,15 @@ from goodall_trajectory_shield import (
 # ===========================================================================
 # 1. Multi-Station RL Environment with Regenerative Energy & Derivative Pressures
 # ===========================================================================
+
+# Departure mass-ID approaches (both kept, selected by the 2nd anemometer position):
+#   > 0  : second wayside anemometer at the platform end (m from the stop). The station-territory wind is
+#          steady and measured by both sensors; the mass window runs until the train passes it. 10 m
+#          fits even very short stations (15 m is slightly more accurate where the platform allows).
+#   0    : station-only approach. Only the station anemometer, fixed 8-step (4 s) window; open-line
+#          gusts may start after 4 s.
+STATION_ANEMOMETER2_X_M = 10.0
+
 class MPCTransitionRailroadEnv:
     def __init__(
         self,
@@ -139,6 +148,7 @@ class MPCTransitionRailroadEnv:
             if self.traj_shield is not None:
                 self.traj_shield.corridor = corridor_override
 
+        self.anem2_x_m = float(getattr(self.corridor, "station_anemometer2_x_m", STATION_ANEMOMETER2_X_M))
         if wind_profile is not None:
             self.wind_profile = np.asarray(wind_profile, dtype=np.float64).copy()
         else:
@@ -146,8 +156,8 @@ class MPCTransitionRailroadEnv:
 
         # At station standstill (wheel brakes locked), read station wayside telemetry:
         # turnstile ticket prior mass, rail adhesion sensor, temperature, and anemometer.
-        # Dynamic weight is identified in closed form from the first 8 steps (k_elapsed < 8, station
-        # weather telemetry window), solved once at step 8, then locked for the rest of the leg.
+        # Dynamic weight is identified in closed form over the station territory: from departure until the
+        # train passes the 2nd anemometer at x = anem2_x_m (at least 8 steps), solved once, then locked.
         self.mass_hat_kg = float(getattr(self.corridor, "ticket_estimated_mass_kg", 85000.0))
         self.mass_prior_kg = self.mass_hat_kg
         self.mass_locked = False
@@ -202,7 +212,7 @@ class MPCTransitionRailroadEnv:
         self, f_net_n: float, g_spec: float, wind_gate: bool, v_next_meas: float
     ) -> None:
         """
-        Station-window (k = 0..7) force balance, closed in the two unknowns theta = 1000 / M_eff and the
+        Station-territory (k = 0 .. passing the 2nd anemometer) force balance, closed in the two unknowns theta = 1000 / M_eff and the
         station wind d. The weather fixes every other term: traction force from adhesion mu (mass
         independent, M_eff * a_max(M) = 1.08 * 85 t * a_base * mu), Davis drag scaled by air density
         rho(T_amb), CWR-thermal curve resistance, and the anemometer prior on d. Telescoping
@@ -702,7 +712,8 @@ class MPCTransitionRailroadEnv:
             f_curve_true = self.true_physics.curve_resistance(self.x_curr) * cwr_thermal_factor
             a_true_nom = (f_prop_true - f_drag_true - f_grade_true - f_curve_true) / self.true_physics.M_eff
 
-            k_w = min(self.k_elapsed, len(self.wind_profile) - 1)
+            # Station territory (x < 2nd anemometer): sheltered platform wind, measured by both sensors.
+            k_w = 0 if self.x_curr < self.anem2_x_m else min(self.k_elapsed, len(self.wind_profile) - 1)
             d_ext = float(self.wind_profile[k_w]) if (self.v_curr > 1e-3 or u_clamped > 1e-3) else 0.0
 
             inertia_mom = 0.14 * (self.v_curr - self.v_prev)
@@ -720,7 +731,7 @@ class MPCTransitionRailroadEnv:
                 v_next_meas = v_next
             inertia_mom_meas = 0.14 * (self.v_meas - self.v_meas_prev)
 
-            # Dynamic weight identification (k = 0..7, station weather window) and open-line DOB:
+            # Dynamic weight identification (station territory up to the 2nd anemometer) and open-line DOB:
             self.d_hat_prev = self.d_hat
             a_meas_no_mom = ((v_next_meas - self.v_meas) - inertia_mom_meas) / self.corridor.dt
             a_meas_obs = (v_next_meas - self.v_meas) / self.corridor.dt
@@ -730,8 +741,8 @@ class MPCTransitionRailroadEnv:
             f_grade_est = self.physics.grade_resistance(self.x_curr)
             f_curve_est = self.physics.curve_resistance(self.x_curr) * cwr_thermal_factor
 
-            if self.k_elapsed < 8:
-                # Station weather telemetry is available ONLY in this departure window (k = 0..7):
+            if self.k_elapsed < 8 or not self.mass_locked:
+                # Station weather telemetry (station + 2nd anemometer) is available ONLY in station territory:
                 self.d_hat = self.d_standstill
                 if not self.mass_locked:
                     self._accumulate_departure_mass_step(
@@ -740,8 +751,8 @@ class MPCTransitionRailroadEnv:
                         (self.v_meas > 1e-3) or (u_clamped > 1e-3),
                         v_next_meas,
                     )
-                    if self.k_elapsed == 7:
-                        # Dynamic weight computed once at step 8, then locked for the rest of the leg:
+                    if self.k_elapsed >= 7 and x_next >= self.anem2_x_m:
+                        # Dynamic weight computed once when the train passes the 2nd anemometer, then locked:
                         self.mass_hat_kg, d_post = self._solve_departure_mass_kg()
                         self._sync_physics_and_mpc(use_estimated_mass=True, reset_shaper=False)
                         self.mass_locked = True
@@ -1018,7 +1029,8 @@ class MPCTransitionRailroadEnv:
             f_curve_true = self.true_physics.curve_resistance(self.x_curr) * cwr_thermal_factor
             a_true_nom = (f_prop_true - f_drag_true - f_grade_true - f_curve_true) / self.true_physics.M_eff
 
-            k_w = min(self.k_elapsed, len(self.wind_profile) - 1)
+            # Station territory (x < 2nd anemometer): sheltered platform wind, measured by both sensors.
+            k_w = 0 if self.x_curr < self.anem2_x_m else min(self.k_elapsed, len(self.wind_profile) - 1)
             d_ext = float(self.wind_profile[k_w]) if (self.v_curr > 1e-3 or u_clamped > 1e-3) else 0.0
 
             inertia_mom = 0.14 * (self.v_curr - self.v_prev)
@@ -1473,9 +1485,6 @@ def evaluate_multi_station_journey(
             eco_governor=eco_governor,
         )
         obs = env.reset(corridor_override=cor_leg, wind_profile=wind_prof)
-        # True Static Plan: computed at t=0 assuming nominal 85t mass, dry rails, and zero wind:
-        v_naive_0 = cor_leg.station_x_m / max(1.0, cor_leg.deadline_s - cor_leg.start_time_s)
-        v_static_target = v_naive_0 + 1.05  # Fixed nominal schedule offset (does not adapt to leg zones/wind/mass)
         bilbao_ctrl = BilbaoCBTCATOController(cor_leg, env.physics) if mode == "BILBAO_CBTC_ATO" else None
         if mode == "LIT_PILOT":
             lit_pilot.reset_leg(env)
@@ -1511,17 +1520,6 @@ def evaluate_multi_station_journey(
                 act_buf[0], act_buf[1], act_buf[2] = a0_greedy, 1.0, 1.0
                 act = act_buf
                 mpc_gain = 0.95
-            elif mode == "NAIVE_NO_OVERSHOOT":
-                act_buf[0], act_buf[1], act_buf[2] = 0.0, 0.0, 0.0
-                act = act_buf
-                mpc_gain = 0.95
-            elif mode == "STATIC_NO_WIND_REPLAN":
-                v_naive_now = max(0.0, env.corridor.station_x_m - env.x_curr) / max(0.5, env.corridor.deadline_s - env.t_curr)
-                as_raw = (v_static_target - v_naive_now) / 3.80
-                a0_stat = -1.0 if as_raw < -1.0 else (1.0 if as_raw > 1.0 else as_raw)
-                act_buf[0], act_buf[1], act_buf[2] = a0_stat, 0.0, 0.0
-                act = act_buf
-                mpc_gain = 0.0
             else:
                 raise ValueError(f"Unknown mode: {mode}")
             t_pol_1 = time.thread_time()
@@ -2012,6 +2010,7 @@ def _print_spike_profiler(dmps_runs: list[dict], subset_label: str) -> None:
 
 
 def main():
+    global STATION_ANEMOMETER2_X_M
     ap = argparse.ArgumentParser(description="Multi-Property PPO + Hierarchical Contract Shielding (3-Station ~16.5 km)")
     ap.add_argument("--epochs", type=int, default=220, help="PPO training epochs (logarithmic convergence around ~180-220)")
     ap.add_argument("--eval-runs", type=int, default=30, help="Number of 3-station multi-km test scenarios")
@@ -2042,7 +2041,7 @@ def main():
     ap.add_argument(
         "--no-literature",
         action="store_true",
-        help="Skip literature baselines 11-17 (docs/RelatedWork_Survey.tex)",
+        help="Skip literature baselines 9-15 (docs/RelatedWork_Survey.tex)",
     )
     ap.add_argument(
         "--data-dir",
@@ -2050,7 +2049,15 @@ def main():
         default="data",
         help="Directory to store separated baseline vs extreme-scenario datasets (JSON + CSV)",
     )
+    ap.add_argument(
+        "--anemometer2-x-m",
+        type=float,
+        default=STATION_ANEMOMETER2_X_M,
+        help="Departure mass-ID approach: position (m) of the 2nd platform-end anemometer; the window runs until "
+        "the train passes it. 0 = station-only approach (station anemometer, fixed 8-step window).",
+    )
     args = ap.parse_args()
+    STATION_ANEMOMETER2_X_M = float(args.anemometer2_x_m)
 
     if args.harsh_weather is not None:
         harsh_mode_eff = "raw" if args.harsh_weather == "none" else args.harsh_weather
@@ -2157,20 +2164,18 @@ def main():
 
     method_specs = [
         ("1. Max-Speed Greedy Cosine + MPC", "MAX_SPEED_GREEDY", None),
-        ("2. Naive Pace (No Cruise Overshoot) + MPC", "NAIVE_NO_OVERSHOOT", None),
-        ("3. Static Plan (No Wind/Mass Replan) + MPC", "STATIC_NO_WIND_REPLAN", None),
-        ("4. Multi-Property PPO Pilot (Unshielded)", "RL_LEARNED", None),
-        ("5. Contract-Shielded PPO (Switch MPS)", "RL_LEARNED", "switch"),
-        ("6. Contract-Shielded PPO (1-Step DCBF)", "RL_LEARNED", "cbf_opt"),
-        ("7. Contract-Shielded PPO (UCB-DMPS Cosine)", "RL_LEARNED", "mps_rollout"),
-        ("8. Stable-Accel PPO (No Cosine, Unshielded)", "RL_FREE_LEARNED", None),
-        ("9. Stable-Accel PPO + Jerk-Horizon UCB-DMPS", "RL_FREE_LEARNED", "mps_rollout"),
-        ("10. Bilbao (2025) CBTC-ATO (RMBTP + PI)", "BILBAO_CBTC_ATO", None),
+        ("2. Multi-Property PPO Pilot (Unshielded)", "RL_LEARNED", None),
+        ("3. Contract-Shielded PPO (Switch MPS)", "RL_LEARNED", "switch"),
+        ("4. Contract-Shielded PPO (1-Step DCBF)", "RL_LEARNED", "cbf_opt"),
+        ("5. Contract-Shielded PPO (UCB-DMPS Cosine)", "RL_LEARNED", "mps_rollout"),
+        ("6. Stable-Accel PPO (No Cosine, Unshielded)", "RL_FREE_LEARNED", None),
+        ("7. Stable-Accel PPO + Jerk-Horizon UCB-DMPS", "RL_FREE_LEARNED", "mps_rollout"),
+        ("8. Bilbao (2025) CBTC-ATO (RMBTP + PI)", "BILBAO_CBTC_ATO", None),
     ]
     lit_factories = {}
     if not args.no_literature:
         from literature_baselines import load_literature_pilots
-        print("\n=== 2c. Loading Literature Baselines 11-17 (RelatedWork_Survey.tex) ===", flush=True)
+        print("\n=== 2c. Loading Literature Baselines 9-15 (RelatedWork_Survey.tex) ===", flush=True)
         lit_factories = load_literature_pilots(emulator, train_if_missing=True)
         method_specs.extend((nm, "LIT_PILOT", None) for nm in lit_factories)
 
@@ -2291,7 +2296,7 @@ def main():
         )
         print("-" * 168)
         for ep_i in idxs[:10]:
-            r_d = agg_results["7. Contract-Shielded PPO (UCB-DMPS Cosine)"][ep_i]
+            r_d = agg_results["5. Contract-Shielded PPO (UCB-DMPS Cosine)"][ep_i]
             scen_i = scenarios_list[ep_i]
             max_w = max((float(np.max(np.abs(l["wind_profile"]))) for l in scen_i["legs"]), default=0.0)
             min_mu = min((float(l["adhesion_mu"]) for l in scen_i["legs"]), default=1.0)
@@ -2402,18 +2407,18 @@ def main():
                 f"{c_m:10.4f} | {e_m:8.2f} Wh/tk | {s_m:9.4f} | {sh_m:6.1f}% | {eco_m:5.1f}% | "
                 f"{mpc_us:6.1f} us | {tot_us:5.1f}/{p99_us:5.1f}/{max_us:6.1f} us"
             )
-        mass_runs = [r for r in agg_results["7. Contract-Shielded PPO (UCB-DMPS Cosine)"] if filter_fn(r)]
+        mass_runs = [r for r in agg_results["5. Contract-Shielded PPO (UCB-DMPS Cosine)"] if filter_fn(r)]
         m_err = [e for r in mass_runs for e in r.get("mass_abs_err_kg", [])]
         m_pri = [e for r in mass_runs for e in r.get("mass_prior_abs_err_kg", [])]
         if m_err:
             print(
-                f"  Departure mass ID (closed-form, k=0..7, {len(m_err)} legs): MAE={np.mean(m_err):.1f} kg "
+                f"  Departure mass ID (closed-form, {'stop..2nd anemometer @ %g m' % STATION_ANEMOMETER2_X_M if STATION_ANEMOMETER2_X_M > 0 else 'station-only, 8 steps'}, {len(m_err)} legs): MAE={np.mean(m_err):.1f} kg "
                 f"(max {np.max(m_err):.1f}) vs ticket prior MAE={np.mean(m_pri):.1f} kg (max {np.max(m_pri):.1f})"
             )
         print("=" * 168, flush=True)
 
     # Diagnostic Profiler & Scissor Diagnostics separated for Baseline vs Extreme Scenarios
-    dmps_runs = agg_results["7. Contract-Shielded PPO (UCB-DMPS Cosine)"]
+    dmps_runs = agg_results["5. Contract-Shielded PPO (UCB-DMPS Cosine)"]
     dmps_base = [dmps_runs[i] for i in baseline_indices]
     dmps_ext = [dmps_runs[i] for i in extreme_indices]
     if dmps_base:
@@ -2432,8 +2437,8 @@ def main():
     save_dual_axis_wind_trajectory_shield_plot(
         scenario=plot_base_scen,
         run_nominal_no_wind=plot_base_nw,
-        run_unshielded_wind=plot_base_trajs["4. Multi-Property PPO Pilot (Unshielded)"],
-        run_shielded_wind=plot_base_trajs["7. Contract-Shielded PPO (UCB-DMPS Cosine)"],
+        run_unshielded_wind=plot_base_trajs["2. Multi-Property PPO Pilot (Unshielded)"],
+        run_shielded_wind=plot_base_trajs["5. Contract-Shielded PPO (UCB-DMPS Cosine)"],
         out_path=str(dual_plot_out_path),
         tag_label=base_tag,
     )
@@ -2442,27 +2447,25 @@ def main():
         save_dual_axis_wind_trajectory_shield_plot(
             scenario=sample_ext_scenario,
             run_nominal_no_wind=sample_ext_no_wind,
-            run_unshielded_wind=sample_ext_trajs["4. Multi-Property PPO Pilot (Unshielded)"],
-            run_shielded_wind=sample_ext_trajs["7. Contract-Shielded PPO (UCB-DMPS Cosine)"],
+            run_unshielded_wind=sample_ext_trajs["2. Multi-Property PPO Pilot (Unshielded)"],
+            run_shielded_wind=sample_ext_trajs["5. Contract-Shielded PPO (UCB-DMPS Cosine)"],
             out_path=ext_dual_path,
             tag_label="EXTREME NOISE",
         )
 
     # ---------------- 6-Panel Benchmark-Relevant Trajectory & Multi-Stat Figure ----------------
     sample_plot_trajs = plot_base_trajs
-    tr_dmps = sample_plot_trajs["7. Contract-Shielded PPO (UCB-DMPS Cosine)"]["traj"]
+    tr_dmps = sample_plot_trajs["5. Contract-Shielded PPO (UCB-DMPS Cosine)"]["traj"]
     fig, axes = plt.subplots(2, 3, figsize=(18.5, 10.0))
     plot_names = [
         "1. Max-Speed Greedy Cosine + MPC",
-        "2. Naive Pace (No Cruise Overshoot) + MPC",
-        "3. Static Plan (No Wind/Mass Replan) + MPC",
-        "10. Bilbao (2025) CBTC-ATO (RMBTP + PI)",
-        "4. Multi-Property PPO Pilot (Unshielded)",
-        "7. Contract-Shielded PPO (UCB-DMPS Cosine)",
-        "9. Stable-Accel PPO + Jerk-Horizon UCB-DMPS",
+        "8. Bilbao (2025) CBTC-ATO (RMBTP + PI)",
+        "2. Multi-Property PPO Pilot (Unshielded)",
+        "5. Contract-Shielded PPO (UCB-DMPS Cosine)",
+        "7. Stable-Accel PPO + Jerk-Horizon UCB-DMPS",
     ]
-    cols = ["steelblue", "darkorange", "purple", "goldenrod", "seagreen", "crimson", "teal"]
-    lss = ["--", ":", "-.", "-.", "--", "-", "-."]
+    cols = ["steelblue", "goldenrod", "seagreen", "crimson", "teal"]
+    lss = ["--", "-.", "--", "-", "-."]
 
     # Panel 1: Multi-Station Speed Trajectories v(x)
     for name, c, ls in zip(plot_names, cols, lss):
@@ -2500,7 +2503,7 @@ def main():
     axes[0, 2].grid(True, alpha=0.3)
 
     short_labels = [
-        "Greedy", "Naive", "Static", "PPO Unsh", "PPO+Sw",
+        "Greedy", "PPO Unsh", "PPO+Sw",
         "PPO+DCBF", "PPO+DMPS", "Stab Unsh", "Stab+DMPS", "Bilbao'25",
         "Xiao'23", "Zhong'22", "CDQ'25", "S-SARSA'23", "EITOP'25", "SRL'23", "SSA-DRL'25",
     ][: len(method_specs)]
