@@ -8,3 +8,5 @@ __pycache__/
 CHANGES.md
 *.pt
 *.tex
+*.pdf
+*.npz

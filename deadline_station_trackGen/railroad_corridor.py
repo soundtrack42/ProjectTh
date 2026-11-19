@@ -57,6 +57,8 @@ class RailroadCorridor:
     unmodeled_drag_factor: float = 1.0   # Plant-only aerodynamic/rolling drag multiplier
     sensor_noise_seed: int = 0           # Deterministic RNG seed for sensor noise per leg
     is_extreme_scenario: bool = False    # Tag separating extreme noise-injected scenarios
+    n_cars: float = 4.0                  # Consist size (4 = calibrated reference unit)
+    train_length_m: float = 0.0          # >0: distributed-mass train (grade averaging); 0 = point mass
 
     # Base physical & comfort bounds at nominal 85,000 kg mass (m/s^2)
     base_max_traction_accel: float = 1.85
@@ -74,15 +76,22 @@ class RailroadCorridor:
     ])
 
     @property
+    def car_scale(self) -> float:
+        """n_cars / 4: traction, mass and rolling resistance scale with the number of (motor) cars."""
+        return float(self.n_cars) / 4.0
+
+    @property
     def max_traction_accel(self) -> float:
         """Physical traction limit scaled by vehicle mass and rail adhesion."""
-        mass_scale = 85000.0 / max(65000.0, self.mass_kg)
+        s = self.car_scale
+        mass_scale = (85000.0 * s) / max(65000.0 * s, self.mass_kg)
         return float(self.base_max_traction_accel * mass_scale * self.adhesion_mu_factor)
 
     @property
     def max_service_braking(self) -> float:
         """Physical service braking limit scaled by vehicle mass and rail adhesion."""
-        mass_scale = 85000.0 / max(65000.0, self.mass_kg)
+        s = self.car_scale
+        mass_scale = (85000.0 * s) / max(65000.0 * s, self.mass_kg)
         return float(self.base_max_service_braking * mass_scale * self.adhesion_mu_factor)
 
     def get_speed_limit(self, x_m: float) -> float:
@@ -218,6 +227,46 @@ WIND_REF_CRUISE_MPS = 15.0
 WIND_REF_M_EFF_KG = 85000.0 * 1.08
 WIND_YAW_SIDE_DRAG_K = 0.15
 MAX_WIND_SPEED_MPS = 30.0
+AERO_NOSE_TAIL_FRACTION = 0.5     # must match NonlinearTrainPhysics.AERO_NOSE_TAIL_FRACTION
+CAR_LENGTH_M = 18.75              # 75 m four-car unit
+
+# Train-size switch. None = the calibrated 4-car point-mass plant used for the paper benchmark.
+# A number N enables the distributed-length model with N cars (CLI --train-cars N); 0 = use the real
+# Digitraffic composition length on real-data journeys (synthetic journeys then use 4 cars).
+TRAIN_CARS: float | None = None
+
+
+def train_size_config(n_cars: float | None = None) -> tuple[float, float, bool]:
+    """Returns (n_cars, length_m, length_effects) for the current switch."""
+    n = TRAIN_CARS if n_cars is None else n_cars
+    if n is None:
+        return 4.0, 0.0, False
+    n = 4.0 if n <= 0 else float(n)
+    return n, n * CAR_LENGTH_M, True
+
+
+def tail_clearance_time_s(zones: list, length_m: float) -> float:
+    """Extra minimum running time from holding each lower limit for one train length longer."""
+    if length_m <= 0.0:
+        return 0.0
+    return float(sum(length_m * (1.0 / zones[i].v_limit_mps - 1.0 / zones[i + 1].v_limit_mps)
+                     for i in range(len(zones) - 1) if zones[i + 1].v_limit_mps > zones[i].v_limit_mps))
+
+
+def apply_tail_clearance(zones: list, length_m: float) -> list:
+    """
+    A speed restriction holds until the tail has cleared it: every boundary where the limit rises is
+    moved forward by the train length (the head position is the reference everywhere else).
+    """
+    if length_m <= 0.0:
+        return zones
+    zs = [SpeedLimitZone(z.x_start, z.x_end, z.v_limit_mps, z.label) for z in zones]
+    for i in range(len(zs) - 1):
+        if zs[i + 1].v_limit_mps > zs[i].v_limit_mps:
+            b_new = min(zs[i].x_end + length_m, zs[i + 1].x_end - 1.0)
+            zs[i].x_end = b_new
+            zs[i + 1].x_start = b_new
+    return zs
 STATION_WINDOW_STEPS = 8          # k = 0..7 (t < 4.0 s): wayside station weather telemetry available
 STATION_WINDOW_S = 4.0
 
@@ -228,14 +277,21 @@ def wind_speed_to_longitudinal_accel(
     v_ref_mps: float = WIND_REF_CRUISE_MPS,
     rho_ratio: float = 1.0,
     drag_mult: float = 1.0,
+    car_scale: float = 1.0,
 ):
-    """Longitudinal disturbance (m/s^2, <0 = retarding) from the head- (+) / tail- (-) wind component."""
+    """
+    Longitudinal disturbance (m/s^2, <0 = retarding) from the head- (+) / tail- (-) wind component.
+    car_scale = n_cars/4: head/tail drag grows only through the skin-friction share of A, the crosswind
+    (side-area) term grows with length, and the effective mass grows with the consist.
+    """
     w_h = np.clip(np.asarray(w_head_mps, dtype=np.float64), -MAX_WIND_SPEED_MPS, MAX_WIND_SPEED_MPS)
     w_c = np.clip(np.abs(np.asarray(w_cross_mps, dtype=np.float64)), 0.0, MAX_WIND_SPEED_MPS)
     v_rel = v_ref_mps + w_h
-    f_long = AERO_DAVIS_A_NS2_M2 * (v_rel * np.abs(v_rel) - v_ref_mps * v_ref_mps)
-    f_side = WIND_YAW_SIDE_DRAG_K * AERO_DAVIS_A_NS2_M2 * (w_c * w_c)
-    d = -(f_long + f_side) * float(rho_ratio) * float(drag_mult) / WIND_REF_M_EFF_KG
+    s = float(car_scale)
+    a_long = AERO_DAVIS_A_NS2_M2 * (AERO_NOSE_TAIL_FRACTION + (1.0 - AERO_NOSE_TAIL_FRACTION) * s)
+    f_long = a_long * (v_rel * np.abs(v_rel) - v_ref_mps * v_ref_mps)
+    f_side = WIND_YAW_SIDE_DRAG_K * AERO_DAVIS_A_NS2_M2 * s * (w_c * w_c)
+    d = -(f_long + f_side) * float(rho_ratio) * float(drag_mult) / (WIND_REF_M_EFF_KG * s)
     return float(d) if np.ndim(d) == 0 else d
 
 
@@ -246,6 +302,7 @@ def wind_speed_series_to_accel_profile(
     dt: float = 0.50,
     rho_ratio: float = 1.0,
     drag_mult: float = 1.0,
+    car_scale: float = 1.0,
 ) -> np.ndarray:
     """
     Maps a head-wind speed series (m/s) to the plant disturbance profile (m/s^2):
@@ -254,8 +311,8 @@ def wind_speed_series_to_accel_profile(
     """
     n = len(w_head_series)
     t_grid = np.arange(n, dtype=np.float64) * dt
-    d_station = wind_speed_to_longitudinal_accel(w_head_station, w_cross, 0.0, rho_ratio, drag_mult)
-    d_open = wind_speed_to_longitudinal_accel(w_head_series, w_cross, WIND_REF_CRUISE_MPS, rho_ratio, drag_mult)
+    d_station = wind_speed_to_longitudinal_accel(w_head_station, w_cross, 0.0, rho_ratio, drag_mult, car_scale)
+    d_open = wind_speed_to_longitudinal_accel(w_head_series, w_cross, WIND_REF_CRUISE_MPS, rho_ratio, drag_mult, car_scale)
     gate = np.clip((t_grid - STATION_WINDOW_S) / 6.0, 0.0, 1.0)
     prof = (1.0 - gate) * d_station + gate * d_open
     prof[:STATION_WINDOW_STEPS] = d_station
@@ -396,6 +453,7 @@ def generate_multi_station_scenario(
     wind_mode: str = "disjoint",
     allow_infeasible_breaks: bool = True,
     extreme_noise: bool = False,
+    n_cars: float | None = None,
 ) -> dict:
     """
     Generates a generalized Multi-Station Railway Journey with:
@@ -408,7 +466,10 @@ def generate_multi_station_scenario(
     if n_legs is None or n_legs <= 0:
         n_legs = int(rng.integers(1, 6))
 
-    tare_mass_kg = 72000.0
+    n_cars_eff, train_len_m, length_fx = train_size_config(n_cars)
+    s_car = n_cars_eff / 4.0
+    # Passenger flows are drawn for the 4-car reference (same RNG stream for every size) and scaled by s_car.
+    tare_mass_kg = 72000.0 * s_car
     max_train_capacity = 360
     curr_passengers = int(rng.integers(110, 190))
     curr_tickets = int(np.clip(curr_passengers + rng.integers(-18, 22), 40, max_train_capacity))
@@ -445,8 +506,12 @@ def generate_multi_station_scenario(
         curr_tickets = int(np.clip(curr_passengers + missed_train_pax - untracked_pass_holders, 30, max_train_capacity))
 
         avg_pax_weight_kg = float(rng.normal(82.0 if leg_idx == 2 else 75.5, 4.5))
-        leg_mass_kg = float(tare_mass_kg + curr_passengers * avg_pax_weight_kg)
-        ticket_est_mass_kg = float(tare_mass_kg + curr_tickets * 75.0)
+        pax_phys = int(round(curr_passengers * s_car))
+        tickets_phys = int(round(curr_tickets * s_car))
+        leg_mass_kg = float(tare_mass_kg + pax_phys * avg_pax_weight_kg)
+        ticket_est_mass_kg = float(tare_mass_kg + tickets_phys * 75.0)
+        if length_fx:
+            zones = apply_tail_clearance(zones, train_len_m)
 
         if leg_idx == 0:
             is_scenario_weather = (wind_mode != "none") and (
@@ -470,7 +535,7 @@ def generate_multi_station_scenario(
             else:
                 weather_name, mu_adhesion, temp_c = "Heat-Thermal", 0.94, 38.0
 
-        mass_time_adder = max(0.0, (leg_mass_kg - 85000.0) / 2200.0) + (4.0 if mu_adhesion < 0.85 else 0.0)
+        mass_time_adder = max(0.0, (leg_mass_kg / s_car - 85000.0) / 2200.0) + (4.0 if mu_adhesion < 0.85 else 0.0)
         eff_min_feas_s = min_feas_s + mass_time_adder
 
         # Stress-test leg (tight but physically solvable within +1.5s if shield coordinates speed & ramps)
@@ -480,7 +545,9 @@ def generate_multi_station_scenario(
         else:
             leg_budget_s = float(np.round((eff_min_feas_s + rng.uniform(16.0, 42.0)) * 2.0) / 2.0)
 
-        leg_deadline_s = t_clock + leg_budget_s
+        # Tail-clearance running time is added after the budget so every train size draws the same journeys.
+        tail_s = float(np.round(tail_clearance_time_s(zones, train_len_m) * 2.0) / 2.0)
+        leg_deadline_s = t_clock + leg_budget_s + tail_s
         dwell_s = 25.0 if leg_idx < n_legs - 1 else 0.0
 
         drag_mult_reg = {0: 1.00, 1: 1.15, 2: 1.12, 3: 1.20, 4: 1.05}.get(w_type, 1.0)
@@ -528,7 +595,8 @@ def generate_multi_station_scenario(
                 weather_name = "Storm-Gale"
 
         w_prof = wind_speed_series_to_accel_profile(
-            w_head, w_head_station, w_cross=w_cross_leg, dt=0.50, rho_ratio=rho_ratio_leg, drag_mult=drag_mult_reg
+            w_head, w_head_station, w_cross=w_cross_leg, dt=0.50, rho_ratio=rho_ratio_leg, drag_mult=drag_mult_reg,
+            car_scale=s_car,
         )
         w_meta, ev_desc = _extract_wind_events(w_prof, 0.50)
         if extreme_noise:
@@ -550,9 +618,9 @@ def generate_multi_station_scenario(
             deadline_s=leg_deadline_s,
             mass_kg=leg_mass_kg,
             ticket_estimated_mass_kg=ticket_est_mass_kg,
-            passengers=curr_passengers,
-            sold_tickets=curr_tickets,
-            max_capacity=max_train_capacity,
+            passengers=pax_phys,
+            sold_tickets=tickets_phys,
+            max_capacity=int(round(max_train_capacity * s_car)),
             weather_condition=weather_name,
             adhesion_mu_factor=mu_adhesion,
             temp_celsius=temp_c,
@@ -563,6 +631,8 @@ def generate_multi_station_scenario(
             sensor_noise_seed=int(seed * 101 + leg_idx * 17),
             is_extreme_scenario=bool(extreme_noise),
             speed_zones=zones,
+            n_cars=n_cars_eff,
+            train_length_m=train_len_m,
         )
 
         cum_x_m += leg_len_m
@@ -574,10 +644,10 @@ def generate_multi_station_scenario(
             "cum_station_x_m": cum_x_m,
             "t_start": t_clock,
             "deadline_s": leg_deadline_s,
-            "budget_s": leg_budget_s,
+            "budget_s": leg_budget_s + tail_s,
             "dwell_s": dwell_s,
-            "passengers": curr_passengers,
-            "sold_tickets": curr_tickets,
+            "passengers": pax_phys,
+            "sold_tickets": tickets_phys,
             "n_join": n_join,
             "n_leave": n_leave,
             "mass_kg": leg_mass_kg,
