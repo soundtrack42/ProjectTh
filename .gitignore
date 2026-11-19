@@ -10,3 +10,4 @@ CHANGES.md
 *.tex
 *.pdf
 *.npz
+external/
