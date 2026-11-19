@@ -1360,6 +1360,27 @@ class CosineTrajectoryRLPolicy(nn.Module):
         return logp, entropy, values
 
 
+class NumpyActorPilot:
+    """Deterministic pilot exported from MASA-Safe-RL (masa_rail/pilot_masa.py): tanh-MLP actor with a
+    linear mean head, clipped to [-1, 1]; same 18 features and 3 actions as CosineTrajectoryRLPolicy."""
+
+    def __init__(self, path: str):
+        w = np.load(path)
+        n = len([k for k in w.files if k.startswith("W")])
+        self.layers = [(np.asarray(w[f"W{i}"], np.float32), np.asarray(w[f"b{i}"], np.float32)) for i in range(n)]
+
+    def eval(self):
+        return self
+
+    def get_action_and_value(self, obs, deterministic: bool = True):
+        h = np.asarray(obs, dtype=np.float32)
+        for i, (wi, bi) in enumerate(self.layers):
+            h = h @ wi + bi
+            if i < len(self.layers) - 1:
+                h = np.tanh(h)
+        return np.clip(h, -1.0, 1.0).astype(np.float32), 0.0, 0.0
+
+
 def train_pure_ppo_cosine_pilot(
     base_corridor: RailroadCorridor,
     emulator: LearnedLinearizationModel,
@@ -2199,6 +2220,10 @@ def main():
         "the train passes it. 0 = station-only approach (station anemometer, fixed 8-step window).",
     )
     ap.add_argument("--coast", action="store_true", help="Enable pre-landing coasting (punctuality-guarded) for methods 2-7")
+    ap.add_argument("--pilot-npz", type=str, default="",
+                    help="Cosine pilot exported from MASA (e.g. checkpoints/trpo_cosine_pilot.npz); overrides --load-checkpoint's pilot")
+    ap.add_argument("--free-pilot-npz", type=str, default="",
+                    help="No-cosine pilot exported from MASA (methods 6-7); overrides --free-checkpoint")
     ap.add_argument("--free-checkpoint", type=str, default="best_ppo_free_pilot.pt",
                     help="Checkpoint of the no-cosine PPO pilot (methods 6-7)")
     ap.add_argument("--a-start-center", type=float, default=OUR_A_START_CENTER,
@@ -2317,6 +2342,13 @@ def main():
             base_corridor, emulator=emulator, epochs=args.epochs, wind_mode=args.wind_mode,
             seed=args.seed + 100, checkpoint_prefix="ppo_free_pilot", use_cosine_shaper=False
         )
+
+    if args.pilot_npz:
+        print(f"=== 2d. Cosine pilot from MASA export '{args.pilot_npz}' ===", flush=True)
+        rl_policy = NumpyActorPilot(_resolve_ckpt(args.pilot_npz))
+    if args.free_pilot_npz:
+        print(f"=== 2e. No-cosine pilot from MASA export '{args.free_pilot_npz}' ===", flush=True)
+        rl_policy_free = NumpyActorPilot(_resolve_ckpt(args.free_pilot_npz))
 
     method_specs = [
         ("1. Max-Speed Greedy Cosine + MPC", "MAX_SPEED_GREEDY", None),

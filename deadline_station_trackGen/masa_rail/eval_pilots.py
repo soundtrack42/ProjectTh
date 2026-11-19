@@ -2,7 +2,8 @@
 Pilot selection on the tuning journeys (seeds 5000 + 29k; disjoint from training, validation and the
 held-out benchmark seeds 9000 + 29k). Each pilot runs as method 2 (unshielded) and method 5 (UCB-DMPS).
 
-    python eval_pilots.py PILOT OUT_JSON [CORE]
+    python eval_pilots.py PILOT OUT_JSON [free]
+`free` evaluates a no-cosine pilot as methods 6 (unshielded) and 7 (UCB-DMPS).
 PILOT is a MASA export (*.npz, deterministic tanh-MLP actor) or our PPO checkpoint (*.pt).
 """
 from __future__ import annotations
@@ -55,8 +56,8 @@ def load_pilot(path: str):
 
 def main():
     path, out = sys.argv[1], sys.argv[2]
-    if len(sys.argv) > 3:
-        os.sched_setaffinity(0, {int(sys.argv[3])})
+    free = len(sys.argv) > 3 and sys.argv[3] == "free"
+    mode = "RL_FREE_LEARNED" if free else "RL_LEARNED"
     emu = D.LearnedLinearizationModel(hidden_dim=64)
     emu.load_state_dict(torch.load("checkpoints/best_emulator.pt", map_location="cpu"))
     emu.eval()
@@ -65,8 +66,9 @@ def main():
                                              allow_infeasible_breaks=(ep > 0), extreme_noise=(ep % 2 == 1))
              for ep in range(N_TUNING)]
     res = {"pilot": path}
-    for name, sh in (("m2_unshielded", None), ("m5_ucb_dmps", "mps_rollout")):
-        rs = [D.evaluate_multi_station_journey(name, sc, "RL_LEARNED", rl_policy=pilot, shield_mode=sh, emulator=emu)
+    names = ("m6_unshielded", "m7_ucb_dmps") if free else ("m2_unshielded", "m5_ucb_dmps")
+    for name, sh in zip(names, (None, "mps_rollout")):
+        rs = [D.evaluate_multi_station_journey(name, sc, mode, rl_policy=pilot, shield_mode=sh, emulator=emu)
               for sc in scens]
         g = lambda k: float(np.mean([r[k] for r in rs]))
         res[name] = dict(loss=g("multi_obj_score"), T=g("abs_sched_err_s"), stop=g("abs_stop_err_m"),

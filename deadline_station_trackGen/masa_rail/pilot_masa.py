@@ -3,8 +3,9 @@ Pilot-learner study: train our cosine pilot with every MASA-Safe-RL algorithm th
 interface (18 continuous features, 3 continuous actions in [-1, 1]) and export the best checkpoint.
 
 Same protocol as `train_pure_ppo_cosine_pilot` (our PPO):
-  * training journeys: 220 epochs x 3 generated journeys (seed*1000 + epoch*53 + b*17, b = 2 extreme),
-    consumed in the same order; budget = the same 660 journeys;
+  * training journeys: 400 epochs x 3 generated journeys (seed*1000 + epoch*53 + b*17, b = 2 extreme),
+    consumed in the same order; budget = the same 1,200 journeys; seeds 42, 7, 2024 as for our pilots
+    (the seed sets the journeys, the validation set and the learner initialisation);
   * reward = env reward / 20, gamma = 0.996;
   * checkpoint selection: every 15 journeys (= 5 epochs), deterministic LossScore on the same 6
     validation journeys (seeds 70000+), lowest kept.
@@ -12,12 +13,19 @@ Everything else is MASA's default configuration for the algorithm. The constrain
 TRPOLag, CPO) receive a per-step cost = 1 when any 0.5 s substep violates the benchmark's comfort/safety
 pressures (rho_1 > 1.02, rho_2 > 1.02 or rho_3 > 1.05), with a budget of `--cost-limit` per leg.
 
+Shield-in-the-loop variant (--shield-train): every training leg runs under UCB-DMPS (the benchmark's
+shield, same configuration, one UCB state per journey), the reward loses --interv-penalty for each macro
+step the shield overrides, and the checkpoint is the lowest shielded validation LossScore among those whose
+validation shield rate is <= --max-val-shield % (default 5, half the 10% target; a barely trained pilot
+rescued by the shield must not be selected). All checkpoints are kept in <tag>_ckpts.npz.
+
     python pilot_masa.py --algo TRPO --out DIR
 Writes DIR/<algo>_pilot.npz (actor MLP weights) and DIR/<algo>_history.json.
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -61,8 +69,8 @@ jax.config.update("jax_enable_x64", False)
 PILOT_ALGOS = ["PPO", "A2C", "TRPO", "PPOLag", "TRPOLag", "CPO"]
 YAML_FILE = {"PPO": "ppo.yaml", "A2C": "a2c.yaml", "TRPO": "TRPO.yaml", "PPOLag": "PPOLag.yaml",
              "TRPOLag": "TRPOLag.yaml", "CPO": "CPO.yaml"}
-EPOCHS, JOURNEYS_PER_EPOCH, VAL_EVERY_EPOCHS = 220, 3, 5
-TRAIN_SEED = 42
+EPOCHS, JOURNEYS_PER_EPOCH, VAL_EVERY_EPOCHS = 400, 3, 5   # our pilots: 400 epochs (1,200 journeys)
+TRAIN_SEED = 42                                           # overridden by --seed
 GAMMA = 0.996
 CHUNK_FRAMES = 2048
 
@@ -79,11 +87,15 @@ class RailPilotEnv(gym.Env):
     Legs are served from the fixed training-journey stream. A reset while a leg is still running is a
     no-op, so MASA's train() restarts (one per chunk) do not skip journeys."""
 
-    def __init__(self, emu, journeys=None):
+    def __init__(self, emu, journeys=None, cosine: bool = True, shield: bool = False, penalty: float = 0.0):
+        self._emu, self._cosine, self._shield, self._penalty = emu, cosine, shield, float(penalty)
+        self._ucb: dict = {}
+        self.interventions = 0
+        self.macro_steps = 0
         self.observation_space = spaces.Box(-np.inf, np.inf, (18,), np.float32)
         self.action_space = spaces.Box(-1.0, 1.0, (3,), np.float32)
         self.env = D.MPCTransitionRailroadEnv(corridor=RailroadCorridor(), traj_shield=None, emulator=emu,
-                                              use_cosine_shaper=True)
+                                              use_cosine_shaper=cosine)
         self.env.a_start_center = 0.96
         self.env.coast_enabled = False
         self._journeys = journeys          # None = training stream
@@ -106,6 +118,7 @@ class RailPilotEnv(gym.Env):
                 scen = self._journeys[self._j % len(self._journeys)]
             self._j += 1
             self.journeys_started += 1
+            self._ucb = {}                 # UCB contract statistics persist within a journey, as in the benchmark
             self._legs = list(scen["legs"])
         return self._legs.pop(0)
 
@@ -113,7 +126,11 @@ class RailPilotEnv(gym.Env):
         if self._in_leg:
             return self._obs, {}
         leg = self._next_leg()
-        self._obs = self.env.reset(corridor_override=leg["corridor"], wind_profile=leg["wind_profile"]).astype(np.float32)
+        cor = leg["corridor"]
+        if self._shield:
+            cor = copy.deepcopy(cor)
+            self.env = make_leg_env(self._emu, cor, self._cosine, self._ucb)
+        self._obs = self.env.reset(corridor_override=cor, wind_profile=leg["wind_profile"]).astype(np.float32)
         self._in_leg = True
         self.violation = False
         return self._obs, {}
@@ -124,11 +141,27 @@ class RailPilotEnv(gym.Env):
         self._obs = obs.astype(np.float32)
         if done:
             self._in_leg = False
-        return self._obs, float(rew) / 20.0, bool(done), False, {}
+        r = float(rew) / 20.0
+        if self._shield:
+            hit = any(m.get("shield_intervened", False) for m in info["micro_logs"])
+            self.interventions += int(hit)
+            self.macro_steps += 1
+            r -= self._penalty * float(hit)
+        return self._obs, r, bool(done), False, {}
 
 
-def build(emu, cost_limit: float):
-    inner = RailPilotEnv(emu)
+def make_leg_env(emu, cor, cosine: bool, ucb_state: dict | None):
+    """One leg exactly as evaluate_multi_station_journey builds it for UCB-DMPS (methods 5 / 7)."""
+    sh = D.GoodallTrajectoryShield(cor, emu, D.TrajectoryShieldConfig(mode="mps_rollout"), ucb_state=ucb_state) \
+        if ucb_state is not None else None
+    env = D.MPCTransitionRailroadEnv(corridor=cor, traj_shield=sh, emulator=emu, use_cosine_shaper=cosine)
+    env.a_start_center = 0.96
+    env.coast_enabled = False
+    return env
+
+
+def build(emu, cost_limit: float, cosine: bool = True, shield: bool = False, penalty: float = 0.0):
+    inner = RailPilotEnv(emu, cosine=cosine, shield=shield, penalty=penalty)
     env = TimeLimit(inner, 5000)
     env = LabelledEnv(env, inner.label_fn)
     env = CumulativeCostEnv(env, cost_fn=lambda labels: 1.0 if "unsafe" in labels else 0.0, budget=cost_limit)
@@ -173,17 +206,27 @@ class NumpyPilot:
         return np.clip(h, -1.0, 1.0).astype(np.float32), 0.0, 0.0
 
 
-def val_loss_score(env: D.MPCTransitionRailroadEnv, pilot, val_scens) -> dict:
-    """Identical to the validation LossScore in train_pure_ppo_cosine_pilot."""
+def val_loss_score(env: D.MPCTransitionRailroadEnv, pilot, val_scens, shield: bool = False, emu=None,
+                   cosine: bool = True) -> dict:
+    """Identical to the validation LossScore in train_pure_ppo_cosine_pilot (shield=False). With
+    shield=True each leg runs under UCB-DMPS as in the benchmark, and the shield rate is returned too."""
     errs, stops, smooth, kwh, tkm = [], [], [], 0.0, 0.0
+    hits, macros = 0, 0
     for sc in val_scens:
+        ucb: dict = {}
         for leg in sc["legs"]:
-            obs = env.reset(corridor_override=leg["corridor"], wind_profile=leg["wind_profile"])
+            cor = leg["corridor"]
+            if shield:
+                cor = copy.deepcopy(cor)
+                env = make_leg_env(emu, cor, cosine, ucb)
+            obs = env.reset(corridor_override=cor, wind_profile=leg["wind_profile"])
             done = False
             while not done:
                 act, _, _ = pilot.get_action_and_value(obs, deterministic=True)
                 obs, _, done, info = env.step(act, record_micro=True)
                 smooth.extend(m["rho_2"] ** 2 + m["rho_3"] ** 2 for m in info["micro_logs"])
+                hits += int(any(m.get("shield_intervened", False) for m in info["micro_logs"]))
+                macros += 1
             errs.append(abs(info["schedule_error_s"]))
             stops.append(abs(info["stop_error_m"]))
             kwh += float(info["energy_kwh"])
@@ -191,27 +234,38 @@ def val_loss_score(env: D.MPCTransitionRailroadEnv, pilot, val_scens) -> dict:
     T, St = float(np.mean(errs)), float(np.mean(stops))
     Sm = float(np.mean(smooth)) if smooth else 0.0
     E = kwh * 1000.0 / max(1.0, tkm)
-    return dict(loss=T + 15.0 * St + 2.0 * Sm + 0.025 * E, T=T, stop=St, smooth=Sm, E=E)
+    return dict(loss=T + 15.0 * St + 2.0 * Sm + 0.025 * E, T=T, stop=St, smooth=Sm, E=E,
+                shield_pct=100.0 * hits / max(1, macros))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--algo", required=True, choices=PILOT_ALGOS)
+    ap.add_argument("--free", action="store_true",
+                    help="no-cosine pilot (methods 6-7, use_cosine_shaper=False); our seeds 142, 107, 2124")
     ap.add_argument("--cost-limit", type=float, default=1.0, help="violation steps per leg (PPOLag/TRPOLag/CPO)")
-    ap.add_argument("--seed", type=int, default=0, help="learner seed (journeys are fixed)")
-    ap.add_argument("--epochs", type=int, default=EPOCHS, help="journeys budget = epochs x 3 (220 = our PPO)")
+    ap.add_argument("--seed", type=int, default=42, help="training seed: journeys, validation set and learner (42, 7, 2024)")
+    ap.add_argument("--epochs", type=int, default=EPOCHS, help="journeys budget = epochs x 3 (400 = our PPO)")
+    ap.add_argument("--shield-train", action="store_true", help="train and validate under UCB-DMPS")
+    ap.add_argument("--interv-penalty", type=float, default=0.0, help="reward penalty per shield override (scaled reward units)")
+    ap.add_argument("--max-val-shield", type=float, default=5.0, help="selection cap on validation shield %% (--shield-train)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    global TRAIN_SEED
+    TRAIN_SEED = int(args.seed)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
     emu = load_emulator()
-    env, inner = build(emu, args.cost_limit)
+    cosine = not args.free
+    tag = ("free_" if args.free else "") + args.algo + (f"_sh{args.interv_penalty:g}" if args.shield_train else "")
+    sh, pen = args.shield_train, args.interv_penalty
+    env, inner = build(emu, args.cost_limit, cosine, sh, pen)
     algo_cls = registry.get_algorithm(args.algo)
     model = algo_cls(env, tensorboard_logdir=None, seed=args.seed, device="cpu", verbose=0,
-                     env_fn=lambda: build(emu, args.cost_limit)[0], **algo_kwargs(args.algo, args.cost_limit))
+                     env_fn=lambda: build(emu, args.cost_limit, cosine, sh, pen)[0], **algo_kwargs(args.algo, args.cost_limit))
 
-    val_env = D.MPCTransitionRailroadEnv(corridor=RailroadCorridor(), traj_shield=None, emulator=emu, use_cosine_shaper=True)
+    val_env = D.MPCTransitionRailroadEnv(corridor=RailroadCorridor(), traj_shield=None, emulator=emu, use_cosine_shaper=cosine)
     val_env.a_start_center = 0.96
     val_scens = [generate_multi_station_scenario(seed=70000 + TRAIN_SEED * 13 + v * 31, n_legs=0, wind_mode="mixed",
                                                  allow_infeasible_breaks=False, extreme_noise=(v % 2 == 1))
@@ -220,6 +274,8 @@ def main():
     budget = args.epochs * JOURNEYS_PER_EPOCH
     val_step = VAL_EVERY_EPOCHS * JOURNEYS_PER_EPOCH
     next_val, best, best_w, hist = val_step, float("inf"), None, []
+    cap = args.max_val_shield if sh else float("inf")
+    all_w, fb, fb_w = {}, float("inf"), None      # all checkpoints; fallback = best ignoring the cap
     frames, t0 = 0, time.time()
     while inner.journeys_started <= budget:
         model.train(CHUNK_FRAMES, num_eval_episodes=0, eval_freq=0, log_freq=0)
@@ -228,15 +284,24 @@ def main():
         if done_j >= next_val or inner.journeys_started > budget:
             next_val += val_step
             w = actor_numpy(model)
-            r = val_loss_score(val_env, NumpyPilot(w), val_scens)
-            if r["loss"] <= best:
+            r = val_loss_score(val_env, NumpyPilot(w), val_scens, shield=sh, emu=emu, cosine=cosine)
+            for k, v in w.items():
+                all_w[f"c{len(hist)}_{k}"] = v
+            if r["loss"] <= fb:
+                fb, fb_w = r["loss"], w
+            if r["loss"] <= best and r["shield_pct"] <= cap:
                 best, best_w = r["loss"], w
             hist.append(dict(journeys=done_j, frames=frames, minutes=(time.time() - t0) / 60, best=best, **r))
             print(f"[{args.algo}] journeys {done_j:4d}/{budget} frames {frames:7d} val LossScore {r['loss']:.4f} "
-                  f"(best {best:.4f}) T={r['T']:.2f}s stop={r['stop']:.3f}m  {(time.time() - t0) / 60:.1f} min", flush=True)
-    np.savez(out / f"{args.algo}_pilot.npz", **best_w)
-    json.dump(dict(algo=args.algo, seed=args.seed, cost_limit=args.cost_limit, frames=frames,
-                   journeys=budget, best_val_loss=best, history=hist), open(out / f"{args.algo}_history.json", "w"), indent=1)
+                  f"(best {best:.4f}) T={r['T']:.2f}s stop={r['stop']:.3f}m shield={r['shield_pct']:.1f}% "
+                  f"train-shield={100.0 * inner.interventions / max(1, inner.macro_steps):.1f}%  {(time.time() - t0) / 60:.1f} min", flush=True)
+    if best_w is None:
+        print(f"[{args.algo}] no checkpoint under the {cap}% shield cap; using the best uncapped one", flush=True)
+        best, best_w = fb, fb_w
+    np.savez(out / f"{tag}_pilot.npz", **best_w)
+    np.savez(out / f"{tag}_ckpts.npz", **all_w)
+    json.dump(dict(algo=args.algo, seed=args.seed, cost_limit=args.cost_limit, shield_train=sh, interv_penalty=pen, frames=frames,
+                   journeys=budget, best_val_loss=best, history=hist), open(out / f"{tag}_history.json", "w"), indent=1)
 
 
 if __name__ == "__main__":
