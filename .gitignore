@@ -9,3 +9,4 @@ CHANGES.md
 *.pt
 *.tex
 *.pdf
+*.npz
