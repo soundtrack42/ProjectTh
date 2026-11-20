@@ -1059,3 +1059,335 @@ def load_literature_pilots(emulator, train_if_missing: bool = True, log=print) -
         act.eval()
         out[nm] = (lambda act=act, nm=nm, kw=kw: PolicyPilot(nm, act, shield_fn=kw.get("shield_fn")))
     return out
+
+
+# ===========================================================================
+# Extra literature baselines (added 2026-11-20 after a literature check; not part of the paper benchmark yet)
+#   16. Cheng et al. (2024)  S-PPO: PPO + safe action rechoosing + relaxed dynamic reward.
+#   17. Wang et al. (2024)   ES-MEDRL: maximum-entropy DRL (SAC) with Lagrange-multiplier constraint penalties
+#                            and a second energy-refinement stage on the speed setpoint.
+#   18. Tan et al. (2025)    GA-DDPG: DDPG whose exploration noise is tuned by a genetic algorithm, with an
+#                            expert reference system that keeps operation safe and guides training.
+# ===========================================================================
+def _pm_worst_ceiling_margin(env, v_t: float, a_up: float, n_steps: int = 8) -> float:
+    """Point-mass rollout of one macro step toward setpoint v_t at the comfort rates; returns the worst
+    (speed - braking-aware ceiling) over the rollout (> 0 means overspeed)."""
+    cor = env.corridor
+    x, v = env.x_curr, env.v_meas
+    worst = -1e9
+    for _ in range(n_steps):
+        acc = _clip((v_t - v) / 2.0, -0.78, a_up)
+        v = max(0.0, v + 0.5 * acc)
+        x += 0.5 * v
+        worst = max(worst, v - cor.compute_smooth_spatial_ceiling(min(x, cor.station_x_m), 0.78))
+    return worst
+
+
+def sppo_safe_rechoose(env, v_cmd: float, a_start: float, b_land: float, v_feas: float):
+    """S-PPO safe action rechoosing (training and evaluation): an action is safe if the next macro step keeps
+    the speed under the speed-limit/braking curve and the train moving; otherwise the largest safe setpoint
+    is re-chosen (bisection)."""
+    if env.shaper.in_landing:
+        return v_cmd, a_start, b_land
+    if _pm_worst_ceiling_margin(env, v_cmd, a_start) <= 0.0:
+        return v_cmd, a_start, b_land
+    lo, hi = 1.5, v_cmd
+    for _ in range(8):
+        mid = 0.5 * (lo + hi)
+        if _pm_worst_ceiling_margin(env, mid, a_start) <= 0.0:
+            lo = mid
+        else:
+            hi = mid
+    return lo, a_start, b_land
+
+
+class SPPOReward:
+    """Relaxed dynamic reward of S-PPO: a dense term that trades energy against running time with a weight set
+    by the step's initial speed, plus a sparse terminal reward whose trip-time tolerance is relaxed early in
+    training (10 s) and tightened to 2 s, so feasible samples are found early."""
+
+    def __init__(self):
+        self._key = None
+        self._E = 0.0
+        self._v0 = 0.0
+
+    def __call__(self, env, rew, done, info) -> float:
+        key = id(env.corridor)
+        if key != self._key:
+            self._key, self._E, self._v0 = key, 0.0, 0.0
+        cor = env.corridor
+        dE = float(info["energy_kwh"]) - self._E
+        self._E = float(info["energy_kwh"])
+        c = _clip(self._v0 / 16.0, 0.2, 0.8)              # faster -> energy weighs more
+        self._v0 = float(info["v_curr"])
+        dur = max(1.0, cor.deadline_s - cor.start_time_s)
+        late = (info["t_curr"] - cor.start_time_s) - (info["x_curr"] / max(1.0, cor.station_x_m)) * dur
+        r = -(c * dE / 0.3 + (1.0 - c) * abs(late) / 20.0) * 0.1
+        if done:
+            tau = 10.0 - 8.0 * float(getattr(env, "train_progress", 1.0))
+            err = abs(float(info["schedule_error_s"]))
+            r += 1.0 if err <= tau else -0.5 * err / tau
+            se = abs(float(info["stop_error_m"]))
+            r += 0.5 * float(np.exp(-3.0 * se)) - 1.0 * se
+            self._key = None
+        return r
+
+
+# ---------------- ES-MEDRL (SAC + Lagrangian penalties + energy refinement) ----------------
+class SACActor(nn.Module):
+    def __init__(self, obs_dim: int = 18, act_dim: int = 3, hidden: int = 64):
+        super().__init__()
+        self.body = nn.Sequential(nn.Linear(obs_dim, hidden), nn.Tanh(), nn.Linear(hidden, hidden), nn.Tanh())
+        self.mu = nn.Linear(hidden, act_dim)
+        self.log_std = nn.Linear(hidden, act_dim)
+
+    def forward(self, o):
+        h = self.body(o)
+        return self.mu(h), torch.clamp(self.log_std(h), -5.0, 1.0)
+
+    def sample(self, o):
+        mu, ls = self(o)
+        std = ls.exp()
+        eps = torch.randn_like(mu)
+        u = mu + std * eps
+        a = torch.tanh(u)
+        logp = (-0.5 * eps.pow(2) - ls - 0.5 * math.log(2 * math.pi)).sum(-1) - torch.log(1 - a.pow(2) + 1e-6).sum(-1)
+        return a, logp
+
+    def get_action_and_value(self, obs, deterministic: bool = True):
+        with torch.no_grad():
+            mu, _ = self(torch.as_tensor(obs, dtype=torch.float32))
+            return torch.tanh(mu).numpy(), 0.0, 0.0
+
+
+def esmedrl_refine(env, v_cmd: float, a_start: float, b_land: float, v_feas: float):
+    """ES-MEDRL second stage (speed optimisation for energy): lower the cruise setpoint in 0.2 m/s steps
+    (up to 0.6 m/s) while the predicted arrival still meets the deadline with a 2 s margin."""
+    if env.shaper.in_landing or env.k_elapsed < 8:
+        return v_cmd, a_start, b_land
+    t_rem = env.corridor.deadline_s - env.t_curr
+    v = v_cmd
+    for _ in range(3):
+        v_try = v - 0.2
+        if v_try < max(1.5, v_feas):
+            break
+        if env.estimate_remaining_time_at_speed(v_try, a_start, b_land) <= t_rem - 2.0:
+            v = v_try
+        else:
+            break
+    return v, a_start, b_land
+
+
+def train_esmedrl(name: str, emulator, n_journeys: int = 600, seed: int = 31, val_every: int = 25, log=print,
+                  lam_max: float = float("inf")):
+    """Maximum-entropy actor-critic (SAC, automatic temperature) on the LossScore reward, with Lagrange
+    multipliers on the speed, acceleration and jerk violations (dual ascent towards zero violations)."""
+    from dynamic_railroad_mpc import MPCTransitionRailroadEnv
+    from railroad_corridor import RailroadCorridor
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    env = MPCTransitionRailroadEnv(corridor=RailroadCorridor(), traj_shield=None, emulator=emulator)
+    env.pilot_filter = esmedrl_refine
+    actor = SACActor()
+    q1, q2 = DDPGCritic(), DDPGCritic()
+    q1_t, q2_t = copy.deepcopy(q1), copy.deepcopy(q2)
+    log_alpha = torch.zeros(1, requires_grad=True)
+    opt_a = optim.Adam(actor.parameters(), lr=3e-4)
+    opt_q = optim.Adam(list(q1.parameters()) + list(q2.parameters()), lr=1e-3)
+    opt_al = optim.Adam([log_alpha], lr=3e-4)
+    target_ent = -3.0
+    lam = np.zeros(3)                                     # Lagrange multipliers: speed, accel, jerk
+    buf = []
+    cap = 60000
+    val = validation_scenarios()
+    pilot = PolicyPilot(name, actor, pilot_filter=esmedrl_refine)
+    best, best_sd = validation_loss(pilot, emulator, val), copy.deepcopy(actor.state_dict())
+    log(f"  [{name}] init val LossScore {best:.4f}")
+    for j in range(n_journeys):
+        viol_sum, n_steps = np.zeros(3), 0
+        legs_j = training_scenario(seed, j)["legs"]
+        for leg in legs_j:
+            obs = env.reset(corridor_override=leg["corridor"], wind_profile=leg["wind_profile"])
+            done = False
+            while not done:
+                with torch.no_grad():
+                    a = actor.sample(torch.as_tensor(obs, dtype=torch.float32))[0].numpy().astype(np.float32)
+                obs2, rew, done, info = env.step(a, record_micro=True)
+                ml = info["micro_logs"]
+                # Violation indicators with the thresholds of the constrained learners (App. masa, pilot_masa.py):
+                v = np.array([
+                    float(any(m["rho_1"] > 1.02 for m in ml)),
+                    float(any(m["rho_2"] > 1.02 for m in ml)),
+                    float(any(m["rho_3"] > 1.05 for m in ml)),
+                ])
+                viol_sum += v; n_steps += 1
+                r = rew / 20.0 - float(lam @ v)
+                buf.append((obs, a, r, obs2, float(done)))
+                if len(buf) > cap:
+                    del buf[: len(buf) - cap]
+                obs = obs2
+                if len(buf) >= 512:
+                    idx = rng.integers(0, len(buf), 64)
+                    o = torch.as_tensor(np.array([buf[i][0] for i in idx]))
+                    aa = torch.as_tensor(np.array([buf[i][1] for i in idx]))
+                    rr = torch.as_tensor(np.array([buf[i][2] for i in idx], dtype=np.float32))
+                    o2 = torch.as_tensor(np.array([buf[i][3] for i in idx]))
+                    dd = torch.as_tensor(np.array([buf[i][4] for i in idx], dtype=np.float32))
+                    alpha = log_alpha.exp().detach()
+                    with torch.no_grad():
+                        a2, lp2 = actor.sample(o2)
+                        y = rr + 0.99 * (1 - dd) * (torch.min(q1_t(o2, a2), q2_t(o2, a2)) - alpha * lp2)
+                    lq = nn.functional.mse_loss(q1(o, aa), y) + nn.functional.mse_loss(q2(o, aa), y)
+                    opt_q.zero_grad(); lq.backward(); opt_q.step()
+                    an, lp = actor.sample(o)
+                    la = (alpha * lp - torch.min(q1(o, an), q2(o, an))).mean()
+                    opt_a.zero_grad(); la.backward(); opt_a.step()
+                    lal = -(log_alpha * (lp.detach() + target_ent)).mean()
+                    opt_al.zero_grad(); lal.backward(); opt_al.step()
+                    with torch.no_grad():
+                        for net, nt in ((q1, q1_t), (q2, q2_t)):
+                            for p, pt in zip(net.parameters(), nt.parameters()):
+                                pt.mul_(0.995).add_(0.005 * p)
+        # Dual ascent on the multipliers (constraint budget as in the constrained learners of App. masa).
+        lam = np.maximum(0.0, lam + 0.05 * (viol_sum / max(1, len(legs_j)) - 1.0 / 3.0))   # budget: 1 violating step per leg
+        lam = np.minimum(lam, lam_max)
+        if (j + 1) % val_every == 0 or j + 1 == n_journeys:
+            vl = validation_loss(pilot, emulator, val)
+            if vl <= best:
+                best, best_sd = vl, copy.deepcopy(actor.state_dict())
+            log(f"  [{name}] journey {j + 1}/{n_journeys} val LossScore {vl:.4f} (best {best:.4f}) lambda {np.round(lam, 3)}")
+    actor.load_state_dict(best_sd)
+    return actor, best
+
+
+# ---------------- GA-DDPG (Tan et al. 2025) ----------------
+def tan_expert_rules(env, v_cmd: float, a_start: float, b_land: float, v_feas: float):
+    """Expert reference system (safety rules, training and evaluation): keep a 0.3 m/s margin under the
+    braking-aware ceiling ahead, and never command less than the feasible pace when clearly behind."""
+    if env.shaper.in_landing:
+        return v_cmd, a_start, b_land
+    cor = env.corridor
+    x_ahead = min(cor.station_x_m, env.x_curr + max(env.v_meas, v_cmd) * 4.0)
+    v_ceil = min(cor.compute_smooth_spatial_ceiling(env.x_curr, 0.78), cor.compute_smooth_spatial_ceiling(x_ahead, 0.78))
+    if env.v_meas < 0.9 * v_feas:
+        v_cmd = max(v_cmd, v_feas)
+    return min(v_cmd, v_ceil - 0.3), a_start, b_land
+
+
+def tan_expert_action(env) -> np.ndarray:
+    """Expert reference action used to guide exploration: hold slightly above the feasible pace."""
+    v_feas, _ = env.compute_feasible_deadline_pace(0.96, 0.78)
+    return encode_action(env, v_feas + 0.4, 0.96, 0.78)
+
+
+def train_ga_ddpg(name: str, emulator, n_journeys: int = 600, seed: int = 41, val_every: int = 25,
+                  pop: int = 4, gen_len: int = 25, log=print):
+    from dynamic_railroad_mpc import MPCTransitionRailroadEnv
+    from railroad_corridor import RailroadCorridor
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    env = MPCTransitionRailroadEnv(corridor=RailroadCorridor(), traj_shield=None, emulator=emulator)
+    env.pilot_filter = tan_expert_rules
+    actor, critic = DDPGActor(), DDPGCritic()
+    actor_t, critic_t = copy.deepcopy(actor), copy.deepcopy(critic)
+    opt_a = optim.Adam(actor.parameters(), lr=3e-4)
+    opt_c = optim.Adam(critic.parameters(), lr=1e-3)
+    buf = []
+    cap = 60000
+    val = validation_scenarios()
+    pilot = PolicyPilot(name, actor, pilot_filter=tan_expert_rules)
+    # Genetic algorithm over the exploration-noise scale: each individual explores for gen_len // pop journeys,
+    # fitness = mean training return; selection keeps the best half, mutation multiplies by lognormal noise.
+    sigmas = list(rng.uniform(0.08, 0.40, pop))
+    fitness = [0.0] * pop
+    best, best_sd = validation_loss(pilot, emulator, val), copy.deepcopy(actor.state_dict())
+    log(f"  [{name}] init val LossScore {best:.4f}")
+    for j in range(n_journeys):
+        ind = (j % gen_len) * pop // gen_len
+        sig = sigmas[ind]
+        p_guide = 0.5 * max(0.0, 1.0 - 2.0 * j / n_journeys)   # expert guidance, annealed to 0 by mid-training
+        ret = 0.0
+        for leg in training_scenario(seed, j)["legs"]:
+            obs = env.reset(corridor_override=leg["corridor"], wind_profile=leg["wind_profile"])
+            done = False
+            while not done:
+                if rng.random() < p_guide:
+                    a = tan_expert_action(env)
+                else:
+                    a = actor.get_action_and_value(obs)[0] + rng.normal(0, sig, 3).astype(np.float32)
+                a = np.clip(a, -1, 1).astype(np.float32)
+                obs2, rew, done, info = env.step(a)
+                r = rew / 20.0
+                ret += r
+                buf.append((obs, a, r, obs2, float(done)))
+                if len(buf) > cap:
+                    del buf[: len(buf) - cap]
+                obs = obs2
+                if len(buf) >= 512:
+                    idx = rng.integers(0, len(buf), 64)
+                    o = torch.as_tensor(np.array([buf[i][0] for i in idx]))
+                    aa = torch.as_tensor(np.array([buf[i][1] for i in idx]))
+                    rr = torch.as_tensor(np.array([buf[i][2] for i in idx], dtype=np.float32))
+                    o2 = torch.as_tensor(np.array([buf[i][3] for i in idx]))
+                    dd = torch.as_tensor(np.array([buf[i][4] for i in idx], dtype=np.float32))
+                    with torch.no_grad():
+                        y = rr + 0.99 * (1.0 - dd) * critic_t(o2, actor_t(o2))
+                    lc = nn.functional.mse_loss(critic(o, aa), y)
+                    opt_c.zero_grad(); lc.backward(); opt_c.step()
+                    la = -critic(o, actor(o)).mean()
+                    opt_a.zero_grad(); la.backward(); opt_a.step()
+                    with torch.no_grad():
+                        for p, pt in zip(actor.parameters(), actor_t.parameters()):
+                            pt.mul_(0.995).add_(0.005 * p)
+                        for p, pt in zip(critic.parameters(), critic_t.parameters()):
+                            pt.mul_(0.995).add_(0.005 * p)
+        fitness[ind] += ret
+        if (j + 1) % gen_len == 0:
+            order = np.argsort(fitness)[::-1]
+            elite = [sigmas[i] for i in order[: pop // 2]]
+            sigmas = elite + [float(_clip(s * np.exp(rng.normal(0, 0.3)), 0.03, 0.5)) for s in elite]
+            fitness = [0.0] * pop
+        if (j + 1) % val_every == 0 or j + 1 == n_journeys:
+            vl = validation_loss(pilot, emulator, val)
+            if vl <= best:
+                best, best_sd = vl, copy.deepcopy(actor.state_dict())
+            log(f"  [{name}] journey {j + 1}/{n_journeys} val LossScore {vl:.4f} (best {best:.4f}) sigmas {np.round(sigmas, 3)}")
+    actor.load_state_dict(best_sd)
+    return actor, best
+
+
+EXTRA_LIT_NAMES = [
+    "16. Cheng (2024) S-PPO (Safe Rechoosing + Relaxed Reward)",
+    "17. Wang (2024) ES-MEDRL (Max-Entropy DRL + Lagrange)",
+    "18. Tan (2025) GA-DDPG (Expert Rules + GA Noise)",
+]
+
+
+def load_extra_literature_pilots(emulator, train_if_missing: bool = True, log=print) -> dict:
+    from dynamic_railroad_mpc import CosineTrajectoryRLPolicy, train_pure_ppo_cosine_pilot
+    from railroad_corridor import RailroadCorridor
+    out = {}
+    p = CKPT_DIR / "best_lit_sppo.pt"
+    sp = CosineTrajectoryRLPolicy(18, 3, 64)
+    if p.exists():
+        sp.load_state_dict(torch.load(str(p), map_location="cpu"))
+    elif train_if_missing:
+        sp, _ = train_pure_ppo_cosine_pilot(RailroadCorridor(), emulator=emulator, epochs=400, wind_mode="mixed",
+                                            seed=42, checkpoint_prefix="lit_sppo", pilot_filter=sppo_safe_rechoose,
+                                            reward_fn=SPPOReward())
+    sp.eval()
+    out[EXTRA_LIT_NAMES[0]] = lambda: PolicyPilot(EXTRA_LIT_NAMES[0], sp, pilot_filter=sppo_safe_rechoose)
+    for nm, fname, cls, trainer, filt in (
+        (EXTRA_LIT_NAMES[1], "lit_esmedrl.pt", SACActor, train_esmedrl, esmedrl_refine),
+        (EXTRA_LIT_NAMES[2], "lit_ga_ddpg.pt", DDPGActor, train_ga_ddpg, tan_expert_rules),
+    ):
+        p = CKPT_DIR / fname
+        act = cls()
+        if p.exists():
+            act.load_state_dict(torch.load(str(p), map_location="cpu"))
+        elif train_if_missing:
+            act, _ = trainer(nm, emulator, log=log)
+            torch.save(act.state_dict(), str(p))
+        act.eval()
+        out[nm] = (lambda act=act, nm=nm, filt=filt: PolicyPilot(nm, act, pilot_filter=filt))
+    return out

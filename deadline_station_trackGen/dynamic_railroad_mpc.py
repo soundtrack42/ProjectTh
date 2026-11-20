@@ -1508,7 +1508,9 @@ def train_pure_ppo_cosine_pilot(
     pace_change_w: float = 0.0,
     ontrack_w: float = 0.0,
     a_start_center: float = 0.96,
+    reward_fn=None,
 ) -> tuple[CosineTrajectoryRLPolicy, list[dict]]:
+    # reward_fn(env, rew, done, info) -> training reward (already scaled); None keeps the LossScore reward / 20.
     np.random.seed(seed)
     torch.manual_seed(seed)
 
@@ -1555,6 +1557,7 @@ def train_pure_ppo_cosine_pilot(
             target_log_std = -0.65 - 0.85 * (float(epoch) / float(epochs))
             policy.log_std.fill_(target_log_std)
 
+        env.train_progress = float(epoch - 1) / float(max(1, epochs))
         for batch_sc in range(3):
             # One of the three training journeys per epoch uses extreme weather (Table tab:extreme):
             scen = generate_multi_station_scenario(
@@ -1568,11 +1571,11 @@ def train_pure_ppo_cosine_pilot(
 
                 while not done:
                     act, lp, val = policy.get_action_and_value(obs, deterministic=False)
-                    next_obs, rew, done, _ = env.step(act, record_micro=False)
+                    next_obs, rew, done, step_info = env.step(act, record_micro=False)
                     ep_o.append(obs)
                     ep_a.append(act)
                     ep_lp.append(lp)
-                    ep_r.append(rew / 20.0)
+                    ep_r.append(rew / 20.0 if reward_fn is None else float(reward_fn(env, rew, done, step_info)))
                     ep_v.append(val)
                     obs = next_obs
 
