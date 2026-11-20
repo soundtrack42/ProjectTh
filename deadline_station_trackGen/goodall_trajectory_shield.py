@@ -983,9 +983,9 @@ class GoodallTrajectoryShield:
         ext_f_0 = (
             env.physics.grade_resistance(env.x_curr) + env.physics.curve_resistance(env.x_curr)
         ) / (0.03 * env.physics.M * env.physics.g)
-        temp_c_0 = float(getattr(self.corridor, "temp_celsius", 18.0))
+        temp_c_0 = float(getattr(env, "station_temp_c", getattr(self.corridor, "temp_celsius", 18.0)))
         rho_air_0 = 293.15 / max(250.0, 273.15 + temp_c_0)
-        adh_mu_0 = float(getattr(self.corridor, "adhesion_mu_factor", 1.0))
+        adh_mu_0 = float(getattr(env, "station_mu", getattr(self.corridor, "adhesion_mu_factor", 1.0)))
 
         u_raw_now = (v_cmd_task - v_obs) * 0.45
         u_est_now = -1.0 if u_raw_now < -1.0 else (1.0 if u_raw_now > 1.0 else u_raw_now)

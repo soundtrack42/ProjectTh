@@ -972,6 +972,9 @@ def fetch_real_world_multi_station_scenario(
             "unmodeled_drag_factor": unmodeled_drag,
             "real_empirical_delay_s": hop["empirical_delay_s"],
             "track_bearing_deg": bearing_deg,
+            "lat_a": float(s_a["lat"]), "lon_a": float(s_a["lon"]),
+            "lat_b": float(s_b["lat"]), "lon_b": float(s_b["lon"]),
+            "hour_utc": int(hop.get("hour_utc", 12)), "date_str": used_date,
             "latest_gps_speed_mps": latest_gps_speed_mps,
         })
         t_clock = leg_deadline_s + dwell_s

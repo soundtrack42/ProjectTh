@@ -77,6 +77,21 @@ PILOT_COASTING = False
 # Ablation: --a-start-center 0.81 lowers drivetrain slew/copper losses (-1.3..-2.2% energy) but, without
 # retraining, costs ~0.1 s punctuality on methods 2-4 (UCB-DMPS methods 5/7 compensate via C3).
 OUR_A_START_CENTER = 0.96
+# Slow-weather knowledge of the controller (temperature, rail adhesion). The plant may carry a true slow-weather
+# profile along the leg (corridor.slow_weather_profile: per-step "temp_c", "mu"; shared by all methods).
+#   "station": measured at the departure station, held until the next station.
+#   "online":  station value plus the change reported by a weather service along the route. Requests are sent every
+#              WX_FETCH_PERIOD_S, answer after a random latency or fail with WX_FETCH_FAIL_P; on failure the last value
+#              is kept. The service resolves weather in WX_API_SLOT_S slots and has a per-leg bias (cancelled by
+#              anchoring on the value fetched at departure) plus per-request noise.
+#   "oracle":  the controller knows the true slow weather at every step (upper bound).
+WX_POLICY = "online"   # selected by design study S9 (weather_update_study.py)
+WX_FETCH_PERIOD_S = 60.0
+WX_FETCH_FAIL_P = 0.2
+WX_LATENCY_S = (0.3, 3.0)
+WX_API_SLOT_S = 900.0
+WX_API_BIAS = (1.5, 0.04)       # per-leg representativeness bias, std (degC, mu)
+WX_API_NOISE = (0.3, 0.01)      # per-request noise, std (degC, mu)
 
 class MPCTransitionRailroadEnv:
     def __init__(
@@ -137,7 +152,7 @@ class MPCTransitionRailroadEnv:
         # Controller (MPC + Shaper) knows station weather telemetry (adhesion_mu_factor) and online mass_hat_kg:
         ctrl_mass = self.mass_hat_kg if use_estimated_mass else 85000.0 * s_car
         mass_ratio = (85000.0 * s_car) / max(65000.0 * s_car, ctrl_mass)
-        adh_mu = getattr(self.corridor, "adhesion_mu_factor", 1.0)
+        adh_mu = float(getattr(self, "station_mu", getattr(self.corridor, "adhesion_mu_factor", 1.0)))
         self.physics = NonlinearTrainPhysics(mass_kg=ctrl_mass, car_scale=s_car, length_m=len_m)
         self.physics.max_traction_accel = self.corridor.base_max_traction_accel * mass_ratio * adh_mu
         self.physics.max_braking_decel = self.corridor.base_max_service_braking * mass_ratio * adh_mu
@@ -211,6 +226,22 @@ class MPCTransitionRailroadEnv:
         self.d_standstill = float(getattr(self.corridor, "station_wind_sensor_mps2", 0.0))
         self.station_mu = float(getattr(self.corridor, "adhesion_mu_factor", 1.0))
         self.station_temp_c = float(getattr(self.corridor, "temp_celsius", 18.0))
+        prof = getattr(self.corridor, "slow_weather_profile", None)
+        if prof is not None:
+            self._wx_true_T = np.asarray(prof["temp_c"], dtype=np.float64)
+            self._wx_true_mu = np.asarray(prof["mu"], dtype=np.float64)
+        else:
+            self._wx_true_T = None
+            self._wx_true_mu = None
+        self._wx_mu_leg = self.station_mu
+        self._wx_station = (self.station_temp_c, self.station_mu)
+        self._wx_anchor = None
+        self._wx_pending = False
+        self._wx_req_idx = 0
+        self._wx_last_req_k = -10 ** 9
+        self.wx_requests = 0
+        self.wx_failures = 0
+        self.wx_updates = 0
         self.speed_sensor_noise_mps = float(getattr(self.corridor, "speed_sensor_noise_mps", 0.0))
         self.unmodeled_drag_factor = float(getattr(self.corridor, "unmodeled_drag_factor", 1.0))
         self.sensor_rng = np.random.default_rng(int(getattr(self.corridor, "sensor_noise_seed", 0)))
@@ -241,6 +272,81 @@ class MPCTransitionRailroadEnv:
         self.shaper.reset()
         self.mpc.reset()
         return self._get_obs()
+
+    def _wx_api_value(self, k_req: int) -> tuple[float, float]:
+        """Weather-service answer for a request sent at step k_req: truth at the start of its time slot, plus a
+        per-leg bias and per-request noise (deterministic per leg and request, identical for all methods)."""
+        dt = self.corridor.dt
+        t0 = float(self.corridor.start_time_s) + float(getattr(self.corridor, "wx_clock_offset_s", 0.0))
+        t_abs = t0 + k_req * dt
+        t_slot = math.floor(t_abs / WX_API_SLOT_S) * WX_API_SLOT_S if WX_API_SLOT_S > 0 else t_abs
+        k_slot = int(round((t_slot - t0) / dt))
+        n = len(self._wx_true_T)
+        k_slot = 0 if k_slot < 0 else (n - 1 if k_slot >= n else k_slot)
+        seed = int(getattr(self.corridor, "sensor_noise_seed", 0))
+        b = np.random.default_rng((seed, 77, 0)).normal(0.0, 1.0, 2)
+        e = np.random.default_rng((seed, 77, 1 + self._wx_req_idx)).normal(0.0, 1.0, 2)
+        T = self._wx_true_T[k_slot] + WX_API_BIAS[0] * b[0] + WX_API_NOISE[0] * e[0]
+        mu = self._wx_true_mu[k_slot] + WX_API_BIAS[1] * b[1] + WX_API_NOISE[1] * e[1]
+        return float(T), float(mu)
+
+    def _apply_known_weather(self, temp_c: float, mu: float) -> None:
+        """Controller-side update of the slow weather (MPC, shaper, shield and observer models)."""
+        mu = float(np.clip(mu, 0.55, 1.0))
+        if abs(temp_c - self.station_temp_c) < 1e-9 and abs(mu - self.station_mu) < 1e-9:
+            return
+        self.station_temp_c = float(temp_c)
+        self.station_mu = mu
+        self.wx_updates += 1
+        s_car = self.corridor.car_scale
+        ctrl_mass = self.mass_hat_kg
+        mass_ratio = (85000.0 * s_car) / max(65000.0 * s_car, ctrl_mass)
+        self.physics.max_traction_accel = self.corridor.base_max_traction_accel * mass_ratio * mu
+        self.physics.max_braking_decel = self.corridor.base_max_service_braking * mass_ratio * mu
+        self.shaper.sync_limits(self.physics.max_traction_accel, self.physics.max_braking_decel)
+        self.mpc.update_mass_and_limits(ctrl_mass, self.physics.max_traction_accel, self.physics.max_braking_decel)
+
+    def _weather_tick(self) -> None:
+        """Runs once per 0.5 s step, outside the timed control path (the weather request is asynchronous)."""
+        if self._wx_true_T is None or WX_POLICY == "station":
+            return
+        k = self.k_elapsed
+        if WX_POLICY == "oracle":
+            kk = min(k, len(self._wx_true_T) - 1)
+            self._apply_known_weather(self._wx_true_T[kk], self._wx_true_mu[kk])
+            return
+        dt = self.corridor.dt
+        if self._wx_pending and k >= self._wx_ready_k:
+            self._wx_pending = False
+            if not self._wx_fail:
+                T_api, mu_api = self._wx_api_value(self._wx_req_k)
+                if self._wx_anchor is None:
+                    self._wx_anchor = (T_api, mu_api)
+                else:
+                    T_st, mu_st = self._wx_station
+                    self._apply_known_weather(T_st + T_api - self._wx_anchor[0], mu_st + mu_api - self._wx_anchor[1])
+        if not self._wx_pending and (k - self._wx_last_req_k) * dt >= WX_FETCH_PERIOD_S - 1e-9:
+            r = np.random.default_rng((int(getattr(self.corridor, "sensor_noise_seed", 0)), 78, self._wx_req_idx))
+            self._wx_req_idx += 1
+            self._wx_last_req_k = k
+            self._wx_req_k = k
+            self._wx_fail = bool(r.random() < WX_FETCH_FAIL_P)
+            self._wx_ready_k = k + max(1, int(math.ceil(r.uniform(*WX_LATENCY_S) / dt)))
+            self._wx_pending = True
+            self.wx_requests += 1
+            self.wx_failures += int(self._wx_fail)
+
+    def _true_weather_factors(self, rho_known: float, cwr_known: float) -> tuple[float, float, float]:
+        """Plant-side (true) air density, CWR curve factor and copper-loss factor at the current step."""
+        if self._wx_true_T is None:
+            return rho_known, cwr_known, 1.0 + 0.00393 * max(0.0, self.station_temp_c - 20.0)
+        kk = min(self.k_elapsed, len(self._wx_true_T) - 1)
+        T = float(self._wx_true_T[kk])
+        mu_scale = float(self._wx_true_mu[kk]) / self._wx_mu_leg
+        self.true_physics.max_traction_accel = self.corridor.max_traction_accel * mu_scale
+        self.true_physics.max_braking_decel = self.corridor.max_service_braking * mu_scale
+        return (293.15 / max(250.0, 273.15 + T), 1.0 + 0.0045 * max(0.0, T - 25.0),
+                1.0 + 0.00393 * max(0.0, T - 20.0))
 
     def _accumulate_departure_mass_step(
         self, f_net_n: float, g_spec: float, wind_gate: bool, v_next_meas: float
@@ -787,6 +893,8 @@ class MPCTransitionRailroadEnv:
             t1 = time.thread_time()
             mpc_only_us = (t1 - t0) * 1e6
 
+            # Slow weather: the controller uses its known values (station / online / oracle policy), the plant the true ones.
+            self._weather_tick()
             # Ambient temperature physical effects:
             # 1) Isobaric air density scaling on aerodynamic drag (Rochard & Schmid 2000; Davis 1926)
             rho_air_station = 293.15 / max(250.0, 273.15 + self.station_temp_c)
@@ -794,7 +902,7 @@ class MPCTransitionRailroadEnv:
             #    resistance above neutral temperature T_0 = 25 C (Kish & Samavedam 2013; Dobney et al. 2009)
             cwr_thermal_factor = 1.0 + 0.0045 * max(0.0, self.station_temp_c - 25.0)
             # 3) Stator/inverter copper winding temperature coefficient alpha_Cu = 0.00393 K^-1 above 20 C (Xiao et al. 2023)
-            cu_temp_factor = 1.0 + 0.00393 * max(0.0, self.station_temp_c - 20.0)
+            rho_true, cwr_true, cu_temp_factor = self._true_weather_factors(rho_air_station, cwr_thermal_factor)
 
             t_emu_0 = time.thread_time()
             if self.traj_shield is not None:
@@ -815,9 +923,9 @@ class MPCTransitionRailroadEnv:
             u_clamped = -1.0 if u_cmd < -1.0 else (1.0 if u_cmd > 1.0 else float(u_cmd))
             self.u_act = 0.72 * u_clamped + 0.28 * self.u_act
             f_prop_true = self.u_act * self.true_physics.max_propulsion_force(self.v_curr, self.u_act)
-            f_drag_true = self.true_physics.basic_resistance(self.v_curr) * rho_air_station * self.unmodeled_drag_factor
+            f_drag_true = self.true_physics.basic_resistance(self.v_curr) * rho_true * self.unmodeled_drag_factor
             f_grade_true = self.true_physics.grade_resistance(self.x_curr)
-            f_curve_true = self.true_physics.curve_resistance(self.x_curr) * cwr_thermal_factor
+            f_curve_true = self.true_physics.curve_resistance(self.x_curr) * cwr_true
             a_true_nom = (f_prop_true - f_drag_true - f_grade_true - f_curve_true) / self.true_physics.M_eff
 
             # Station territory (x < 2nd anemometer): sheltered platform wind, measured by both sensors.
@@ -1137,15 +1245,16 @@ class MPCTransitionRailroadEnv:
             t1 = time.thread_time()
             ctrl_step_us = (t1 - t0) * 1e6
 
+            self._weather_tick()
             rho_air_station = 293.15 / max(250.0, 273.15 + self.station_temp_c)
             cwr_thermal_factor = 1.0 + 0.0045 * max(0.0, self.station_temp_c - 25.0)
-            cu_temp_factor = 1.0 + 0.00393 * max(0.0, self.station_temp_c - 20.0)
+            rho_true, cwr_true, cu_temp_factor = self._true_weather_factors(rho_air_station, cwr_thermal_factor)
             u_clamped = -1.0 if u_cmd < -1.0 else (1.0 if u_cmd > 1.0 else float(u_cmd))
             self.u_act = 0.72 * u_clamped + 0.28 * self.u_act
             f_prop_true = self.u_act * self.true_physics.max_propulsion_force(self.v_curr, self.u_act)
-            f_drag_true = self.true_physics.basic_resistance(self.v_curr) * rho_air_station * self.unmodeled_drag_factor
+            f_drag_true = self.true_physics.basic_resistance(self.v_curr) * rho_true * self.unmodeled_drag_factor
             f_grade_true = self.true_physics.grade_resistance(self.x_curr)
-            f_curve_true = self.true_physics.curve_resistance(self.x_curr) * cwr_thermal_factor
+            f_curve_true = self.true_physics.curve_resistance(self.x_curr) * cwr_true
             a_true_nom = (f_prop_true - f_drag_true - f_grade_true - f_curve_true) / self.true_physics.M_eff
 
             # Station territory (x < 2nd anemometer): sheltered platform wind, measured by both sensors.
@@ -2173,7 +2282,7 @@ def _print_spike_profiler(dmps_runs: list[dict], subset_label: str) -> None:
 
 
 def main():
-    global STATION_ANEMOMETER2_X_M, PILOT_COASTING, OUR_A_START_CENTER
+    global STATION_ANEMOMETER2_X_M, PILOT_COASTING, OUR_A_START_CENTER, WX_POLICY
     ap = argparse.ArgumentParser(description="Multi-Property PPO + Hierarchical Contract Shielding (3-Station ~16.5 km)")
     ap.add_argument("--epochs", type=int, default=220, help="PPO training epochs (logarithmic convergence around ~180-220)")
     ap.add_argument("--eval-runs", type=int, default=30, help="Number of 3-station multi-km test scenarios")
@@ -2219,6 +2328,9 @@ def main():
         help="Departure mass-ID approach: position (m) of the 2nd platform-end anemometer; the window runs until "
         "the train passes it. 0 = station-only approach (station anemometer, fixed 8-step window).",
     )
+    ap.add_argument("--weather-update", type=str, default=WX_POLICY, choices=["station", "online", "oracle"],
+                    help="Slow-weather knowledge: station only, station + weather service along the route, or oracle "
+                         "(only matters when the plant weather varies along the leg)")
     ap.add_argument("--coast", action="store_true", help="Enable pre-landing coasting (punctuality-guarded) for methods 2-7")
     ap.add_argument("--pilot-npz", type=str, default="",
                     help="Cosine pilot exported from MASA (e.g. checkpoints/trpo_cosine_pilot.npz); overrides --load-checkpoint's pilot")
@@ -2238,6 +2350,7 @@ def main():
         _rc.TRAIN_CARS = float(args.train_cars)
     STATION_ANEMOMETER2_X_M = float(args.anemometer2_x_m)
     OUR_A_START_CENTER = float(args.a_start_center)
+    WX_POLICY = str(args.weather_update)
     PILOT_COASTING = bool(args.coast)
 
     if args.harsh_weather is not None:

@@ -24,7 +24,7 @@ Every proposed method runs at ≤ 278 µs worst-case step latency.
 ### Weather model
 
 - **Wind** acts on the air drag and is estimated online. Its force follows from the plant's own drag model, with gusts capped at 30 m/s (Beaufort ≤ 10).
-- **Temperature, adhesion and precipitation** change slowly. They are measured at each station and treated as known until the next one.
+- **Temperature, adhesion and precipitation** change slowly. They are measured at each station and then updated along the route from a weather service (one request per minute, outside the control loop; a failed request keeps the last value). Design study S9 (`weather_update_study.py`) shows the update is neutral on real legs and helps when a weather front passes, if the service data are minute-resolved.
 
 ## Results
 
@@ -87,6 +87,7 @@ PPO was kept as the pilot learner after comparing it with the five other learner
 | `deadline_station_trackGen/literature_baselines.py` | Literature baselines 9–15 |
 | `deadline_station_trackGen/bilbao_cbtc_ato.py` | Literature baseline 8 (Bilbao-Moreno et al., 2025) |
 | `deadline_station_trackGen/benchmark_mass_id.py` | Departure mass-identification benchmark |
+| `deadline_station_trackGen/weather_update_study.py` | Slow-weather update study (station vs. weather service along the route, with and without a passing front) |
 | `deadline_station_trackGen/generate_paper_figures.py`, `generate_architecture_diagram.py` | Paper figures |
 | `deadline_station_trackGen/masa_rail/` | MASA-Safe-RL pilot study (`pilot_masa.py` training, `eval_pilots.py` scoring; `rail_env.py` / `run_masa.py` are an earlier tabular experiment, unused) |
 | `experiments/` | Stage 1–2 single-corridor and emulator ablation scripts |
@@ -135,6 +136,7 @@ Main options:
 | `--pilot-npz`, `--free-pilot-npz` | use a pilot exported by the MASA study instead |
 | `--train-cars N` | distributed-length train with N cars (length-averaged grade/curve forces, size-dependent drag, tail clearance); `0` with `--real-data` uses the real composition length |
 | `--a-start-center` | departure acceleration centre (ablation) |
+| `--weather-update` | slow-weather knowledge: `station`, `online` (default: station + weather service along the route) or `oracle`; only matters when the plant weather varies within a leg |
 | `--coast` | enable pre-landing coasting (off by default) |
 | `--pin-core C`, `--no-pin-cpu` | CPU core for latency measurements (default: highest core), or no pinning |
 | `--plot`, `--dual-plot`, `--data-dir` | output figure and data paths |
