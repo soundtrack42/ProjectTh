@@ -71,6 +71,8 @@ STATION_ANEMOMETER2_X_M = 10.0
 
 # Pre-landing coasting for the proposed PPO methods (2-7); off by default, --coast enables it.
 PILOT_COASTING = False
+# Proposed pilots decode (a_start, b_land) inside the shield's comfort limits (checkpoints trained with it).
+COMFORT_ACTION_BOUND = True
 
 # Centre of the departure/shift-up acceleration rate decoded from the pilot action (a_start = centre + 0.22 a1)
 # for the proposed PPO methods (2-7); literature pilots always use 0.96. Default 0.96 (pilots trained with it).
@@ -109,10 +111,25 @@ class MPCTransitionRailroadEnv:
         # Eco governor is part of the UCB-DMPS architecture (methods 7 and 9):
         # Approach schedule reserve (s) kept by the eco governor; selected on tuning seeds 5000+29k (sweep 0.5..6 s).
         self.eco_slack_reserve_s = 4.0
+        # Comfort-consistent bound on the decoded (a_start, b_land); set for the proposed PPO pilots (methods 2-7).
+        self.comfort_action_bound = False
+        # Eco v2 (off by default): with schedule slack, prefer gentler rates and a cruise speed below the field-
+        # weakening knee, each accepted only if the predicted arrival still keeps the eco reserve.
+        self.eco_a_cap: float | None = None      # departure/shift acceleration rate (m/s^2)
+        self.eco_b_cap: float | None = None      # planned landing deceleration (m/s^2), outside the landing only
+        self.eco_v_knee: float | None = None     # cruise speed cap (m/s), e.g. 13.4 (field weakening)
+        self.eco_v2_reserve_s: float | None = None  # reserve for v2 (None: eco_slack_reserve_s)
+        self.eco_v2_steps = 0
         self.eco_governor = bool(
             eco_governor if eco_governor is not None
             else (traj_shield is not None and getattr(traj_shield.cfg, "mode", "") == "mps_rollout")
         )
+        if self.eco_governor and self.use_cosine_shaper:
+            # Cosine UCB-DMPS (method 5), selected on tuning seeds 5000+29k (sweep a_cap 0.65..0.90, reserve 3..5 s,
+            # b_cap, cruise knee, coasting): with schedule slack, depart and shift at <= 0.70 m/s^2, reserve 5 s.
+            # No lever improved the non-cosine pipeline (method 7), which keeps the 4 s reserve and no rate cap.
+            self.eco_a_cap = 0.70
+            self.eco_slack_reserve_s = 5.0
         self.obs_dim = 18
         self.act_dim = 3
         # Pre-landing coasting (cruise -> coast -> brake), enabled for the proposed PPO methods. Coasting starts
@@ -661,6 +678,28 @@ class MPCTransitionRailroadEnv:
         self._eco_ub_cached_res = res
         return res
 
+    def _eco_v2(self, v_cmd: float, a_start: float, b_land: float) -> tuple[float, float, float]:
+        """Greedy eco levers (gentler acceleration, gentler planned landing, cruise below the knee), each kept only
+        if holding the resulting plan still arrives `reserve` seconds before the deadline."""
+        cor = self.corridor
+        reserve = self.eco_slack_reserve_s if self.eco_v2_reserve_s is None else self.eco_v2_reserve_s
+        budget = (cor.deadline_s - self.t_curr) - reserve
+        if budget <= 0.0 or self.estimate_remaining_time_at_speed(v_cmd, a_start, b_land) > budget:
+            return v_cmd, a_start, b_land
+        changed = False
+        if self.eco_a_cap is not None and a_start > self.eco_a_cap and v_cmd > float(self.v_meas) + 0.3:
+            if self.estimate_remaining_time_at_speed(v_cmd, self.eco_a_cap, b_land) <= budget:
+                a_start, changed = self.eco_a_cap, True
+        if self.eco_b_cap is not None and b_land > self.eco_b_cap:
+            if self.estimate_remaining_time_at_speed(v_cmd, a_start, self.eco_b_cap) <= budget:
+                b_land, changed = self.eco_b_cap, True
+        if self.eco_v_knee is not None and v_cmd > self.eco_v_knee and float(self.v_meas) <= self.eco_v_knee + 0.3:
+            if self.estimate_remaining_time_at_speed(self.eco_v_knee, a_start, b_land) <= budget:
+                v_cmd, changed = self.eco_v_knee, True
+        if changed:
+            self.eco_v2_steps += 1
+        return v_cmd, a_start, b_land
+
     def compute_feasible_deadline_pace(self, a_start: float, b_land: float) -> tuple[float, float]:
         self._ensure_feas_cache_epoch()
         cache_key = (round(a_start, 6), round(b_land, 6))
@@ -777,6 +816,21 @@ class MPCTransitionRailroadEnv:
         # Action[0] = 0.0 corresponds to naive pace; Action[0] in [-1, 1] gives full +-3.80 m/s authority
         v_raw = v_naive + 3.80 * a0
         v_cmd_rl = 1.5 if v_raw < 1.5 else (v_cap if v_raw > v_cap else v_raw)
+        if self.comfort_action_bound:
+            # Comfort-consistent action bound (proposed pilots, training and evaluation): the decoded rates stay
+            # inside the same order-2 comfort limits the UCB-DMPS shield certifies (ramp-specific caps for shifts
+            # > 1.85 m/s), so the shield never clamps the departure ramp intermittently (stalled ramp -> lost time
+            # -> late deadline recovery).
+            cor = self.corridor
+            a_hi = cor.comfort_accel_max * 0.99 - 0.01
+            b_hi = cor.comfort_braking_max * 0.99 - 0.01
+            dv_shift = v_cmd_rl - float(self.v_meas)
+            if dv_shift > 1.85:
+                a_hi = min(a_hi, (0.94 if self.use_cosine_shaper else 1.04) - 0.01)
+            elif dv_shift < -1.85:
+                b_hi = min(b_hi, (0.76 if self.use_cosine_shaper else 0.80) - 0.01)
+            a_start_cos = a_hi if a_start_cos > a_hi else a_start_cos
+            b_land_cos = 0.63 if b_land_cos < 0.63 else (b_hi if b_land_cos > b_hi else b_land_cos)
         return v_cmd_rl, a_start_cos, b_land_cos, v_feas, v_naive
 
     def step(
@@ -802,6 +856,10 @@ class MPCTransitionRailroadEnv:
                 v_cmd_rl = v_ub_eco
                 eco_capped = True
                 self.eco_capped_steps += 1
+        if self.eco_governor and not self.shaper.in_landing and (
+            self.eco_a_cap is not None or self.eco_b_cap is not None or self.eco_v_knee is not None
+        ):
+            v_cmd_rl, a_start_cos, b_land_cos = self._eco_v2(v_cmd_rl, a_start_cos, b_land_cos)
 
         shield_intervened = False
         shield_diff = 0.0
@@ -1509,6 +1567,7 @@ def train_pure_ppo_cosine_pilot(
     ontrack_w: float = 0.0,
     a_start_center: float = 0.96,
     reward_fn=None,
+    comfort_bound: bool = False,
 ) -> tuple[CosineTrajectoryRLPolicy, list[dict]]:
     # reward_fn(env, rew, done, info) -> training reward (already scaled); None keeps the LossScore reward / 20.
     np.random.seed(seed)
@@ -1522,6 +1581,7 @@ def train_pure_ppo_cosine_pilot(
     env.rew_pace_change_w = float(pace_change_w)
     env.rew_ontrack_w = float(ontrack_w)
     env.a_start_center = float(a_start_center)
+    env.comfort_action_bound = bool(comfort_bound)
     policy = CosineTrajectoryRLPolicy(obs_dim=env.obs_dim, act_dim=env.act_dim, hidden_dim=64)
     if init_state is not None:
         # Fine-tuning (e.g. after enabling coasting): start from a trained pilot instead of random weights.
@@ -1754,6 +1814,7 @@ def evaluate_multi_station_journey(
         env.coast_enabled = bool(PILOT_COASTING if coast is None else coast) and mode in ("RL_LEARNED", "RL_FREE_LEARNED")
         if mode in ("RL_LEARNED", "RL_FREE_LEARNED"):
             env.a_start_center = OUR_A_START_CENTER
+            env.comfort_action_bound = COMFORT_ACTION_BOUND
         obs = env.reset(corridor_override=cor_leg, wind_profile=wind_prof)
         bilbao_ctrl = BilbaoCBTCATOController(cor_leg, env.physics) if mode == "BILBAO_CBTC_ATO" else None
         if mode == "LIT_PILOT":
@@ -2436,7 +2497,8 @@ def main():
     else:
         print(f"\n=== 2. Training 18-Feature Multi-Property PPO Pilot Across {args.epochs} Epochs ===", flush=True)
         rl_policy, _ = train_pure_ppo_cosine_pilot(
-            base_corridor, emulator=emulator, epochs=args.epochs, wind_mode=args.wind_mode, seed=args.seed
+            base_corridor, emulator=emulator, epochs=args.epochs, wind_mode=args.wind_mode, seed=args.seed,
+            comfort_bound=COMFORT_ACTION_BOUND,
         )
 
     free_ckpt_path = _resolve_ckpt(args.free_checkpoint)
@@ -2456,7 +2518,8 @@ def main():
         print(f"\n=== 2b. Training Parallel Stable-Accel (No-Cosine) PPO Pilot Across {args.epochs} Epochs ===", flush=True)
         rl_policy_free, _ = train_pure_ppo_cosine_pilot(
             base_corridor, emulator=emulator, epochs=args.epochs, wind_mode=args.wind_mode,
-            seed=args.seed + 100, checkpoint_prefix="ppo_free_pilot", use_cosine_shaper=False
+            seed=args.seed + 100, checkpoint_prefix="ppo_free_pilot", use_cosine_shaper=False,
+            comfort_bound=COMFORT_ACTION_BOUND,
         )
 
     if args.pilot_npz:

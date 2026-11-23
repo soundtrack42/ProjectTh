@@ -5,7 +5,7 @@ Generate publication-grade diagrams and empirical multi-panel paper figures insi
   2. `train_physical_forces.png`            - Free-body physical force diagram of train + weather
   3. `contract_searching_tree.png`          - Safe Contract Searching Tree with tube pruning & UCB
   4. `testing_disturbance_trajectories.png` - Multi-station trajectories across Baseline vs Extreme disturbances
-  5. `appendix_full_benchmark.png`          - Full-page 9-panel comparison across all 10 methods
+  5. `appendix_full_benchmark.png`          - Full-page 9-panel comparison across all 18 methods
   6. `appendix_disturbance_vs_clean_trajs.png` - Clean vs. Heavy-Disturbance trajectory comparison (many methods)
 """
 from __future__ import annotations
@@ -329,6 +329,10 @@ def _compute_scenario_ceil_grid(scenario: dict) -> tuple[np.ndarray, np.ndarray]
     return np.asarray(xs, dtype=np.float64), np.asarray(vc, dtype=np.float64)
 
 
+# Real-journey date of the published figures (the fetcher defaults to "yesterday", which changes the journeys).
+FIG_DATE = "2026-11-17"
+
+
 def generate_empirical_figures(fig_dir: Path) -> None:
     emu = LearnedLinearizationModel(hidden_dim=64)
     emu.load_state_dict(torch.load(SCRIPT_DIR / "checkpoints" / "best_emulator.pt", map_location="cpu", weights_only=True))
@@ -342,10 +346,10 @@ def generate_empirical_figures(fig_dir: Path) -> None:
 
     # Representative Baseline (ep=0: 4 stops, 16.15 km) & Extreme Storm/Slush (ep=11: #8601, 4 stops, 15.60 km, mu=0.62)
     sc_base = fetch_real_world_multi_station_scenario(
-        train_number=8311, n_legs_max=0, seed=9000, ep_idx=0, harsh_weather_mode="mixed"
+        date_str=FIG_DATE, train_number=8311, n_legs_max=0, seed=9000, ep_idx=0, harsh_weather_mode="mixed"
     )
     sc_ext = fetch_real_world_multi_station_scenario(
-        train_number=8311, n_legs_max=0, seed=9000 + 11 * 29, ep_idx=11, harsh_weather_mode="mixed"
+        date_str=FIG_DATE, train_number=8311, n_legs_max=0, seed=9000 + 11 * 29, ep_idx=11, harsh_weather_mode="mixed"
     )
     sc_clean = generate_multi_station_scenario(seed=9000, n_legs=3, wind_mode="none", allow_infeasible_breaks=False, extreme_noise=False)
 
@@ -470,7 +474,8 @@ def generate_empirical_figures(fig_dir: Path) -> None:
     full_method_keys = [_canon(k) for k in full_method_keys]
     lit_short = [("Xiao (2023)", "Xiao'23"), ("Zhong (2022)", "Zhong'22"), ("Chen (2025)", "CDQ'25"),
                  ("Zhao (2023)", "S-SARSA'23"), ("Huang (2025)", "EITOP'25"), ("Li (2023)", "SRL'23"),
-                 ("Zhao (2025)", "SSA-DRL'25")]
+                 ("Zhao (2025)", "SSA-DRL'25"), ("Cheng (2024)", "S-PPO'24"), ("Wang (2024)", "ES-MEDRL'24"),
+                 ("Tan (2025)", "GA-DDPG'25")]
     for prefix, lbl in lit_short:
         k_lit = next((k for k in csv_real_b if k.startswith(prefix)), None)
         if k_lit is not None and k_lit in csv_real_e and k_lit in csv_synth:
