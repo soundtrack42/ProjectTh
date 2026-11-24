@@ -41,21 +41,24 @@ The score is
 
 | Method | Real (measured) | Real (extreme) | Synthetic | Latency mean / max |
 |---|---|---|---|---|
-| 1. Greedy cosine + MPC | 5.928 | 6.029 | 7.060 | 33 / 89 µs |
-| **2. PPO pilot, unshielded** | **1.228** | **1.503** | 1.595 | 33 / 89 µs |
-| 3. PPO + switch shield | 1.298 | 1.538 | **1.527** | 52 / 165 µs |
-| 4. PPO + 1-step DCBF | 1.305 | 1.558 | 1.575 | 52 / 129 µs |
-| **5. PPO + UCB-DMPS (main method)** | 1.371 | 1.710 | 1.531 | 57 / 231 µs |
-| 6. Non-cosine PPO, unshielded | 1.346 | 1.755 | 1.654 | 37 / 98 µs |
-| 7. Non-cosine PPO + UCB-DMPS | 1.432 | 1.715 | 1.750 | 61 / 226 µs |
-| 8. Bilbao (2025), CBTC-ATO | 6.005 | 4.685 | 5.442 | 8 / 322 µs |
-| 9. Xiao (2023), convex eco-driving | 10.629 | 8.097 | 8.030 | 0.38 / 1.61 ms |
-| 10. Zhong (2022), pseudospectral MPC | 2.660 | 3.810 | 2.965 | 0.35 / 1.49 ms |
-| 11. CDQ (2025) | 6.890 | 6.800 | 5.958 | 35 / 132 µs |
-| 12. Shield SARSA (2023) | 11.807 | 11.664 | 11.688 | 34 / 133 µs |
-| 13. EITOP (2025) | 1.384 | 1.541 | 1.670 | 34 / 112 µs |
-| 14. SRL-IETTO (2023) | 1.404 | 1.891 | 1.785 | 40 / 138 µs |
-| 15. SSA-DRL (2025) | 1.539 | 1.713 | 1.772 | 83 / 276 µs |
+| 1. Greedy cosine + MPC | 6.007 | 6.078 | 7.085 | 34 / 202 µs |
+| **2. PPO pilot, unshielded** | 1.252 | **1.561** | 1.548 | 35 / 172 µs |
+| 3. PPO + switch shield | 1.237 | 1.567 | 1.530 | 55 / 209 µs |
+| 4. PPO + 1-step DCBF | 1.233 | 1.591 | 1.547 | 55 / 210 µs |
+| **5. PPO + UCB-DMPS (main method)** | 1.232 | 1.571 | **1.485** | 60 / 378 µs |
+| 6. Non-cosine PPO, unshielded | **1.226** | 1.618 | 1.601 | 39 / 202 µs |
+| 7. Non-cosine PPO + UCB-DMPS | 1.409 | 1.661 | 1.756 | 63 / 260 µs |
+| 8. Bilbao (2025), CBTC-ATO | 6.236 | 4.815 | 5.441 | 9 / 313 µs |
+| 9. Xiao (2023), convex eco-driving | 11.467 | 10.129 | 9.222 | 0.42 / 1.72 ms |
+| 10. Zhong (2022), pseudospectral MPC | 4.916 | 6.820 | 3.404 | 0.36 / 1.50 ms |
+| 11. CDQ (2025) | 6.790 | 6.948 | 5.966 | 36 / 235 µs |
+| 12. Shield SARSA (2023) | 11.893 | 11.903 | 11.618 | 35 / 212 µs |
+| 13. EITOP (2025) | 1.369 | 1.710 | 1.748 | 36 / 214 µs |
+| 14. SRL-IETTO (2023) | 1.375 | 1.838 | 1.821 | 41 / 216 µs |
+| 15. SSA-DRL (2025) | 1.532 | 1.791 | 1.757 | 86 / 329 µs |
+| 16. S-PPO (2024) | 2.311 | 2.095 | 2.117 | 37 / 180 µs |
+| 17. ES-MEDRL (2024) | 1.443 | 1.731 | 1.629 | 45 / 266 µs |
+| 18. GA-DDPG (2025) | 1.640 | 1.805 | 1.906 | 39 / 279 µs |
 
 - **Literature baselines.** None of them has a runtime safety layer that covers speed, comfort and deadline together: six have none, and two shield overspeed only.
 - **Mass identification.** Under extreme sensor noise, the second anemometer at 10 m cuts the mass error from about 680–950 kg to about 110–130 kg.

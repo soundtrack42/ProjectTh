@@ -1,11 +1,12 @@
 """
 Departure mass-identification benchmark: station-only approach vs. second platform-end anemometer.
 
-Both approaches use the same closed-form 2x2 MAP estimator (theta = 1000/M_eff, station wind d); they differ
-only in the sensors and therefore the identification window:
-  * station-only  (x_a2 = 0):  station anemometer, fixed 8-step (4 s) window; open-line gusts may start after 4 s.
-  * 2nd anemometer (x_a2 > 0): station-territory wind steady and measured by both sensors; the window runs until
-                               the train passes x_a2 (10 m default, 15 m where the platform allows).
+Both approaches use the same Kalman filter on (theta = 1000/M_eff, wind d), with the wind as a random walk
+(gusts and turbulence act from the first step); they differ only in the sensors and therefore the window:
+  * station-only  (x_a2 = 0):  station anemometer reading every step, fixed 8-step (4 s) window.
+  * 2nd anemometer (x_a2 > 0): both wayside anemometers send a reading every step; the window runs until the train
+                               passes x_a2 (10 m default, 15 m where the platform allows).
+Anemometer noise follows a low-cost ultrasonic sensor spec (max(0.3 m/s, 3 %), see railroad_corridor.py).
 
 Runs only the departure phase of every leg of the 30 + 30 benchmark journeys (same seeds as the main benchmark,
 verified against data/*_scenarios.json), so it takes seconds per configuration. Closed-loop effects on the full

@@ -56,6 +56,9 @@ class RailroadCorridor:
     speed_sensor_noise_mps: float = 0.0  # Tachometer/radar measurement noise std (m/s)
     unmodeled_drag_factor: float = 1.0   # Plant-only aerodynamic/rolling drag multiplier
     sensor_noise_seed: int = 0           # Deterministic RNG seed for sensor noise per leg
+    # Per-step std (m/s^2) of a wayside anemometer reading expressed as wind force, from the sensor spec
+    # (ANEMOMETER_ACC_*) and the true wind; None = legacy constant noise. Used only to generate noise.
+    anemometer_sigma_mps2: object = None
     is_extreme_scenario: bool = False    # Tag separating extreme noise-injected scenarios
     n_cars: float = 4.0                  # Consist size (4 = calibrated reference unit)
     train_length_m: float = 0.0          # >0: distributed-mass train (grade averaging); 0 = point mass
@@ -295,6 +298,38 @@ def wind_speed_to_longitudinal_accel(
     return float(d) if np.ndim(d) == 0 else d
 
 
+# Low-cost ultrasonic anemometer accuracy: the greater of 0.3 m/s or 3 % of the wind speed
+# (METER ATMOS41, Dombrowski et al., Sensors 21(3):741, 2021; within the WMO-No. 8 requirement of
+# 0.5 m/s below 5 m/s and 10 % above).
+ANEMOMETER_ACC_ABS_MPS = 0.3
+ANEMOMETER_ACC_REL = 0.03
+
+
+def anemometer_sigma_series(
+    w_head_series: np.ndarray,
+    w_cross: float = 0.0,
+    dt: float = 0.50,
+    rho_ratio: float = 1.0,
+    drag_mult: float = 1.0,
+    car_scale: float = 1.0,
+) -> np.ndarray:
+    """
+    Std (m/s^2) of one anemometer reading expressed as wind force, per step. The sensor error in wind speed,
+    max(0.3 m/s, 3 % of |w|), is propagated through the same drag model and reference-speed blend as
+    wind_speed_series_to_accel_profile (first-order term plus the second-order term that dominates at w ~ 0).
+    """
+    w_h = np.clip(np.asarray(w_head_series, dtype=np.float64), -MAX_WIND_SPEED_MPS, MAX_WIND_SPEED_MPS)
+    n = len(w_h)
+    t_grid = np.arange(n, dtype=np.float64) * dt
+    gate = np.clip((t_grid - STATION_WINDOW_S) / 6.0, 0.0, 1.0)
+    v_ref = gate * WIND_REF_CRUISE_MPS
+    s = float(car_scale)
+    a_long = AERO_DAVIS_A_NS2_M2 * (AERO_NOSE_TAIL_FRACTION + (1.0 - AERO_NOSE_TAIL_FRACTION) * s)
+    k = a_long * float(rho_ratio) * float(drag_mult) / (WIND_REF_M_EFF_KG * s)
+    sig_w = np.maximum(ANEMOMETER_ACC_ABS_MPS, ANEMOMETER_ACC_REL * np.hypot(w_h, float(w_cross)))
+    return 2.0 * k * np.abs(v_ref + w_h) * sig_w + k * sig_w * sig_w
+
+
 def wind_speed_series_to_accel_profile(
     w_head_series: np.ndarray,
     w_head_station: float,
@@ -305,18 +340,17 @@ def wind_speed_series_to_accel_profile(
     car_scale: float = 1.0,
 ) -> np.ndarray:
     """
-    Maps a head-wind speed series (m/s) to the plant disturbance profile (m/s^2):
-    constant station wind (v_ref = 0) over the k = 0..7 telemetry window, then a smooth 6 s blend
-    to the open-line value (v_ref = 15 m/s) including gusts/turbulence.
+    Maps a head-wind speed series (m/s) to the plant disturbance profile (m/s^2). The same time-varying
+    wind (gusts and turbulence included) acts from the first step; only the reference speed of the drag
+    model changes, from v_ref = 0 at the platform (first 4 s) to v_ref = 15 m/s on the open line over 6 s.
+    `w_head_station` is kept for API compatibility and no longer used: the station wind is not held steady.
     """
     n = len(w_head_series)
     t_grid = np.arange(n, dtype=np.float64) * dt
-    d_station = wind_speed_to_longitudinal_accel(w_head_station, w_cross, 0.0, rho_ratio, drag_mult, car_scale)
+    d_station = wind_speed_to_longitudinal_accel(w_head_series, w_cross, 0.0, rho_ratio, drag_mult, car_scale)
     d_open = wind_speed_to_longitudinal_accel(w_head_series, w_cross, WIND_REF_CRUISE_MPS, rho_ratio, drag_mult, car_scale)
     gate = np.clip((t_grid - STATION_WINDOW_S) / 6.0, 0.0, 1.0)
-    prof = (1.0 - gate) * d_station + gate * d_open
-    prof[:STATION_WINDOW_STEPS] = d_station
-    return prof
+    return (1.0 - gate) * d_station + gate * d_open
 
 
 def _extract_wind_events(profile: np.ndarray, dt: float, thresh: float = 0.04, min_len_s: float = 6.0):
@@ -366,7 +400,7 @@ def generate_disjoint_wind_events(
 ) -> tuple[np.ndarray, str, list[tuple[float, float, float]]]:
     """
     Isolated head/tail gust fronts (moderate 10-17 m/s wind speed) mapped through the physical
-    Davis-drag wind model; calm at the station departure window (k = 0..7).
+    Davis-drag wind model.
     `calm_deadband_mps2` is kept for API compatibility (calm air is now defined in wind speed).
     """
     rng = np.random.default_rng(seed)
@@ -405,7 +439,11 @@ def generate_continuous_evolving_wind(
 
 def _ou_turbulence(n_steps: int, dt: float, sigma: float, tau_s: float, rng: np.random.Generator,
                    lp_tau_s: float = 3.2, start_k: int = STATION_WINDOW_STEPS) -> np.ndarray:
-    """2nd-order band-limited Ornstein-Uhlenbeck turbulence (m/s), zero inside the station window."""
+    """2nd-order band-limited Ornstein-Uhlenbeck turbulence (m/s), fully developed from the first step.
+
+    Draws the same n_steps - start_k innovations as before (so the scenario RNG stream is unchanged) and
+    drops the zero start plus a 20 s warm-up, so turbulence also acts during the station departure.
+    """
     phi = math.exp(-dt / tau_s)
     alpha = dt / (lp_tau_s + dt)
     s1 = 0.0
@@ -413,7 +451,19 @@ def _ou_turbulence(n_steps: int, dt: float, sigma: float, tau_s: float, rng: np.
     for k in range(start_k, n_steps):
         s1 = phi * s1 + sigma * math.sqrt(1.0 - phi * phi) * float(rng.normal())
         out[k] = (1.0 - alpha) * out[k - 1] + alpha * s1
-    return out
+    return _drop_ou_warmup(out, start_k)
+
+
+OU_WARMUP_STEPS = 40  # 20 s, several OU time constants
+
+
+def _drop_ou_warmup(out: np.ndarray, start_k: int) -> np.ndarray:
+    """Shift an OU series that starts at zero so that it is stationary at k = 0 (tail padded)."""
+    cut = min(len(out) - 1, start_k + OU_WARMUP_STEPS)
+    res = np.empty_like(out)
+    res[: len(out) - cut] = out[cut:]
+    res[len(out) - cut:] = out[-1]
+    return res
 
 
 def _build_leg_zones(leg_length_m: float, rng: np.random.Generator) -> tuple[list[SpeedLimitZone], float]:
@@ -565,8 +615,7 @@ def generate_multi_station_scenario(
             w_desc = "Disjoint gust fronts 10-17 m/s"
         w_head_station = float(w_head[0])
 
-        # Wayside station sensor at departure (first 8 steps, t < 4.0 s):
-        anem_std = 0.018 if extreme_noise else 0.008
+        # Wayside station sensor reading at departure (k = 0):
         if extreme_noise:
             # Beaufort 9-10 storm: sustained 20-24 m/s at a random bearing, gust fronts up to 26-30 m/s
             # (<= 30 m/s cap) alternating head/tail on the open line, 12% turbulence intensity.
@@ -577,15 +626,14 @@ def generate_multi_station_scenario(
             w_head_sus = v_sus * math.cos(ang)
             w_cross_leg = abs(v_sus * math.sin(ang))
             w_head = np.full(n_st, w_head_sus, dtype=np.float64)
-            open_line_gate = np.clip((t_grid - STATION_WINDOW_S) / 6.0, 0.0, 1.0)
             sgn0 = 1.0 if w_head_sus >= 0.0 else -1.0
             for g_i in range(3):
                 c_s = float(rng.uniform(0.14 + 0.24 * g_i, 0.30 + 0.24 * g_i) * leg_budget_s)
                 w_s = float(rng.uniform(16.0, 26.0))
                 sgn = sgn0 if (g_i % 2 == 0) else -sgn0
                 target = sgn * float(rng.uniform(26.0, 30.0))
-                w_head = w_head + (target - w_head_sus) * np.exp(-0.5 * ((t_grid - c_s) / w_s) ** 2) * open_line_gate
-            w_head = w_head + _ou_turbulence(n_st, 0.50, 0.12 * 28.0, 4.8, rng) * open_line_gate
+                w_head = w_head + (target - w_head_sus) * np.exp(-0.5 * ((t_grid - c_s) / w_s) ** 2)
+            w_head = w_head + _ou_turbulence(n_st, 0.50, 0.12 * 28.0, 4.8, rng)
             w_head = np.clip(w_head, -MAX_WIND_SPEED_MPS, MAX_WIND_SPEED_MPS)
             w_head_station = w_head_sus
             drag_mult_reg = max(drag_mult_reg, 1.10)
@@ -607,7 +655,10 @@ def generate_multi_station_scenario(
         elif ev_desc:
             w_desc = f"{w_desc}: " + " | ".join(ev_desc)
 
-        station_wind_reading = float(w_prof[0] + rng.normal(0.0, anem_std)) if is_weather_active else 0.0
+        anem_sig = anemometer_sigma_series(w_head, w_cross=w_cross_leg, dt=0.50, rho_ratio=rho_ratio_leg,
+                                           drag_mult=drag_mult_reg, car_scale=s_car)
+        # Station anemometer reading at departure (k = 0); the same draw as before, scaled to the sensor spec:
+        station_wind_reading = float(w_prof[0] + anem_sig[0] * rng.normal(0.0, 1.0)) if is_weather_active else 0.0
         speed_noise_std = 0.0025 if extreme_noise else 0.0
         unmodeled_drag = float(rng.uniform(1.03, 1.08)) if extreme_noise else 1.0
 
@@ -629,6 +680,7 @@ def generate_multi_station_scenario(
             speed_sensor_noise_mps=speed_noise_std,
             unmodeled_drag_factor=unmodeled_drag,
             sensor_noise_seed=int(seed * 101 + leg_idx * 17),
+            anemometer_sigma_mps2=anem_sig,
             is_extreme_scenario=bool(extreme_noise),
             speed_zones=zones,
             n_cars=n_cars_eff,

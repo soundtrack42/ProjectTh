@@ -83,65 +83,54 @@ def _pill(ax, x: float, y: float, txt: str, col="#0F172A", bg="#FFFFFF", ec="#CB
 
 
 def generate_pipeline_stages(out_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(14.5, 5.0), dpi=300)
-    ax.set_xlim(0, 14.5)
-    ax.set_ylim(0, 5.0)
+    """Control loop as in MPCTransitionRailroadEnv.step(): forces estimated -> PPO plan -> eco governor ->
+    shield (contract search tree only when the plan is unsafe) -> shaper + MPC -> back to force estimation.
+    The eco governor never coasts or brakes (it holds speed and softens starts when early); coasting is the
+    shield's C4 backup. The learned speed-range predictor lives inside the shield (and caps the pilot's speed).
+    """
+    W, H = 16.0, 3.75
+    fig, ax = plt.subplots(figsize=(W, H), dpi=300)
+    ax.set_xlim(0, W)
+    ax.set_ylim(-0.12, H - 0.25)
     ax.axis("off")
 
-    top_y, top_h = 2.85, 1.85
-    _card(ax, 0.25, top_y, 2.45, top_h, "1. Station estimation",
-          ["Weather + ticket telemetry",
-           "Train mass at departure",
-           "Wind observer on the line"],
-          "#F5F3FF", "#6250D6", "#6250D6", fb=8.4)
-    _card(ax, 3.05, top_y, 2.45, top_h, "2. PPO pilot",
-          ["Cruise speed, start and",
-           "braking rate every macro step",
-           "Eco cap when ahead of time"],
-          "#EFF6FF", "#2A78D6", "#2A78D6", fb=8.4)
-    _card(ax, 5.85, top_y, 2.55, top_h, "3. Contract shield",
-          ["Checks speed, comfort,",
-           "deadline margins",
-           "Safe backup only if violated"],
-          "#FFF1F2", "#E34948", "#C73534", fb=8.4)
-    _card(ax, 8.75, top_y, 2.45, top_h, "4. Smooth reference",
-          ["Half-cosine curve (cosine)",
-           "or Hermite curve (non-cosine)",
-           "No jerk spikes"],
-          "#F0FDFA", "#1BAF7A", "#13895F", fb=8.4)
-    _card(ax, 11.55, top_y, 2.70, top_h, "5. MPC tracker",
-          ["Models drivetrain lag",
-           "Closed-form solve",
-           "Traction / brake command"],
-          "#ECFDF5", "#008300", "#006A00", fb=8.4)
+    stages = [
+        ("1. Force estimation", ["Mass + wind at departure", "Wind and grip along route"], "#F5F3FF", "#6250D6", "#6250D6"),
+        ("2. PPO pilot", ["Picks a speed plan every 4 s"], "#EFF6FF", "#2A78D6", "#2A78D6"),
+        ("3. Eco governor", ["When early: hold speed.", "Depart more gently"], "#F0FDF4", "#4D9A3A", "#3F7F30"),
+        ("4. Shield", ["Predicts the 99% speed range,", "checks the proposed plan"], "#FFF1F2", "#E34948", "#C73534"),
+        ("5. MPC tracker", ["Smooth speed curve,", "traction / brake command"], "#ECFDF5", "#008300", "#006A00"),
+    ]
+    flow = ["estimated\nforces", "speed\nplan", "capped\nplan", "safe\nplan"]
+    x0, w, top_y, top_h = 0.35, 2.45, 2.1, 1.35
+    gap = (W - 2 * x0 - len(stages) * w) / (len(stages) - 1)
+    xs = [x0 + i * (w + gap) for i in range(len(stages))]
+    cx = [x + w / 2 for x in xs]
+    for x, (title, lines, fc, ec, hc) in zip(xs, stages):
+        _card(ax, x, top_y, w, top_h, title, lines, fc, ec, hc, ft=9.4, fb=8.3)
+    ym = top_y + 0.42
+    for i in range(len(stages) - 1):
+        _arr(ax, (xs[i] + w, ym), (xs[i + 1], ym), col=stages[i][3])
+        ax.text(xs[i] + w + gap / 2, ym + 0.12, flow[i], ha="center", va="bottom",
+                fontsize=7.6, color="#334155", linespacing=1.05, zorder=6)
 
-    _card(ax, 9.20, 0.40, 5.05, 1.55, "6. Train and weather",
-          ["Drag, grades, curves, wind gusts",
-           "Wheel-rail grip, unknown passenger load"],
-          "#F8FAFC", "#475569", "#334155", fb=8.4)
-    _card(ax, 2.80, 0.40, 5.65, 1.55, "7. Learned uncertainty model",
-          ["Predicts next speed and its 99% band",
-           "Band used by pilot bound and shield"],
-          "#FAF5FF", "#7E22CE", "#7E22CE", fb=8.4)
+    # Contract search: a separate branch, entered only when the shield finds the plan unsafe
+    bk_w = 3.4
+    bk_x = cx[3] - bk_w / 2
+    _card(ax, bk_x, 0.25, bk_w, 1.15, "Contract search tree (only if unsafe)",
+          ["Backup contracts C1-C4 x 3 blend strengths;", "prune unsafe leaves, keep the best reward"],
+          "#FEF2F2", "#E34948", "#991B1B", ft=8.6, fb=8.0)
+    _arr(ax, (cx[3] - 0.45, top_y), (cx[3] - 0.45, 1.40), col="#C73534", lw=1.6, ls="--")
+    _pill(ax, cx[3] - 1.20, 1.76, "unsafe", col="#991B1B", bg="#FEF2F2", ec="#F87171", fs=7.4)
+    _arr(ax, (cx[3] + 0.45, 1.40), (cx[3] + 0.45, top_y), col="#C73534", lw=1.6)
+    _pill(ax, cx[3] + 1.25, 1.76, "best among safe option", col="#991B1B", bg="#FEF2F2", ec="#F87171", fs=7.4)
 
-    ym = top_y + 0.80
-    _arr(ax, (2.70, ym), (3.05, ym), col="#475569")
-    _arr(ax, (5.50, ym), (5.85, ym), col="#2A78D6")
-    _arr(ax, (8.40, ym), (8.75, ym), col="#C73534")
-    _arr(ax, (11.20, ym), (11.55, ym), col="#13895F")
-
-    _arr(ax, (12.90, top_y), (12.90, 1.95), col="#006A00")
-    _pill(ax, 13.62, 2.40, "command", col="#065F46", bg="#ECFDF5", ec="#10B981", fs=7.6)
-    _arr(ax, (9.20, 1.18), (8.45, 1.18), col="#475569")
-    _pill(ax, 8.82, 1.58, "speed", fs=7.4)
-
-    ax.plot([11.72, 11.72, 1.47, 1.47], [0.40, 0.10, 0.10, top_y], color="#6250D6", lw=1.6, ls="--", zorder=3)
-    _arr(ax, (1.47, top_y - 0.2), (1.47, top_y), col="#6250D6", lw=1.6)
-    _pill(ax, 1.47, 1.55, "measurements", col="#3B2F99", bg="#F5F3FF", ec="#A78BFA", fs=7.4)
-
-    _arr(ax, (7.10, 1.95), (7.10, top_y), col="#7E22CE", lw=1.8)
-    _arr(ax, (4.28, 1.95), (4.28, top_y), col="#7E22CE", lw=1.5, ls="--")
-    _pill(ax, 5.68, 2.40, "99% speed band", col="#581C87", bg="#FAF5FF", ec="#C084FC", fs=7.6)
+    # Closed loop: MPC command acts on the train, measurements feed force estimation again
+    xa, xb, yb = cx[4], cx[0], -0.04
+    ax.plot([xa, xa, xb, xb], [top_y, yb, yb, top_y - 0.2], color="#475569", lw=1.6, zorder=3)
+    _arr(ax, (xb, top_y - 0.2), (xb, top_y), col="#475569", lw=1.6)
+    _pill(ax, xa, 0.95, "traction / brake\napplied to train", col="#065F46", bg="#ECFDF5", ec="#10B981", fs=7.4)
+    _pill(ax, xb, 0.95, "measured speed,\nwind, grip", col="#3B2F99", bg="#F5F3FF", ec="#A78BFA", fs=7.4)
 
     fig.tight_layout(pad=0.25)
     fig.savefig(str(out_path), dpi=300, bbox_inches="tight")
@@ -238,78 +227,80 @@ def generate_train_physical_forces(out_path: Path) -> None:
 
 def generate_contract_searching_tree(out_path: Path) -> None:
     """Worked example: a headwind makes the train late, so the deadline margin is violated."""
-    fig, ax = plt.subplots(figsize=(14.5, 6.9), dpi=300)
-    ax.set_xlim(0, 14.5)
-    ax.set_ylim(0, 6.9)
+    fig, ax = plt.subplots(figsize=(13.2, 6.0), dpi=300)
+    ax.set_xlim(0, 13.2)
+    ax.set_ylim(0, 6.0)
     ax.axis("off")
 
-    ax.text(7.25, 6.68, "Example: a headwind makes the train late, so the deadline margin is violated",
+    ax.text(6.6, 5.82, "Example: a headwind makes the train late (deadline margin violated)",
             ha="center", va="center", fontsize=10.5, fontweight="bold", color="#0F172A")
 
-    _card(ax, 0.25, 2.45, 2.45, 1.85, "PPO proposal",
-          ["Cruise speed, start and",
-           "braking rate",
-           "Speed, comfort: OK",
-           "Deadline: violated"],
-          "#EFF6FF", "#2A78D6", "#2A78D6", ft=9.2, fb=7.9)
+    _card(ax, 0.20, 2.35, 2.10, 1.30, "Pilot command",
+          ["Speed, comfort: OK", "Deadline: violated"],
+          "#EFF6FF", "#2A78D6", "#2A78D6", ft=9.2, fb=8.0)
 
+    # Safety contracts: each restores one safety property.
+    ax.text(4.20, 5.40, "Safety contracts", ha="center", va="center", fontsize=8.6, fontweight="bold",
+            color="#334155")
     c_specs = [
-        (5.15, "C1 Speed clamp", "Stay under limit\nminus 99% band", "#F1F5F9", "#64748B", "#475569"),
-        (3.60, "C2 Comfort", "Soften acceleration\nand braking ramps", "#ECFDF5", "#1BAF7A", "#13895F"),
-        (2.05, "C3 Deadline", "Speed up to\nrecover lost time", "#FEF2F2", "#E34948", "#C73534"),
-        (0.50, "C4 Eco", "Coast, or hold\nspeed when early", "#F0FDF4", "#008300", "#006A00"),
+        (4.25, "C1 Speed", "#F1F5F9", "#64748B", "#475569"),
+        (3.05, "C2 Comfort", "#ECFDF5", "#1BAF7A", "#13895F"),
+        (1.85, "C3 Deadline", "#FEF2F2", "#E34948", "#C73534"),
     ]
-    for cy, title, sub, fc, ec, hc in c_specs:
-        _card(ax, 3.45, cy, 2.55, 1.15, title, [sub], fc, ec, hc, ft=8.9, fb=7.7)
-        _arr(ax, (2.70, 3.37), (3.45, cy + 0.58), col=hc, lw=1.7)
+    for cy, title, fc, ec, hc in c_specs:
+        ax.add_patch(FancyBboxPatch((3.25, cy + 0.15), 1.90, 0.65, boxstyle="round,pad=0.04,rounding_size=0.14",
+                                    facecolor=hc, edgecolor=ec, linewidth=1.5, zorder=2))
+        ax.text(4.20, cy + 0.475, title, ha="center", va="center", fontsize=9.0, fontweight="bold",
+                color="#FFFFFF", zorder=4)
+        _arr(ax, (2.30, 3.00), (3.25, cy + 0.47), col=hc, lw=1.7)
 
-    GREY = ("#F1F5F9", "#94A3B8", "#475569", False)   # kept but scores low
-    PRUN = ("#FEE2E2", "#F87171", "#991B1B", False)   # pruned
+    # Energy option: not a safety property, kept only if every safety margin holds.
+    ax.plot([2.95, 9.05], [1.45, 1.45], color="#94A3B8", lw=1.0, ls="--", zorder=1)
+    ax.text(4.20, 1.27, "Energy option (not a safety property)", ha="center", va="center", fontsize=8.0,
+            style="italic", color="#475569")
+    ax.add_patch(FancyBboxPatch((3.25, 0.325), 1.90, 0.65, boxstyle="round,pad=0.04,rounding_size=0.14",
+                                facecolor="#F8FAFC", edgecolor="#94A3B8", linewidth=1.5, linestyle="--", zorder=2))
+    ax.text(4.20, 0.65, "C4 Eco coast", ha="center", va="center", fontsize=9.0, fontweight="bold", color="#475569")
+    _arr(ax, (2.30, 3.00), (3.25, 0.65), col="#94A3B8", lw=1.3, ls=":")
+
+    GREY = ("#F1F5F9", "#94A3B8", "#475569", False)
+    PRUN = ("#FEE2E2", "#F87171", "#991B1B", False)
     FEAS = ("#DBEAFE", "#2A78D6", "#1E3A8A", True)
     WIN = ("#DCFCE7", "#008300", "#14532D", True)
-    lam_vals = ["55%", "85%", "100%"]
-    node_statuses = [
-        [("still late", GREY)] * 3,
-        [("still late", GREY)] * 3,
-        [("feasible, less time recovered", FEAS), ("CHOSEN", WIN), ("pruned: over speed band", PRUN)],
-        [("pruned: even later", PRUN)] * 3,
+    ax.text(7.05, 5.40, "Blends 55 / 85 / 100%", ha="center", va="center", fontsize=8.6, fontweight="bold",
+            color="#334155")
+    leaves = [
+        (4.25, [("still late", GREY)]),
+        (3.05, [("still late", GREY)]),
+        (1.85, [("55%: safe", FEAS), ("85%: chosen", WIN), ("100%: over band", PRUN)]),
+        (0.30, [("later: pruned", PRUN)]),
     ]
-    lam_y_offsets = [0.92, 0.57, 0.22]
-    for c_idx, (cy, *_rest) in enumerate(c_specs):
-        for l_idx, (dy, lv) in enumerate(zip(lam_y_offsets, lam_vals)):
-            ny = cy + dy - 0.14
-            st_lbl, (bg_c, bd_c, txt_c, strong) = node_statuses[c_idx][l_idx]
-            win = st_lbl == "CHOSEN"
-            ax.add_patch(FancyBboxPatch((6.75, ny), 2.55, 0.30, boxstyle="round,pad=0.02,rounding_size=0.06",
+    for cy, items in leaves:
+        hgt = 0.95 if cy > 0.5 else 0.70
+        n = len(items)
+        for i, (lbl, (bg_c, bd_c, txt_c, strong)) in enumerate(items):
+            bh = 0.26 if n == 3 else 0.34
+            ny = cy + hgt / 2 - bh / 2 + (1 - i) * 0.31 if n == 3 else cy + hgt / 2 - bh / 2
+            win = lbl.endswith("chosen")
+            ax.add_patch(FancyBboxPatch((6.05, ny), 2.00, bh, boxstyle="round,pad=0.02,rounding_size=0.06",
                                         facecolor=bg_c, edgecolor=bd_c, linewidth=(2.0 if win else 1.1), zorder=3))
-            _arr(ax, (6.00, cy + 0.58), (6.75, ny + 0.15),
+            _arr(ax, (5.15, cy + hgt / 2), (6.05, ny + bh / 2),
                  col=("#008300" if win else ("#2A78D6" if strong else "#94A3B8")),
                  lw=(2.2 if win else 1.1), ls=("-" if strong else ":"), ms=10.0)
-            ax.text(8.02, ny + 0.15, f"{lv} blend: {st_lbl}", ha="center", va="center",
-                    fontsize=7.2, fontweight=("bold" if strong else "normal"), color=txt_c, zorder=4)
+            ax.text(7.05, ny + bh / 2, ("all blends " + lbl) if n == 1 else lbl, ha="center", va="center",
+                    fontsize=7.8, fontweight=("bold" if strong else "normal"), color=txt_c, zorder=4)
 
-    ax.text(11.08, 5.75, "Each contract is blended with the\nproposal at 55%, 85%, or 100% strength",
-            ha="center", va="center", fontsize=7.6, color="#475569", style="italic")
-    ax.plot([9.42, 9.52, 9.52, 9.42], [0.62, 0.62, 6.10, 6.10], color="#7E22CE", lw=1.4, zorder=2)
+    ax.plot([8.15, 8.25, 8.25, 8.15], [0.45, 0.45, 5.10, 5.10], color="#7E22CE", lw=1.4, zorder=2)
+    _card(ax, 8.60, 2.35, 2.15, 1.30, "Prune and score",
+          ["Drop blends outside", "the 99% band", "Keep the best reward"],
+          "#FAF5FF", "#7E22CE", "#7E22CE", ft=9.0, fb=7.9, line_step=0.24)
+    _arr(ax, (8.25, 3.00), (8.60, 3.00), col="#7E22CE", lw=2.0, ms=14)
 
-    _card(ax, 9.85, 2.60, 2.45, 2.30, "Prune and score",
-          ["1. Drop leaves that break a",
-           "    higher-priority margin",
-           "2. Drop leaves whose 8-step",
-           "    band crosses the limit",
-           "3. Keep the best worst-case",
-           "    margin + energy score"],
-          "#FAF5FF", "#7E22CE", "#7E22CE", ft=8.9, fb=7.6, line_step=0.24)
-    _arr(ax, (9.52, 3.75), (9.85, 3.75), col="#7E22CE", lw=2.0, ms=14)
-
-    _card(ax, 12.65, 2.95, 1.75, 1.60, "Verify and hold",
-          ["2-step check with",
-           "learned model",
-           "Hold 2 steps, then",
-           "release when safe"],
-          "#ECFDF5", "#008300", "#006A00", ft=8.9, fb=7.6, line_step=0.22)
-    _arr(ax, (12.30, 3.75), (12.65, 3.75), col="#008300", lw=2.2, ms=14)
-    ax.text(13.52, 2.72, "safe setpoint to\nthe reference shaper", ha="center", va="top", fontsize=7.4, color="#14532D")
+    _card(ax, 11.10, 2.35, 1.90, 1.30, "Verify and hold",
+          ["2-step check", "hold 2 steps"],
+          "#ECFDF5", "#008300", "#006A00", ft=9.0, fb=7.9, line_step=0.26)
+    _arr(ax, (10.75, 3.00), (11.10, 3.00), col="#008300", lw=2.2, ms=14)
+    ax.text(12.05, 2.20, "to the shaper", ha="center", va="top", fontsize=7.8, color="#14532D")
 
     fig.tight_layout(pad=0.25)
     fig.savefig(str(out_path), dpi=300, bbox_inches="tight")
@@ -550,7 +541,7 @@ def generate_empirical_figures(fig_dir: Path) -> None:
     ax_lat.bar(xp - bw, m_lat, bw, color="#2a78d6", label="Mean")
     ax_lat.bar(xp, p_lat, bw, color="#eb6834", label="99th percentile")
     ax_lat.bar(xp + bw, mx_e, bw, color="#1baf7a", label="Worst case")
-    ax_lat.axhline(400.0, color="red", ls="--", lw=1.4, label="400 µs target (methods 2-7)")
+    ax_lat.axhline(500.0, color="red", ls="--", lw=1.4, label="500 µs budget (methods 2-7)")
     ax_lat.set_yscale("log")
     ax_lat.set_title("9. Step latency, extreme weather (µs, log scale)", fontweight="bold", fontsize=10.5)
     ax_lat.set_ylabel("Microseconds")

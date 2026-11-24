@@ -42,6 +42,11 @@ from havaei_generalizing_rl import NonlinearTrainPhysics, LearnedLinearizationMo
 from railroad_corridor import (
     RailroadCorridor,
     generate_multi_station_scenario,
+    AERO_DAVIS_A_NS2_M2,
+    AERO_NOSE_TAIL_FRACTION,
+    WIND_REF_M_EFF_KG,
+    ANEMOMETER_ACC_ABS_MPS,
+    ANEMOMETER_ACC_REL,
 )
 from cosine_trajectory_shaper import CosineTrajectoryShaper
 from real_world_rail_weather import (
@@ -62,12 +67,17 @@ from goodall_trajectory_shield import (
 # ===========================================================================
 
 # Departure mass-ID approaches (both kept, selected by the 2nd anemometer position):
-#   > 0  : second wayside anemometer at the platform end (m from the stop). The station-territory wind is
-#          steady and measured by both sensors; the mass window runs until the train passes it. 10 m
-#          fits even very short stations (15 m is slightly more accurate where the platform allows).
-#   0    : station-only approach. Only the station anemometer, fixed 8-step (4 s) window; open-line
-#          gusts may start after 4 s.
+#   > 0  : second wayside anemometer at the platform end (m from the stop). Both wayside anemometers send a
+#          reading every 0.5 s step; the mass window runs until the train passes the 2nd one. 10 m fits even
+#          very short stations (15 m where the platform allows).
+#   0    : station-only approach. Only the station anemometer, fixed 8-step (4 s) window.
+# The wind is NOT steady: gusts and turbulence act from the first step, so the estimator is a Kalman filter
+# on (theta = 1000 / M_eff, wind d) in which d drifts as a random walk.
 STATION_ANEMOMETER2_X_M = 10.0
+# Random-walk std of the wind state per 0.5 s step (m/s^2). Selected on tuning seeds 5000+29k, all legs, 2nd
+# anemometer at 10 m: MAE 145 / 109 / 101 / 99 / 98 / 98 kg for q = 0.003 / 0.006 / 0.012 / 0.024 / 0.048 / 0.096;
+# 0.024 is the smallest value on the plateau (within 1 kg of the best).
+MASS_KF_WIND_Q = 0.024
 
 # Pre-landing coasting for the proposed PPO methods (2-7); off by default, --coast enables it.
 PILOT_COASTING = False
@@ -234,13 +244,13 @@ class MPCTransitionRailroadEnv:
         self.macro_steps_total = 0
         self._coast_lock_until = -1
         self._v_cmd_pilot_prev: float | None = None
-        # Departure mass ID accumulators (cumulative regressors of the telescoped force balance):
-        self._mid_cum_f = 0.0     # sum F_k dt   [kN s]   (traction - Davis drag, from mu_adh & T_amb)
-        self._mid_cum_c = 0.0     # sum gate_k dt [s]     (wind acts only when moving or tractive)
-        self._mid_cum_g = 0.0     # sum g_k dt    [m/s]   (grade + thermal curve resistance per M_eff)
-        self._mid_info = [0.0, 0.0, 0.0]   # (I_tt, I_td, I_dd) Gauss-Newton information
-        self._mid_rhs = [0.0, 0.0]
+        # Departure mass ID: Kalman filter on (theta, wind d), initialised from the ticket prior and the
+        # station anemometer reading at standstill. Wayside anemometer noise (true std, used ONLY to draw the
+        # readings) comes from the scenario; the filter uses its own variance model (_anem_var).
         self.d_standstill = float(getattr(self.corridor, "station_wind_sensor_mps2", 0.0))
+        sig_prof = getattr(self.corridor, "anemometer_sigma_mps2", None)
+        self._anem_sig_true = None if sig_prof is None else np.asarray(sig_prof, dtype=np.float64)
+        self._anem_rng = np.random.default_rng((int(getattr(self.corridor, "sensor_noise_seed", 0)), 79))
         self.station_mu = float(getattr(self.corridor, "adhesion_mu_factor", 1.0))
         self.station_temp_c = float(getattr(self.corridor, "temp_celsius", 18.0))
         prof = getattr(self.corridor, "slow_weather_profile", None)
@@ -271,6 +281,7 @@ class MPCTransitionRailroadEnv:
         self.v_prev = 0.0
         self.v_meas = 0.0
         self.v_meas_prev = 0.0
+        self._mkf_init()
         self.u_act = 0.0
         self.d_hat = self.d_standstill
         self.d_hat_prev = self.d_standstill
@@ -365,54 +376,81 @@ class MPCTransitionRailroadEnv:
         return (293.15 / max(250.0, 273.15 + T), 1.0 + 0.0045 * max(0.0, T - 25.0),
                 1.0 + 0.00393 * max(0.0, T - 20.0))
 
-    def _accumulate_departure_mass_step(
-        self, f_net_n: float, g_spec: float, wind_gate: bool, v_next_meas: float
-    ) -> None:
-        """
-        Station-territory (k = 0 .. passing the 2nd anemometer) force balance, closed in the two unknowns theta = 1000 / M_eff and the
-        station wind d. The weather fixes every other term: traction force from adhesion mu (mass
-        independent, M_eff * a_max(M) = 1.08 * 85 t * a_base * mu), Davis drag scaled by air density
-        rho(T_amb), CWR-thermal curve resistance, and the anemometer prior on d. Telescoping
-            v_{k+1} - 0.14 v_k + sum_j g_j dt = theta * sum_j F_j dt + d * sum_j gate_j dt
-        keeps the tachometer noise un-differenced. Standstill steps (measured v_{k+1} == 0, where the
-        wheel-rail clamp v >= 0 makes the balance non-linear) carry no information and are skipped.
-        """
-        if v_next_meas <= 0.0:
-            return
-        dt = self.corridor.dt
-        self._mid_cum_f += (f_net_n / 1000.0) * dt
-        self._mid_cum_c += dt if wind_gate else 0.0
-        self._mid_cum_g += g_spec * dt
-        y = (v_next_meas - 0.14 * self.v_meas) + self._mid_cum_g
-        w = 1.0 / max(1e-4, 1.01 * self.speed_sensor_noise_mps) ** 2
-        rf, rc = self._mid_cum_f, self._mid_cum_c
-        inf = self._mid_info
-        inf[0] += w * rf * rf
-        inf[1] += w * rf * rc
-        inf[2] += w * rc * rc
-        self._mid_rhs[0] += w * rf * y
-        self._mid_rhs[1] += w * rc * y
-
-    def _solve_departure_mass_kg(self) -> tuple[float, float]:
-        """Closed-form 2x2 MAP solve (ticket-mass prior on theta, anemometer prior on d)."""
+    def _mkf_init(self) -> None:
+        """Departure mass-ID Kalman filter state: x = (theta = 1000 / M_eff, wind d), ticket and anemometer priors."""
         prior = self.mass_prior_kg
         th0 = 1000.0 / ((1.0 + self.physics.gamma) * prior)
-        s_car = self.corridor.car_scale
-        sig_th = th0 * (2500.0 * s_car / prior)
-        sig_anem = 0.018 if self.speed_sensor_noise_mps > 0.0 else 0.008
-        a11 = self._mid_info[0] + 1.0 / (sig_th * sig_th)
-        a12 = self._mid_info[1]
-        a22 = self._mid_info[2] + 1.0 / (sig_anem * sig_anem)
-        b1 = self._mid_rhs[0] + th0 / (sig_th * sig_th)
-        b2 = self._mid_rhs[1] + self.d_standstill / (sig_anem * sig_anem)
-        det = a11 * a22 - a12 * a12
-        if det <= 1e-12:
-            return prior, self.d_standstill
-        th = (a22 * b1 - a12 * b2) / det
-        d_post = (a11 * b2 - a12 * b1) / det
+        sig_th = th0 * (2500.0 * self.corridor.car_scale / prior)
+        self._mkf_x = np.array([th0, self.d_standstill], dtype=np.float64)
+        self._mkf_P = np.diag([sig_th * sig_th, self._anem_var(self.d_standstill)])
+
+    def _anem_noise_std_true(self) -> float:
+        """True std of one wayside anemometer reading at this step (simulator side, draws the noise only)."""
+        if self._anem_sig_true is None:   # legacy scenarios without a sensor-spec profile
+            return 0.018 if self.speed_sensor_noise_mps > 0.0 else 0.008
+        return float(self._anem_sig_true[min(self.k_elapsed, len(self._anem_sig_true) - 1)])
+
+    def _anem_var(self, z: float) -> float:
+        """
+        Variance the filter assigns to one anemometer reading z (m/s^2), from the reading itself and the measured
+        speed: invert the platform drag model (station air density, no precipitation multiplier) for the wind
+        speed and propagate the sensor spec max(0.3 m/s, 3 %). Uses no true value.
+        """
+        if self._anem_sig_true is None:
+            s = 0.018 if self.speed_sensor_noise_mps > 0.0 else 0.008
+            return s * s
+        sc = self.corridor.car_scale
+        a_long = AERO_DAVIS_A_NS2_M2 * (AERO_NOSE_TAIL_FRACTION + (1.0 - AERO_NOSE_TAIL_FRACTION) * sc)
+        rho = 293.15 / max(250.0, 273.15 + self.station_temp_c)
+        k0 = a_long * rho / (WIND_REF_M_EFF_KG * sc)
+        w = math.sqrt(abs(z) / k0)
+        sig_w = max(ANEMOMETER_ACC_ABS_MPS, ANEMOMETER_ACC_REL * w)
+        s = 2.0 * k0 * (max(0.0, self.v_meas) + w) * sig_w + k0 * sig_w * sig_w
+        return max(1e-10, s * s)
+
+    def _mkf_wind_reading(self, z: float) -> None:
+        P, x = self._mkf_P, self._mkf_x
+        S = P[1, 1] + self._anem_var(z)
+        K = P[:, 1] / S
+        self._mkf_x = x + K * (z - x[1])
+        self._mkf_P = P - np.outer(K, P[1, :])
+
+    def _mkf_departure_step(self, f_net_n: float, g_spec: float, wind_gate: bool, v_next_meas: float) -> None:
+        """
+        One 0.5 s step of the departure mass ID (station territory, before the lock).
+          predict : theta constant, wind random walk (MASS_KF_WIND_Q);
+          wind    : readings of the current wind from the station anemometer (k >= 1; k = 0 is the prior) and,
+                    if installed, the 2nd anemometer; each = true wind + sensor noise;
+          speed   : y = v_{k+1} - v_k - 0.14 (v_k - v_{k-1}) + g_k dt = theta * F_k dt / 1000 + d * gate_k dt
+                    with measured speeds (tachometer noise enters three times: variance 2.32 sigma^2).
+        The filter sees only measured speeds, the commanded effort, station weather and the readings.
+        """
+        dt = self.corridor.dt
+        self._mkf_P[1, 1] += MASS_KF_WIND_Q * MASS_KF_WIND_Q
+        d_true = float(self.wind_profile[min(self.k_elapsed, len(self.wind_profile) - 1)])
+        sig = self._anem_noise_std_true()
+        n_read = (1 if self.k_elapsed >= 1 else 0) + (1 if self.anem2_x_m > 0.0 else 0)
+        for _ in range(n_read):
+            self._mkf_wind_reading(d_true + sig * float(self._anem_rng.normal()))
+        if v_next_meas <= 0.0:   # wheel-rail clamp holds the train: the balance is not linear there
+            return
+        y = (v_next_meas - self.v_meas) - 0.14 * (self.v_meas - self.v_meas_prev) + g_spec * dt
+        H = np.array([(f_net_n / 1000.0) * dt, dt if wind_gate else 0.0])
+        r = 2.32 * max(1e-4, self.speed_sensor_noise_mps) ** 2
+        P = self._mkf_P
+        PH = P @ H
+        S = float(H @ PH) + r
+        K = PH / S
+        self._mkf_x = self._mkf_x + K * (y - float(H @ self._mkf_x))
+        self._mkf_P = P - np.outer(K, PH)
+
+    def _mkf_mass_kg(self) -> float:
+        """Mass from the filter's theta, clamped to the physical range around the ticket prior."""
+        th = float(self._mkf_x[0])
         m_est = 1000.0 / ((1.0 + self.physics.gamma) * max(1e-6, th))
+        s_car, prior = self.corridor.car_scale, self.mass_prior_kg
         m_lo, m_hi = max(65000.0 * s_car, prior - 9000.0 * s_car), min(110000.0 * s_car, prior + 9000.0 * s_car)
-        return (m_lo if m_est < m_lo else (m_hi if m_est > m_hi else float(m_est))), float(d_post)
+        return m_lo if m_est < m_lo else (m_hi if m_est > m_hi else m_est)
 
     def _ensure_feas_cache_epoch(self) -> None:
         if self._feas_cache_k != self.k_elapsed:
@@ -986,8 +1024,9 @@ class MPCTransitionRailroadEnv:
             f_curve_true = self.true_physics.curve_resistance(self.x_curr) * cwr_true
             a_true_nom = (f_prop_true - f_drag_true - f_grade_true - f_curve_true) / self.true_physics.M_eff
 
-            # Station territory (x < 2nd anemometer): sheltered platform wind, measured by both sensors.
-            k_w = 0 if self.x_curr < self.anem2_x_m else min(self.k_elapsed, len(self.wind_profile) - 1)
+            # Wind varies from the first step (gusts and turbulence also act in station territory); the
+            # anemometers only measure it, they do not hold it steady.
+            k_w = min(self.k_elapsed, len(self.wind_profile) - 1)
             d_ext = float(self.wind_profile[k_w]) if (self.v_curr > 1e-3 or u_clamped > 1e-3) else 0.0
 
             inertia_mom = 0.14 * (self.v_curr - self.v_prev)
@@ -1015,22 +1054,21 @@ class MPCTransitionRailroadEnv:
             f_grade_est = self.physics.grade_resistance(self.x_curr)
             f_curve_est = self.physics.curve_resistance(self.x_curr) * cwr_thermal_factor
 
-            if self.k_elapsed < 8 or not self.mass_locked:
-                # Station weather telemetry (station + 2nd anemometer) is available ONLY in station territory:
-                self.d_hat = self.d_standstill
-                if not self.mass_locked:
-                    self._accumulate_departure_mass_step(
-                        f_prop_est - f_drag_est,
-                        (f_grade_est + f_curve_est) / self.physics.M_eff,
-                        (self.v_meas > 1e-3) or (u_clamped > 1e-3),
-                        v_next_meas,
-                    )
-                    if self.k_elapsed >= 7 and x_next >= self.anem2_x_m:
-                        # Dynamic weight computed once when the train passes the 2nd anemometer, then locked:
-                        self.mass_hat_kg, d_post = self._solve_departure_mass_kg()
-                        self._sync_physics_and_mpc(use_estimated_mass=True, reset_shaper=False)
-                        self.mass_locked = True
-                        self.d_hat = d_post
+            if not self.mass_locked:
+                # Station territory: wayside telemetry (anemometers) is available only here.
+                self._mkf_departure_step(
+                    f_prop_est - f_drag_est,
+                    (f_grade_est + f_curve_est) / self.physics.M_eff,
+                    (self.v_meas > 1e-3) or (u_clamped > 1e-3),
+                    v_next_meas,
+                )
+                self.d_hat = float(self._mkf_x[1])
+                if self.k_elapsed >= 7 and x_next >= self.anem2_x_m:
+                    # Mass fixed once the train passes the 2nd anemometer (station-only: after 8 steps), then
+                    # the open-line disturbance observer takes over from the filter's wind estimate.
+                    self.mass_hat_kg = self._mkf_mass_kg()
+                    self._sync_physics_and_mpc(use_estimated_mass=True, reset_shaper=False)
+                    self.mass_locked = True
             else:
                 # Open-line disturbance observer (k_elapsed >= 8) with Lyapunov-Adaptive & Fuzzy Rate
                 # (Hanna et al. 2023 Eqs. 35-45 + Wang, Wang, & Chen 2026 Eqs. 20-21, Table 2):
@@ -1315,8 +1353,9 @@ class MPCTransitionRailroadEnv:
             f_curve_true = self.true_physics.curve_resistance(self.x_curr) * cwr_true
             a_true_nom = (f_prop_true - f_drag_true - f_grade_true - f_curve_true) / self.true_physics.M_eff
 
-            # Station territory (x < 2nd anemometer): sheltered platform wind, measured by both sensors.
-            k_w = 0 if self.x_curr < self.anem2_x_m else min(self.k_elapsed, len(self.wind_profile) - 1)
+            # Wind varies from the first step (gusts and turbulence also act in station territory); the
+            # anemometers only measure it, they do not hold it steady.
+            k_w = min(self.k_elapsed, len(self.wind_profile) - 1)
             d_ext = float(self.wind_profile[k_w]) if (self.v_curr > 1e-3 or u_clamped > 1e-3) else 0.0
 
             inertia_mom = 0.14 * (self.v_curr - self.v_prev)
@@ -1762,6 +1801,7 @@ def evaluate_multi_station_journey(
     coast: bool | None = None,
 ) -> dict:
     leg_sched_errs, leg_stop_errs, leg_land_decels, leg_peak_accels, leg_jerks = [], [], [], [], []
+    n_micro_tot, n_jerk_exceed, n_acc_exceed = 0, 0, 0   # comfort limits: jerk 0.48 m/s^3, accel 1.20 m/s^2
     tot_energy_kwh = 0.0
     tot_sh_steps, tot_sh_ints = 0, 0
     tot_eco_steps, tot_eco_caps = 0, 0
@@ -1865,6 +1905,9 @@ def evaluate_multi_station_journey(
         leg_x = np.array([m["x"] for m in leg_micro])
         leg_acc = np.array([m["accel"] for m in leg_micro])
         leg_jrk = np.array([m["jerk"] for m in leg_micro])
+        n_micro_tot += len(leg_jrk)
+        n_jerk_exceed += int(np.sum(leg_jrk > 0.48 + 1e-9))
+        n_acc_exceed += int(np.sum(leg_acc > 1.20 + 1e-9))
         all_step_us.extend([m["step_us"] for m in leg_micro])
 
         all_total_us.extend([m["total_step_us"] for m in leg_micro])
@@ -1998,6 +2041,9 @@ def evaluate_multi_station_journey(
         "peak_accel": float(np.max(leg_peak_accels)),
         "peak_land_decel": float(np.mean(leg_land_decels)),
         "p98_jerk_mps3": float(np.mean(leg_jerks)),
+        "n_micro_steps": int(n_micro_tot),
+        "jerk_exceed_steps": int(n_jerk_exceed),
+        "accel_exceed_steps": int(n_acc_exceed),
         "comfort_pressure": comfort_press,
         "step_smooth_cost": step_smooth_cost,
         "energy_kwh": tot_energy_kwh,
@@ -2241,6 +2287,9 @@ def _serialize_scenarios_subset(
                 "mean_total_us": float(r["mean_total_us"]),
                 "p99_total_us": float(r["p99_total_us"]),
                 "max_total_us": float(r["max_total_us"]),
+                "n_micro_steps": int(r.get("n_micro_steps", 0)),
+                "jerk_exceed_steps": int(r.get("jerk_exceed_steps", 0)),
+                "accel_exceed_steps": int(r.get("accel_exceed_steps", 0)),
                 "property_counts": dict(r.get("property_counts", {})),
                 "peak_pressures": dict(r.get("peak_pressures", {})),
             }
@@ -2268,6 +2317,9 @@ def _serialize_scenarios_subset(
                 "mean_total_us": round(m_entry["mean_total_us"], 2),
                 "p99_total_us": round(m_entry["p99_total_us"], 2),
                 "max_total_us": round(m_entry["max_total_us"], 2),
+                "n_micro_steps": int(m_entry.get("n_micro_steps", 0)),
+                "jerk_exceed_steps": int(m_entry.get("jerk_exceed_steps", 0)),
+                "accel_exceed_steps": int(m_entry.get("accel_exceed_steps", 0)),
             })
 
         json_records.append({
@@ -2541,9 +2593,10 @@ def main():
     ]
     lit_factories = {}
     if not args.no_literature:
-        from literature_baselines import load_literature_pilots
-        print("\n=== 2c. Loading Literature Baselines 9-15 (RelatedWork_Survey.tex) ===", flush=True)
+        from literature_baselines import load_literature_pilots, load_extra_literature_pilots
+        print("\n=== 2c. Loading Literature Baselines 9-18 (RelatedWork_Survey.tex) ===", flush=True)
         lit_factories = load_literature_pilots(emulator, train_if_missing=True)
+        lit_factories.update(load_extra_literature_pilots(emulator, train_if_missing=True))
         method_specs.extend((nm, "LIT_PILOT", None) for nm in lit_factories)
 
     agg_results = {name: [] for name, _, _ in method_specs}
@@ -2779,7 +2832,7 @@ def main():
         m_pri = [e for r in mass_runs for e in r.get("mass_prior_abs_err_kg", [])]
         if m_err:
             print(
-                f"  Departure mass ID (closed-form, {'stop..2nd anemometer @ %g m' % STATION_ANEMOMETER2_X_M if STATION_ANEMOMETER2_X_M > 0 else 'station-only, 8 steps'}, {len(m_err)} legs): MAE={np.mean(m_err):.1f} kg "
+                f"  Departure mass ID (Kalman filter, {'stop..2nd anemometer @ %g m' % STATION_ANEMOMETER2_X_M if STATION_ANEMOMETER2_X_M > 0 else 'station-only, 8 steps'}, {len(m_err)} legs): MAE={np.mean(m_err):.1f} kg "
                 f"(max {np.max(m_err):.1f}) vs ticket prior MAE={np.mean(m_pri):.1f} kg (max {np.max(m_pri):.1f})"
             )
         coast_txt = []
@@ -2882,7 +2935,7 @@ def main():
     short_labels = [
         "Greedy", "PPO Unsh", "PPO+Sw",
         "PPO+DCBF", "PPO+DMPS", "Stab Unsh", "Stab+DMPS", "Bilbao'25",
-        "Xiao'23", "Zhong'22", "CDQ'25", "S-SARSA'23", "EITOP'25", "SRL'23", "SSA-DRL'25",
+        "Xiao'23", "Zhong'22", "CDQ'25", "S-SARSA'23", "EITOP'25", "SRL'23", "SSA-DRL'25", "S-PPO'24", "ES-MEDRL'24", "GA-DDPG'25",
     ][: len(method_specs)]
     x_pos = np.arange(len(method_specs))
     w_b = 0.26

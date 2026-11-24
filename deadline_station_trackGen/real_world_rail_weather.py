@@ -34,6 +34,8 @@ from railroad_corridor import (
     MAX_WIND_SPEED_MPS,
     wind_speed_to_longitudinal_accel,
     wind_speed_series_to_accel_profile,
+    _drop_ou_warmup,
+    anemometer_sigma_series,
     _extract_wind_events,
     train_size_config,
     apply_tail_clearance,
@@ -600,17 +602,18 @@ def build_directional_wind_acceleration_profile(
     regime_drag_mult: float = 1.0,
     is_harsh: bool = False,
     car_scale: float = 1.0,
-) -> tuple[np.ndarray, str, list[tuple[float, float, float]]]:
+) -> tuple[np.ndarray, str, list[tuple[float, float, float]], np.ndarray]:
     """
     Builds the 0.5 s longitudinal wind disturbance profile (m/s^2) from Open-Meteo wind *speeds*
     (sustained <= 24 m/s, gusts <= 30 m/s [108 km/h]) and direction relative to the track bearing,
     through the plant-consistent Davis-drag wind model `wind_speed_to_longitudinal_accel`:
-      1) Station departure window k = 0..7 (t < 4 s, v_ref = 0): constant sustained-wind load,
-         i.e. exactly what the wayside anemometer measures;
-      2) Open line (t >= 4 s, v_ref = 15 m/s): sustained head/tail component + gust fronts whose
-         wind speed reaches the reported gust value (alternating head/tail frontal shifts);
-      3) Band-limited Ornstein-Uhlenbeck turbulence with 12% (harsh) / 8% turbulence intensity.
+      1) Sustained head/tail component + gust fronts whose wind speed reaches the reported gust value
+         (alternating head/tail frontal shifts);
+      2) Band-limited Ornstein-Uhlenbeck turbulence with 12% (harsh) / 8% turbulence intensity.
+    Both act from the first step, including the station departure; the drag reference speed blends from
+    v_ref = 0 (platform, first 4 s) to v_ref = 15 m/s (open line) over 6 s.
     Air density rho(T)/rho_0 and the precipitation drag multiplier scale the aerodynamic force.
+    Also returns the per-step anemometer noise std (m/s^2) from the sensor spec (anemometer_sigma_series).
     """
     rng = np.random.default_rng(seed)
     n_steps = int(np.ceil(total_duration_s / dt)) + 40
@@ -629,7 +632,6 @@ def build_directional_wind_acceleration_profile(
     w_head_sus = v_wind * head_proj
     w_cross = v_wind * cross_proj
 
-    open_line_gate = np.clip((t_grid - 4.0) / 6.0, 0.0, 1.0)
     w_head = np.full(n_steps, w_head_sus, dtype=np.float64)
 
     # Gust fronts: the longitudinal wind component swings to +-v_gust (frontal shift alternates sign).
@@ -642,7 +644,7 @@ def build_directional_wind_acceleration_profile(
         width_s = float(rng.uniform(16.0, 26.0) if is_harsh else rng.uniform(20.0, 32.0))
         sign = sign_primary if (f_i % 2 == 0) else -sign_primary
         target = sign * v_gust * float(rng.uniform(0.88, 1.0))
-        w_head += (target - w_head_sus) * np.exp(-0.5 * ((t_grid - center_s) / width_s) ** 2) * open_line_gate
+        w_head += (target - w_head_sus) * np.exp(-0.5 * ((t_grid - center_s) / width_s) ** 2)
 
     ti = 0.12 if is_harsh else 0.08
     phi_ou = math.exp(-dt / (4.8 if is_harsh else 5.8))
@@ -652,7 +654,9 @@ def build_directional_wind_acceleration_profile(
     for k in range(8, n_steps):
         ou_stage1 = phi_ou * ou_stage1 + ti * v_gust * math.sqrt(1.0 - phi_ou * phi_ou) * float(rng.normal())
         ou_smooth[k] = (1.0 - alpha_lp) * ou_smooth[k - 1] + alpha_lp * ou_stage1
-    w_head = np.clip(w_head + ou_smooth * open_line_gate, -MAX_WIND_SPEED_MPS, MAX_WIND_SPEED_MPS)
+    # Turbulence also acts during the station departure (same draws, warm-up dropped):
+    ou_smooth = _drop_ou_warmup(ou_smooth, 8)
+    w_head = np.clip(w_head + ou_smooth, -MAX_WIND_SPEED_MPS, MAX_WIND_SPEED_MPS)
 
     w_profile = wind_speed_series_to_accel_profile(
         w_head, w_head_sus, w_cross=w_cross, dt=dt, rho_ratio=rho_ratio, drag_mult=regime_drag_mult,
@@ -666,7 +670,9 @@ def build_directional_wind_acceleration_profile(
         f"Rain={weather_dict['rain_mm']:.1f}mm/h, Snow={weather_dict['snow_cm']:.1f}cm/h, "
         f"d in [{w_profile.min():+.2f},{w_profile.max():+.2f}]m/s^2"
     )
-    return w_profile, desc, event_meta
+    anem_sig = anemometer_sigma_series(w_head, w_cross=w_cross, dt=dt, rho_ratio=rho_ratio,
+                                       drag_mult=regime_drag_mult, car_scale=car_scale)
+    return w_profile, desc, event_meta, anem_sig
 
 
 def _extract_corridor_hops(
@@ -879,7 +885,7 @@ def fetch_real_world_multi_station_scenario(
         mass_adder = max(0.0, (leg_mass_kg / s_car - 85000.0) / 2200.0) + tail_clearance_time_s(zones, train_len_m)
         adhesion_adder = max(0.0, (0.90 - mu_adhesion) * 38.0)
 
-        w_prof, w_desc, w_meta = build_directional_wind_acceleration_profile(
+        w_prof, w_desc, w_meta, anem_sig = build_directional_wind_acceleration_profile(
             max(min_feas_s + 240.0, raw_scaled_sched + 200.0),
             dt=0.50,
             track_bearing_deg=bearing_deg,
@@ -906,8 +912,8 @@ def fetch_real_world_multi_station_scenario(
 
         leg_deadline_s = t_clock + leg_budget_s
         dwell_s = 25.0 if leg_idx < len(hops) - 1 else 0.0
-        anem_noise_std = 0.018 if is_harsh_leg else 0.008
-        station_wind_reading = float(w_prof[0] + rng.normal(0.0, anem_noise_std))
+        # Station anemometer reading at departure (k = 0); same draw as before, scaled to the sensor spec:
+        station_wind_reading = float(w_prof[0] + anem_sig[0] * rng.normal(0.0, 1.0))
         speed_noise_std = 0.0025 if is_harsh_leg else 0.0
         unmodeled_drag = float(rng.uniform(1.03, 1.08)) if is_harsh_leg else 1.0
         temp_c = float(weather_eff["temp_c"])
@@ -934,6 +940,7 @@ def fetch_real_world_multi_station_scenario(
             speed_sensor_noise_mps=speed_noise_std,
             unmodeled_drag_factor=unmodeled_drag,
             sensor_noise_seed=int(seed * 101 + leg_idx * 17),
+            anemometer_sigma_mps2=anem_sig,
             is_extreme_scenario=bool(is_harsh_leg),
             speed_zones=zones,
             n_cars=n_cars_eff,

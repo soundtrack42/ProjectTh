@@ -11,3 +11,5 @@ CHANGES.md
 *.pdf
 *.npz
 external/
+*.sh
+*.pkl*
