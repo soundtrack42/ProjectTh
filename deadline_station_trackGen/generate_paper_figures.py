@@ -255,7 +255,7 @@ def generate_contract_searching_tree(out_path: Path) -> None:
         _arr(ax, (2.30, 3.00), (3.25, cy + 0.47), col=hc, lw=1.7)
 
     # Energy option: not a safety property, kept only if every safety margin holds.
-    ax.plot([2.95, 9.05], [1.45, 1.45], color="#94A3B8", lw=1.0, ls="--", zorder=1)
+    ax.plot([2.95, 8.05], [1.45, 1.45], color="#94A3B8", lw=1.0, ls="--", zorder=1)
     ax.text(4.20, 1.27, "Energy option (not a safety property)", ha="center", va="center", fontsize=8.0,
             style="italic", color="#475569")
     ax.add_patch(FancyBboxPatch((3.25, 0.325), 1.90, 0.65, boxstyle="round,pad=0.04,rounding_size=0.14",
@@ -297,10 +297,9 @@ def generate_contract_searching_tree(out_path: Path) -> None:
     _arr(ax, (8.25, 3.00), (8.60, 3.00), col="#7E22CE", lw=2.0, ms=14)
 
     _card(ax, 11.10, 2.35, 1.90, 1.30, "Verify and hold",
-          ["2-step check", "hold 2 steps"],
-          "#ECFDF5", "#008300", "#006A00", ft=9.0, fb=7.9, line_step=0.26)
+          ["2-step check", "hold 2 steps", "then to the shaper"],
+          "#ECFDF5", "#008300", "#006A00", ft=9.0, fb=7.9, line_step=0.24)
     _arr(ax, (10.75, 3.00), (11.10, 3.00), col="#008300", lw=2.2, ms=14)
-    ax.text(12.05, 2.20, "to the shaper", ha="center", va="top", fontsize=7.8, color="#14532D")
 
     fig.tight_layout(pad=0.25)
     fig.savefig(str(out_path), dpi=300, bbox_inches="tight")
