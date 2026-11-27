@@ -5,11 +5,13 @@ __pycache__/
 *.json
 *.csv
 *.pt
-CHANGES.md
+docs/
 *.pt
 *.tex
 *.pdf
+data/
+data_vaquero/
 *.npz
 external/
-*.sh
+eco_study/
 *.pkl*

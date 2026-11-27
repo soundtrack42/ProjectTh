@@ -37,10 +37,18 @@ from railroad_corridor import generate_multi_station_scenario
 CONFIGS = [("Station-only (8 steps)", 0.0), ("2nd anemometer @ 10 m", 10.0), ("2nd anemometer @ 15 m", 15.0)]
 
 
-def build_scenarios(suite: str, train_date: str, train_number: int) -> list[dict]:
+def build_scenarios(suite: str, train_date: str, train_number: int, historic: dict | None = None) -> list[dict]:
     scens = []
     for ep in range(30):
-        if suite == "real":
+        if suite == "real" and historic and ep in historic:
+            from real_world_rail_weather import fetch_real_world_multi_station_scenario
+
+            h = historic[ep]
+            sc = fetch_real_world_multi_station_scenario(
+                date_str=h["date"], train_number=int(h["train_number"]), n_legs_max=0, seed=int(h["seed"]), ep_idx=0,
+                harsh_weather_mode="historic",
+            )
+        elif suite == "real":
             from real_world_rail_weather import fetch_real_world_multi_station_scenario
 
             sc = fetch_real_world_multi_station_scenario(
@@ -107,7 +115,9 @@ def main() -> None:
     ap.add_argument("--train-number", type=int, default=8311)
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--fig", default="figures/mass_id_benchmark.png")
+    ap.add_argument("--historic-suite", default="", help="Same JSON as dynamic_railroad_mpc.py --historic-suite")
     args = ap.parse_args()
+    historic = {int(h["ep"]): h for h in json.load(open(args.historic_suite))} if args.historic_suite else None
 
     torch.set_num_threads(1)
     emu = D.LearnedLinearizationModel(hidden_dim=64)
@@ -116,7 +126,7 @@ def main() -> None:
 
     rows, results = [], {}
     for suite in args.suites:
-        scens = build_scenarios(suite, args.train_date, args.train_number)
+        scens = build_scenarios(suite, args.train_date, args.train_number, historic)
         mism = verify_against_benchmark(suite, scens, Path(args.data_dir))
         print(f"[{suite}] scenario check vs. benchmark: " + ("no saved scenarios" if mism < 0 else f"{mism} mismatches"))
         for si, sc in enumerate(scens):

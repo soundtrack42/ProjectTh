@@ -35,6 +35,7 @@ for _p in (str(_ROOT_DIR), str(_ROOT_DIR / "core")):
         sys.path.append(_p)
 from havaei_generalizing_rl import NonlinearTrainPhysics
 from railroad_corridor import RailroadCorridor
+import eval_counter as _EC
 
 
 def _clamp(val: float, lo: float, hi: float) -> float:
@@ -123,6 +124,7 @@ class BilbaoCBTCATOController:
         RMBTP trajectory across the corridor zones from (x0, v0, t0) to (station_x_m, 0.0).
         Executes in O(N_zones) closed form (< 15 us).
         """
+        _EC.N[0] += 1
         a_eff, b_eff = self._effective_rates(d_obs)
         station_x = self.corridor.station_x_m
         if x0 >= station_x - 0.1:

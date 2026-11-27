@@ -14,6 +14,7 @@ Unifies:
 from __future__ import annotations
 
 import copy
+import eval_counter as _EC
 from dataclasses import dataclass
 import math
 import numpy as np
@@ -117,6 +118,7 @@ class GoodallTrajectoryShield:
     def reset_stats(self) -> None:
         self.total_steps: int = 0
         self.total_interventions: int = 0
+        self.total_rejected_backups: int = 0
         self.total_tree_triggers: int = 0
         self.total_latched_steps: int = 0
         self.contract_selections: dict[str, int] = {c: 0 for c in ACTIVE_RECOVERY_CONTRACTS}
@@ -165,6 +167,7 @@ class GoodallTrajectoryShield:
         rho_air: float | None = None,
         adh_mu: float | None = None,
     ) -> tuple[float, float, float]:
+        _EC.N[0] += 1
         u_clamped = -1.0 if u_cmd < -1.0 else (1.0 if u_cmd > 1.0 else float(u_cmd))
         u_act_next = 0.72 * u_clamped + 0.28 * u_act_curr
         f_prop_lin = u_act_next * physics.M_eff * physics.max_traction_accel
@@ -305,7 +308,7 @@ class GoodallTrajectoryShield:
         C4_ECO_REGEN_COAST recovery target (only used once another property has triggered the
         shield): pre-zone and downhill coasting when positive on-track schedule slack is available.
         The "going too fast" eco upper bound itself is applied upstream of the shield by
-        `env.update_zone_eco_upper_bound` and is not a shield trigger.
+        `eco_governor.EcoGovernor` and is not a shield trigger.
         Returns capped speed target if commanding excess speed above the eco upper bound,
         or None if nominal control passes.
         """
@@ -388,6 +391,7 @@ class GoodallTrajectoryShield:
         x_brk_pre: float | None = None,
         ot_slack_pre: float | None = None,
     ) -> tuple[float, float, float, float, float, float, float, float, float, float, float]:
+        _EC.N[0] += 1
         is_ucb_dmps = (self.cfg.mode == "mps_rollout")
         r99_cmd = self.cfg.z_sigma * self.sigma_tube_curr
         v_ceil = (
@@ -465,7 +469,7 @@ class GoodallTrajectoryShield:
             ot_slack_now = 0.0
 
         # Energy is scored (rho_E feeds the Tchebycheff tree objective) but is not a safety trigger:
-        # the eco "going too fast" upper bound acts upstream of the shield (env.update_zone_eco_upper_bound).
+        # the eco "going too fast" upper bound acts upstream of the shield (eco_governor.EcoGovernor).
         h_energy = 0.50
 
         # 5. Deadline Gust-Compensation & Schedule-Cone Certifier (C3_DEADLINE_RECOVERY)
@@ -731,6 +735,19 @@ class GoodallTrajectoryShield:
         v_comp_latch = self._clamp(v_target_lat, 1.5, v_max_latch)
         return v_comp_latch, a_lat, b_lat
 
+    @staticmethod
+    def _no_worse(h_cand, h_task, tol: float = 1e-4) -> bool:
+        """Hard admissibility rule for every backup: on each safety property (speed, acceleration, jerk,
+        deadline) a margin that holds for the pilot's command must still hold, and a violated one must not
+        get worse. A backup that fails it is never executed."""
+        for i in (0, 1, 2, 4):
+            if h_cand[i] < min(0.0, h_task[i]) - tol:
+                return False
+        return True
+
+    def _margins(self, env, v, a, b, v_pace_feasible, **kw):
+        return self._eval_pressures_margins_scalars(env, v, a, b, v_pace_feasible, **kw)[:6]
+
     def filter_trajectory_action(
         self,
         env,
@@ -890,6 +907,11 @@ class GoodallTrajectoryShield:
             v_max_w1 = max(1.5, v_ceil_cached - r99_now - 0.02)
             v_sw = self._clamp(v_pace_feasible + 0.28 * max(0.0, -env.d_hat) + 0.06, 1.5, v_max_w1)
             a_nom = float(getattr(env, "a_start_center", 0.96))
+            h_sw = self._margins(env, v_sw, a_nom, 0.78, v_pace_feasible, v_ceil_pre=v_ceil_cached, rho_E_pre=rho_E_cached,
+                                 v_lim_180_pre=v_lim_180_0, slope_120_pre=slope_120_0)
+            if not self._no_worse(h_sw, margins_tuple):
+                self.total_rejected_backups += 1
+                return v_cmd_task, a_start_task, b_land_task, False, 0.0, "none"
             diff = abs(v_sw - v_cmd_task) + abs(a_nom - a_start_task) + abs(0.78 - b_land_task)
             return v_sw, a_nom, 0.78, True, diff, worst_prop
 
@@ -911,7 +933,7 @@ class GoodallTrajectoryShield:
                     rho_E_pre=rho_E_cached, v_lim_180_pre=v_lim_180_0, slope_120_pre=slope_120_0,
                 )
                 c_tuple = (ch0, ch1, ch2, ch3, ch4, ch5)
-                if c_tuple[worst_idx] >= -1e-4 and ch0 >= -1e-4:
+                if c_tuple[worst_idx] >= -1e-4 and ch0 >= -1e-4 and self._no_worse(c_tuple, margins_tuple):
                     hi = mid
                 else:
                     lo = mid
@@ -919,6 +941,11 @@ class GoodallTrajectoryShield:
             vs = oh * v_cmd_task + hi * v_cbf_fb
             as_ = oh * a_start_task + hi * a_cbf_fb
             bs = oh * b_land_task + hi * b_cbf_fb
+            h_fin = self._margins(env, vs, as_, bs, v_pace_feasible, v_ceil_pre=v_ceil_cached, rho_E_pre=rho_E_cached,
+                                  v_lim_180_pre=v_lim_180_0, slope_120_pre=slope_120_0)
+            if not self._no_worse(h_fin, margins_tuple):
+                self.total_rejected_backups += 1
+                return v_cmd_task, a_start_task, b_land_task, False, 0.0, "none"
             diff = abs(vs - v_cmd_task) + abs(as_ - a_start_task) + abs(bs - b_land_task)
             return vs, as_, bs, True, diff, worst_prop
 
@@ -1060,13 +1087,14 @@ class GoodallTrajectoryShield:
                         ot_slack_pre=ot_slack_0,
                     )
                     nh_tuple = (nh0, nh1, nh2, nh3, nh4, nh5)
-                    if nh0 < -1e-4 or nh1 < -1e-4 or nh_tuple[worst_idx] < -1e-4:
+                    if nh0 < -1e-4 or nh1 < -1e-4 or nh_tuple[worst_idx] < -1e-4 or not self._no_worse(nh_tuple, margins_tuple):
                         node_eval_cache[nkey] = (False, 0.0)
                         continue
 
                     dv_step = nv - v_obs
                     rate_lim = na * 0.62 if dv_step >= 0.0 else nb * 0.68
                     dv_achievable = math.copysign(min(abs(dv_step), rate_lim * dt_horizon_window), dv_step)
+                    _EC.N[0] += 1
                     v_leaf = max(0.0, v_obs + dv_achievable + 0.25 * env.d_hat * self.corridor.dt)
                     x_leaf = min(self.corridor.station_x_m, env.x_curr + 0.5 * (v_obs + v_leaf) * dt_horizon_window)
                     l_key = (round(x_leaf, 2), b_key)
@@ -1136,6 +1164,16 @@ class GoodallTrajectoryShield:
                 x_r += 0.5 * (mu_r + mu_next_r) * self.corridor.dt
                 vp_r, mu_r = mu_r, mu_next_r
 
+        # The executed backup (tree winner or the primary contract's fallback) must satisfy the same rule.
+        h_best = self._margins(env, best_v, best_a, best_b, v_pace_feasible, v_ceil_pre=ceil_fn(env.x_curr, best_b),
+                               rho_E_pre=rho_E_cached, v_lim_180_pre=v_lim_180_0, slope_120_pre=slope_120_0,
+                               ot_slack_pre=ot_slack_0)
+        if not self._no_worse(h_best, margins_tuple):
+            self.total_rejected_backups += 1
+            self.active_contract = "C0_NOMINAL_BALANCED"
+            self.latch_steps_rem = 0
+            self._pending_ucb_contract = None
+            return v_cmd_task, a_start_task, b_land_task, False, 0.0, "none"
         self.active_contract = best_c_name
         self.latched_contract = best_c_name
         self.latched_a_cap, self.latched_b_cap, self.latch_steps_rem = best_a, best_b, 2

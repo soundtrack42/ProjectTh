@@ -98,6 +98,7 @@ class RailPilotEnv(gym.Env):
                                               use_cosine_shaper=cosine)
         self.env.a_start_center = 0.96
         self.env.coast_enabled = False
+        self.env.comfort_action_bound = D.COMFORT_ACTION_BOUND   # as train_pure_ppo_cosine_pilot(comfort_bound=...)
         self._journeys = journeys          # None = training stream
         self._j = 0
         self._legs: list = []
@@ -157,6 +158,7 @@ def make_leg_env(emu, cor, cosine: bool, ucb_state: dict | None):
     env = D.MPCTransitionRailroadEnv(corridor=cor, traj_shield=sh, emulator=emu, use_cosine_shaper=cosine)
     env.a_start_center = 0.96
     env.coast_enabled = False
+    env.comfort_action_bound = D.COMFORT_ACTION_BOUND
     return env
 
 
@@ -267,6 +269,7 @@ def main():
 
     val_env = D.MPCTransitionRailroadEnv(corridor=RailroadCorridor(), traj_shield=None, emulator=emu, use_cosine_shaper=cosine)
     val_env.a_start_center = 0.96
+    val_env.comfort_action_bound = D.COMFORT_ACTION_BOUND
     val_scens = [generate_multi_station_scenario(seed=70000 + TRAIN_SEED * 13 + v * 31, n_legs=0, wind_mode="mixed",
                                                  allow_infeasible_breaks=False, extreme_noise=(v % 2 == 1))
                  for v in range(6)]

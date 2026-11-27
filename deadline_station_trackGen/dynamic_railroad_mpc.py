@@ -54,6 +54,8 @@ from real_world_rail_weather import (
     fetch_real_world_multi_station_scenario,
 )
 from bilbao_cbtc_ato import BilbaoCBTCATOController
+from eco_governor import EcoConfig, EcoGovernor, default_eco_config, physical_eco_config
+import eval_counter as _EC
 from goodall_trajectory_shield import (
     TrajectoryShieldConfig,
     GoodallTrajectoryShield,
@@ -89,6 +91,18 @@ COMFORT_ACTION_BOUND = True
 # Ablation: --a-start-center 0.81 lowers drivetrain slew/copper losses (-1.3..-2.2% energy) but, without
 # retraining, costs ~0.1 s punctuality on methods 2-4 (UCB-DMPS methods 5/7 compensate via C3).
 OUR_A_START_CENTER = 0.96
+# Eco governor (eco_governor.py), an external operator between the pilot and the shield.
+# Energy limits of the cosine pilots (methods 2-5, eco_governor.ENERGY_LIMITS_COSINE): departure rate <= 0.85 m/s^2
+# (ramp losses grow above 0.78) and a cruise command above the field-weakening knee 13.4 + 0.3 m/s kept only down to
+# max(13.7, v_feas + 1.0), i.e. where the deadline needs it. Not used for the non-cosine pilot (6, 7): its slower
+# Hermite departure then arrives late. --no-eco-energy-limits disables them.
+OUR_ECO_ENERGY_LIMITS = True
+# Replaces the eco governor of the proposed pilots (methods 2-7) by a user configuration (--eco-config file.json with
+# EcoConfig fields, e.g. another vehicle's field-weakening knee), or False (--eco-config off) to disable it.
+ECO_CONFIG: "EcoConfig | bool | None" = None
+# Governor of the proposed pilots: "physical" (default; formulas from the vehicle data, eco_governor.PHYSICAL) or
+# "rules" (the tuned fixed rules: energy limits for the cosine pilot, schedule bound for UCB-DMPS).
+ECO_MODE = "physical"
 # Slow-weather knowledge of the controller (temperature, rail adhesion). The plant may carry a true slow-weather
 # profile along the leg (corridor.slow_weather_profile: per-step "temp_c", "mu"; shared by all methods).
 #   "station": measured at the departure station, held until the next station.
@@ -116,30 +130,33 @@ class MPCTransitionRailroadEnv:
     ):
         self.corridor = corridor if corridor is not None else RailroadCorridor()
         self.traj_shield = traj_shield
+        # Reference safety filter (part of the shield): every control step the executed speed reference keeps its
+        # jerk and comfort acceleration/braking within the limits, with the speed limit taking priority.
+        self.ref_safety_filter = traj_shield is not None
+        self.ref_filter_hits = 0
+        self._rf_v = None
+        # Passive safety monitor (benchmark only): the same speed / comfort / jerk / deadline check for every
+        # method, on the command actually executed; it never changes the command.
+        self.safety_monitor: GoodallTrajectoryShield | None = None
+        self.unsafe_steps = 0
+        self.monitored_steps = 0
+        self.unsafe_proposed_steps = 0
+        self.unsafe_by_prop = {"speed": 0, "accel": 0, "jerk": 0, "deadline": 0}
         self.emulator = emulator
         self.use_cosine_shaper = bool(use_cosine_shaper)
-        # Eco governor is part of the UCB-DMPS architecture (methods 7 and 9):
-        # Approach schedule reserve (s) kept by the eco governor; selected on tuning seeds 5000+29k (sweep 0.5..6 s).
-        self.eco_slack_reserve_s = 4.0
         # Comfort-consistent bound on the decoded (a_start, b_land); set for the proposed PPO pilots (methods 2-7).
         self.comfort_action_bound = False
-        # Eco v2 (off by default): with schedule slack, prefer gentler rates and a cruise speed below the field-
-        # weakening knee, each accepted only if the predicted arrival still keeps the eco reserve.
-        self.eco_a_cap: float | None = None      # departure/shift acceleration rate (m/s^2)
-        self.eco_b_cap: float | None = None      # planned landing deceleration (m/s^2), outside the landing only
-        self.eco_v_knee: float | None = None     # cruise speed cap (m/s), e.g. 13.4 (field weakening)
-        self.eco_v2_reserve_s: float | None = None  # reserve for v2 (None: eco_slack_reserve_s)
-        self.eco_v2_steps = 0
-        self.eco_governor = bool(
+        # Training-reward weight of the per-step specific energy (training only; evaluation uses LossScore).
+        self.rew_energy_w = 0.35
+        # Eco governor: external operator between pilot and shield (eco_governor.py), None = off. By default the
+        # UCB-DMPS pipelines get its schedule bound; evaluate_multi_station_journey adds the energy limits of the
+        # cosine pilots or a user configuration (--eco-config).
+        sched = bool(
             eco_governor if eco_governor is not None
             else (traj_shield is not None and getattr(traj_shield.cfg, "mode", "") == "mps_rollout")
         )
-        if self.eco_governor and self.use_cosine_shaper:
-            # Cosine UCB-DMPS (method 5), selected on tuning seeds 5000+29k (sweep a_cap 0.65..0.90, reserve 3..5 s,
-            # b_cap, cruise knee, coasting): with schedule slack, depart and shift at <= 0.70 m/s^2, reserve 5 s.
-            # No lever improved the non-cosine pipeline (method 7), which keeps the 4 s reserve and no rate cap.
-            self.eco_a_cap = 0.70
-            self.eco_slack_reserve_s = 5.0
+        cfg_eco = default_eco_config(self.use_cosine_shaper, schedule_bound=sched, energy_limits=False)
+        self.eco: EcoGovernor | None = EcoGovernor(cfg_eco) if cfg_eco is not None else None
         self.obs_dim = 18
         self.act_dim = 3
         # Pre-landing coasting (cruise -> coast -> brake), enabled for the proposed PPO methods. Coasting starts
@@ -190,6 +207,8 @@ class MPCTransitionRailroadEnv:
                 max_traction_accel=self.physics.max_traction_accel,
                 max_service_braking=self.physics.max_braking_decel,
             )
+            if getattr(self, "ref_safety_filter", False):
+                self.shaper.stop_comfort_cap = 0.97 * self.corridor.comfort_braking_max
         else:
             self.shaper.corridor = self.corridor
             self.shaper.sync_limits(self.physics.max_traction_accel, self.physics.max_braking_decel)
@@ -231,12 +250,8 @@ class MPCTransitionRailroadEnv:
         self.mass_prior_kg = self.mass_hat_kg
         self.mass_locked = False
         self.mass_samples = []
-        self.v_eco_ub: float | None = None
-        self._eco_ub_cache_k: int = -1
-        self.eco_macro_steps = 0
-        self.eco_capped_steps = 0
-        self._eco_ub_cached_res: tuple[float, bool] = (15.0, False)
-        self._eco_anchor_v: float | None = None   # latched "no further acceleration" speed (None = released)
+        if self.eco is not None:
+            self.eco.reset()
         self.coast_active = False
         self.coast_u_cap = 1.0
         self.coast_macro_steps = 0
@@ -290,6 +305,9 @@ class MPCTransitionRailroadEnv:
         self.v_err_prev = 0.0
         self.mu_min_curr = 1.0
         self.prev_accel = 0.0
+        self._rf_v = None
+        self._rf_a = 0.0
+        self._rf_raw_prev = None
         self.energy_kwh = 0.0
         self.regen_kwh = 0.0
         self.sigma_tube = 0.0045
@@ -299,6 +317,8 @@ class MPCTransitionRailroadEnv:
         self._geom_cache_map: dict[float, tuple[float, float]] = {}
         self.shaper.reset()
         self.mpc.reset()
+        if self.eco is not None and hasattr(self.eco, "prepare"):
+            self.eco.prepare(self)      # at the station, before departure (outside the control loop)
         return self._get_obs()
 
     def _wx_api_value(self, k_req: int) -> tuple[float, float]:
@@ -496,6 +516,7 @@ class MPCTransitionRailroadEnv:
         rate_up: float,
         rate_dn: float,
     ) -> float:
+        _EC.N[0] += 1
         x_rem = station_x_m - x_curr
         if x_rem < 0.0:
             x_rem = 0.0
@@ -627,6 +648,7 @@ class MPCTransitionRailroadEnv:
         inv_2b, inv_1b = 0.5 * land_k / b_eff, land_k / b_eff
         t = 0.0
         for _ in range(40):
+            _EC.N[0] += 1
             if x >= st - inv_2b * v * v:
                 break
             dx = min(100.0, max(1.0, st - inv_2b * v * v - x))
@@ -642,101 +664,6 @@ class MPCTransitionRailroadEnv:
             v = v_new
         t_arr = t + inv_1b * v
         return float((cor.deadline_s - self.t_curr) - t_arr)
-
-    def update_zone_eco_upper_bound(
-        self, a_start: float = 0.86, b_land: float = 0.74
-    ) -> tuple[float, bool]:
-        """
-        Eco upper bound on the commanded cruise speed, applied ONLY when the train is going too fast
-        (cached once per step). Returns (v_ub, is_binding):
-          1) v_track = minimal hold speed such that travelling at min(v_track, cap_i) over the remaining
-             zones plus the cosine stopping trajectory meets the deadline (`compute_feasible_deadline_pace`),
-             plus a headwind margin from the disturbance observer.
-          2) On-track test: holding min(v_meas, cap_i) + stop arrives early by `compute_on_track_slack_s`.
-             If v_meas >= v_track and slack > t_res + 0.5 s, any further acceleration is useless:
-             v_ub = max(v_track + 0.10, v_anchor), v_anchor = speed when the bound engaged (latched).
-          3) Acceleration that would have to be braked away (an upcoming lower speed zone within braking
-             reach, or the station braking spot) is evicted: v_ub <= max(v_target_after, v_anchor).
-        The anchor is latched (constant setpoint, no per-step re-anchoring on the measured speed, which
-        produced a staircase of shaper ramps) and released with hysteresis (slack < t_res - 0.5 s).
-        Otherwise v_ub = local speed cap (no bound).
-        """
-        if self._eco_ub_cache_k == self.k_elapsed:
-            return self._eco_ub_cached_res
-
-        cor = self.corridor
-        x = self.x_curr
-        v = max(0.0, float(self.v_meas))
-        v_cur_cap = cor.get_speed_limit(x)
-        res = (float(v_cur_cap), False)
-        if self.k_elapsed < 8 or self.shaper.in_landing or (cor.station_x_m - x) <= 200.0 or v < 1.8:
-            self._eco_anchor_v = None
-            self._eco_ub_cache_k = self.k_elapsed
-            self._eco_ub_cached_res = res
-            return res
-
-        v_feas, _ = self.compute_feasible_deadline_pace(a_start, b_land)
-        # Keep a schedule reserve t_res for the approach (pilot/landing variability): track the pace that
-        # arrives t_res early, i.e. scale the cruise pace by t_rem / (t_rem - t_res).
-        t_rem = max(cor.dt, cor.deadline_s - self.t_curr)
-        t_res = self.eco_slack_reserve_s
-        v_track = v_feas * (t_rem / max(0.5 * t_rem, t_rem - t_res)) + 0.25 * max(0.0, -float(self.d_hat))
-        slack = self.compute_on_track_slack_s(a_start, b_land)
-        latched = self._eco_anchor_v is not None
-        anchor = self._eco_anchor_v if latched else v
-        v_ub = v_cur_cap
-        on_track = (slack > t_res - 0.5) if latched else (v >= v_track and slack > t_res + 0.5)
-        if on_track:
-            v_ub = max(v_track + 0.10, anchor)
-
-        if slack > 0.0:
-            # Next lower speed zone within braking reach: do not accelerate above current speed.
-            k_land = 0.5 * math.pi if self.use_cosine_shaper else 1.66
-            b_drop = max(0.38, b_land * (0.65 if self.use_cosine_shaper else 0.60))
-            for z in cor.speed_zones:
-                if z.x_start > x and z.v_limit_mps < v_cur_cap:
-                    dx_brk = 0.5 * k_land * max(0.0, v * v - z.v_limit_mps * z.v_limit_mps) / b_drop
-                    if (z.x_start - x) < dx_brk + 8.0 * v:
-                        v_ub = min(v_ub, max(z.v_limit_mps + 0.08, anchor))
-                    break
-            # Station braking spot close ahead: no acceleration beyond what the schedule needs.
-            _, b_eff_land = self._get_remaining_time_geom(b_land)
-            dx_land = (0.5 * k_land / b_eff_land) * v * v
-            if (cor.station_x_m - dx_land - x) < 7.5 * v:
-                v_ub = min(v_ub, max(v_track + 0.06, anchor))
-
-        binding = bool(v_ub < v_cur_cap - 0.05)
-        if binding and not latched:
-            self._eco_anchor_v = v
-        elif not binding:
-            self._eco_anchor_v = None
-        res = (float(v_ub), binding)
-        self.v_eco_ub = res[0]
-        self._eco_ub_cache_k = self.k_elapsed
-        self._eco_ub_cached_res = res
-        return res
-
-    def _eco_v2(self, v_cmd: float, a_start: float, b_land: float) -> tuple[float, float, float]:
-        """Greedy eco levers (gentler acceleration, gentler planned landing, cruise below the knee), each kept only
-        if holding the resulting plan still arrives `reserve` seconds before the deadline."""
-        cor = self.corridor
-        reserve = self.eco_slack_reserve_s if self.eco_v2_reserve_s is None else self.eco_v2_reserve_s
-        budget = (cor.deadline_s - self.t_curr) - reserve
-        if budget <= 0.0 or self.estimate_remaining_time_at_speed(v_cmd, a_start, b_land) > budget:
-            return v_cmd, a_start, b_land
-        changed = False
-        if self.eco_a_cap is not None and a_start > self.eco_a_cap and v_cmd > float(self.v_meas) + 0.3:
-            if self.estimate_remaining_time_at_speed(v_cmd, self.eco_a_cap, b_land) <= budget:
-                a_start, changed = self.eco_a_cap, True
-        if self.eco_b_cap is not None and b_land > self.eco_b_cap:
-            if self.estimate_remaining_time_at_speed(v_cmd, a_start, self.eco_b_cap) <= budget:
-                b_land, changed = self.eco_b_cap, True
-        if self.eco_v_knee is not None and v_cmd > self.eco_v_knee and float(self.v_meas) <= self.eco_v_knee + 0.3:
-            if self.estimate_remaining_time_at_speed(self.eco_v_knee, a_start, b_land) <= budget:
-                v_cmd, changed = self.eco_v_knee, True
-        if changed:
-            self.eco_v2_steps += 1
-        return v_cmd, a_start, b_land
 
     def compute_feasible_deadline_pace(self, a_start: float, b_land: float) -> tuple[float, float]:
         self._ensure_feas_cache_epoch()
@@ -871,6 +798,59 @@ class MPCTransitionRailroadEnv:
             b_land_cos = 0.63 if b_land_cos < 0.63 else (b_hi if b_land_cos > b_hi else b_land_cos)
         return v_cmd_rl, a_start_cos, b_land_cos, v_feas, v_naive
 
+    def _safe_reference(self, v_raw):
+        """Jerk- and comfort-limited follower of the shaper's reference horizon (speed limit first).
+
+        Each step the reference acceleration may change by at most 0.75 j_max * dt, and stays within 0.95 of the
+        comfort acceleration and braking limits; the zone speed limit (minus 0.02 m/s) is never exceeded. Where the
+        raw reference is jerk-feasible it is followed exactly."""
+        cor = self.corridor
+        dt = cor.dt
+        J = 0.75 * 0.48   # tracking adds ~15% to the reference jerk
+        A = 0.95 * cor.comfort_accel_max
+        B = 0.95 * cor.comfort_braking_max
+        if self._rf_v is None:
+            self._rf_v = float(self.v_meas)
+            self._rf_a = 0.0
+            self._rf_raw_prev = float(self.v_meas)
+        v_f, a_f, raw_prev = self._rf_v, self._rf_a, self._rf_raw_prev
+        _EC.N[0] += len(v_raw)   # one filter evaluation per horizon node
+        out = np.empty(len(v_raw))
+        x_i = float(self.x_curr)
+        hit = False
+        for i in range(len(v_raw)):
+            vr = float(v_raw[i])
+            a_t = (vr - raw_prev) / dt
+            e = vr - v_f
+            ae = abs(e)
+            corr = min(ae / (2.0 * dt), math.sqrt(J * ae))
+            a_des = a_t + (corr if e > 0.0 else -corr)
+            lo, hi = a_f - J * dt, a_f + J * dt
+            a_new = lo if a_des < lo else (hi if a_des > hi else a_des)
+            if a_new > A:
+                a_new = A
+            if a_new < -B:
+                a_new = -B
+            v_new = v_f + a_new * dt
+            x_i += max(0.0, v_new) * dt
+            v_lim = cor.get_speed_limit(x_i) - 0.02
+            if v_new > v_lim:            # speed limit has priority over comfort
+                v_new = v_lim
+                a_new = (v_new - v_f) / dt
+            if vr <= 0.0 and v_new < 0.0:
+                v_new = 0.0
+            if v_new < 0.0:
+                v_new = 0.0
+            if abs(v_new - vr) > 1e-4:
+                hit = True
+            out[i] = v_new
+            if i == 0:
+                self._rf_v, self._rf_a, self._rf_raw_prev = v_new, a_new, vr
+            v_f, a_f, raw_prev = v_new, a_new, vr
+        if hit:
+            self.ref_filter_hits += 1
+        return out
+
     def step(
         self,
         action: np.ndarray,
@@ -885,23 +865,14 @@ class MPCTransitionRailroadEnv:
             v_cmd_rl, a_start_cos, b_land_cos = self.pilot_filter(self, v_cmd_rl, a_start_cos, b_land_cos, v_feas)
         v_cmd_unshielded = v_cmd_rl
 
-        # Eco governor (upstream of the shield; not a shield activation): upper bound only when going too fast.
-        eco_capped = False
-        if self.eco_governor and not self.shaper.in_landing:
-            self.eco_macro_steps += 1
-            v_ub_eco, eco_bind = self.update_zone_eco_upper_bound(a_start_cos, b_land_cos)
-            if eco_bind and v_cmd_rl > v_ub_eco + 0.02:
-                v_cmd_rl = v_ub_eco
-                eco_capped = True
-                self.eco_capped_steps += 1
-        if self.eco_governor and not self.shaper.in_landing and (
-            self.eco_a_cap is not None or self.eco_b_cap is not None or self.eco_v_knee is not None
-        ):
-            v_cmd_rl, a_start_cos, b_land_cos = self._eco_v2(v_cmd_rl, a_start_cos, b_land_cos)
+        # Eco governor (external operator, upstream of the shield; not a shield activation).
+        if self.eco is not None:
+            v_cmd_rl, a_start_cos, b_land_cos, v_feas, _ = self.eco.apply(self, v_cmd_rl, a_start_cos, b_land_cos, v_feas)
 
         shield_intervened = False
         shield_diff = 0.0
         violated_prop = "none"
+        cmd_proposed = (v_cmd_rl, a_start_cos, b_land_cos)
         if self.traj_shield is not None:
             self.traj_shield.sigma_tube_curr = self.sigma_tube
             v_cmd_rl, a_start_cos, b_land_cos, shield_intervened, shield_diff, violated_prop = (
@@ -928,6 +899,26 @@ class MPCTransitionRailroadEnv:
         self.coast_active = coast_now
         t_macro_1 = time.thread_time()
         macro_shield_us = (t_macro_1 - t_macro_0) * 1e6
+        if self.safety_monitor is not None and not self.shaper.in_landing:
+            _n_saved = _EC.N[0]
+            mon = self.safety_monitor
+            mon.sigma_tube_curr = 0.0   # the limit itself, without the shield's uncertainty band
+            self.monitored_steps += 1
+            mh = mon._eval_pressures_margins_scalars(self, v_cmd_rl, a_start_cos, b_land_cos, v_feas)
+            unsafe_exec = min(mh[0], mh[1], mh[2], mh[4]) < 0.0   # speed, comfort acceleration, jerk, deadline
+            if unsafe_exec:
+                self.unsafe_steps += 1
+                for _k, _i in (("speed", 0), ("accel", 1), ("jerk", 2), ("deadline", 4)):
+                    if mh[_i] < 0.0:
+                        self.unsafe_by_prop[_k] += 1
+            if (v_cmd_rl, a_start_cos, b_land_cos) == cmd_proposed:
+                unsafe_prop = unsafe_exec
+            else:
+                mp = mon._eval_pressures_margins_scalars(self, *cmd_proposed, v_feas)
+                unsafe_prop = min(mp[0], mp[1], mp[2], mp[4]) < 0.0
+            if unsafe_prop:
+                self.unsafe_proposed_steps += 1
+            _EC.N[0] = _n_saved
 
         n_substeps = self.corridor.macro_steps
         d_hat_at_trigger = self.d_hat  # Record disturbance at macro-trigger instant k_t (Sun et al. 2024 Eq. 20)
@@ -965,6 +956,10 @@ class MPCTransitionRailroadEnv:
                     v_c_i = self.v_meas + a_c * self.corridor.dt * (i_h + 1)
                     if v_c_i < v_ref_h[i_h]:
                         v_ref_h[i_h] = v_c_i if v_c_i > 0.0 else 0.0
+            if self.ref_safety_filter and not self.shaper.in_landing:
+                v_ref_h = self._safe_reference(v_ref_h)
+            elif self.ref_safety_filter:
+                self._rf_v = None   # landing follows the distance-locked stopping profile
             v_ref0_step = float(v_ref_h[0])
 
             slope_iota = (
@@ -973,6 +968,7 @@ class MPCTransitionRailroadEnv:
 
             eff_ff_gain = 1.00 if self.shaper.in_landing else mpc_wind_comp_gain
             self.mpc.prev_v = float(self.v_meas_prev)
+            _EC.N[0] += self.mpc.n_p
             u_cmd = self.mpc.select_action(
                 v_curr=self.v_meas,
                 v_ref_horizon=v_ref_h,
@@ -1104,6 +1100,9 @@ class MPCTransitionRailroadEnv:
                 eta_trac = 0.58 if eta_raw < 0.58 else (0.92 if eta_raw > 0.92 else eta_raw)
                 step_kwh = ((f_prop_true / eta_trac) * avg_v * self.corridor.dt) / 3.6e6
                 self.energy_kwh += step_kwh
+                self._e_diag = (1, f_prop_true * avg_v * self.corridor.dt / 3.6e6, eta_trac,
+                                0.16 * cu_temp_factor * (self.u_act ** 2), slew_loss - ramp_slew, ramp_slew,
+                                0.010 * (max(0.0, avg_v - 13.4) ** 2), a_start_cos, b_land_cos)
             else:
                 # Electrodynamic regenerative braking captures deceleration smoothly when b_land_cos <= 0.72
                 # and |a_real| <= 0.68 m/s^2; steeper braking blends pneumatic friction brakes (dissipated as heat):
@@ -1115,6 +1114,8 @@ class MPCTransitionRailroadEnv:
                 self.regen_kwh += regen_step_kwh
                 self.energy_kwh = max(0.0, self.energy_kwh - regen_step_kwh)
                 step_kwh = -regen_step_kwh
+                self._e_diag = (-1, f_prop_true * avg_v * self.corridor.dt / 3.6e6, regen_step_kwh, regen_blend,
+                                0.0, 0.0, 0.0, a_start_cos, b_land_cos)
 
             # Pure Outcome-Based Multi-Objective Reward (No imitation pace target or param prior bias)
             v_feas_now, v_naive_now = v_feas, v_naive
@@ -1134,7 +1135,7 @@ class MPCTransitionRailroadEnv:
                 + 0.60 * max(0.0, rho_3_jerk - 0.88) ** 2
             )
             ton_km_prior = max(50.0, (self.mass_prior_kg / 1000.0) * (self.corridor.station_x_m / 1000.0))
-            energy_pen = 0.35 * ((step_kwh * 1000.0) / ton_km_prior)
+            energy_pen = self.rew_energy_w * ((step_kwh * 1000.0) / ton_km_prior)
             x_rem_now = max(0.0, self.corridor.station_x_m - x_next)
             stall_pen = 0.30 if ((not self.shaper.in_landing) and (x_rem_now > 150.0) and (v_next < 0.8)) else 0.0
 
@@ -1190,6 +1191,7 @@ class MPCTransitionRailroadEnv:
                     "is_macro_entry": bool(sub_idx == 0),
                     "total_step_us": total_step_us,
                     "is_dwell": False,
+                    "e_diag": getattr(self, "_e_diag", None),
                 })
 
             self.v_prev = self.v_curr
@@ -1330,6 +1332,7 @@ class MPCTransitionRailroadEnv:
 
         for sub_idx in range(n_substeps):
             t0 = time.thread_time()
+            _EC.N[0] += 1
             u_cmd, v_ff, v_cmd_pi, replanned = bilbao_ctrl.select_microscopic_action(
                 t_curr=self.t_curr,
                 x_curr=self.x_curr,
@@ -1607,6 +1610,7 @@ def train_pure_ppo_cosine_pilot(
     a_start_center: float = 0.96,
     reward_fn=None,
     comfort_bound: bool = False,
+    energy_w: float = 0.35,
 ) -> tuple[CosineTrajectoryRLPolicy, list[dict]]:
     # reward_fn(env, rew, done, info) -> training reward (already scaled); None keeps the LossScore reward / 20.
     np.random.seed(seed)
@@ -1621,6 +1625,7 @@ def train_pure_ppo_cosine_pilot(
     env.rew_ontrack_w = float(ontrack_w)
     env.a_start_center = float(a_start_center)
     env.comfort_action_bound = bool(comfort_bound)
+    env.rew_energy_w = float(energy_w)
     policy = CosineTrajectoryRLPolicy(obs_dim=env.obs_dim, act_dim=env.act_dim, hidden_dim=64)
     if init_state is not None:
         # Fine-tuning (e.g. after enabling coasting): start from a trained pilot instead of random weights.
@@ -1802,6 +1807,9 @@ def evaluate_multi_station_journey(
 ) -> dict:
     leg_sched_errs, leg_stop_errs, leg_land_decels, leg_peak_accels, leg_jerks = [], [], [], [], []
     n_micro_tot, n_jerk_exceed, n_acc_exceed = 0, 0, 0   # comfort limits: jerk 0.48 m/s^3, accel 1.20 m/s^2
+    n_state_unsafe_phys = 0
+    n_state_unsafe = 0   # control steps whose actual state breaks speed, accel/brake comfort, jerk, or deadline
+    state_by_prop = {"speed": 0, "accel": 0, "jerk": 0, "deadline": 0}
     tot_energy_kwh = 0.0
     tot_sh_steps, tot_sh_ints = 0, 0
     tot_eco_steps, tot_eco_caps = 0, 0
@@ -1831,7 +1839,10 @@ def evaluate_multi_station_journey(
 
     cum_x_offset = 0.0
     actual_clock_t = float(scenario["legs"][0]["t_start"])
+    _EC.N[0] = 0                     # model evaluations of this journey (machine-independent compute)
+    n_unsafe_tot, n_monitored_tot, n_unsafe_prop_tot = 0, 0, 0
 
+    eco_journey = None   # adaptive eco governor: one object per journey (learns across its legs)
     for leg in scenario["legs"]:
         cor_leg = copy.deepcopy(leg["corridor"])
         cor_leg.start_time_s = actual_clock_t
@@ -1855,10 +1866,26 @@ def evaluate_multi_station_journey(
         if mode in ("RL_LEARNED", "RL_FREE_LEARNED"):
             env.a_start_center = OUR_A_START_CENTER
             env.comfort_action_bound = COMFORT_ACTION_BOUND
+        if mode in ("RL_LEARNED", "RL_FREE_LEARNED"):
+            if ECO_CONFIG is not None:      # user / vehicle-specific eco governor (--eco-config)
+                if ECO_CONFIG is not False and ECO_CONFIG.adaptive:
+                    if eco_journey is None:
+                        eco_journey = EcoGovernor(ECO_CONFIG)
+                    env.eco = eco_journey
+                else:
+                    env.eco = EcoGovernor(ECO_CONFIG) if ECO_CONFIG is not False else None
+            elif ECO_MODE == "physical":    # default: physics-based governor, same for both pilots
+                env.eco = EcoGovernor(physical_eco_config(schedule_bound=env.eco is not None))
+            elif mode == "RL_LEARNED" and OUR_ECO_ENERGY_LIMITS:   # --eco-mode rules: tuned fixed rules
+                env.eco = EcoGovernor(default_eco_config(True, schedule_bound=env.eco is not None, energy_limits=True))
         obs = env.reset(corridor_override=cor_leg, wind_profile=wind_prof)
         bilbao_ctrl = BilbaoCBTCATOController(cor_leg, env.physics) if mode == "BILBAO_CBTC_ATO" else None
         if mode == "LIT_PILOT":
             lit_pilot.reset_leg(env)
+        if mode != "BILBAO_CBTC_ATO":   # Bilbao runs its own control loop, outside the monitored step
+            _n_saved = _EC.N[0]
+            env.safety_monitor = GoodallTrajectoryShield(cor_leg, emulator, TrajectoryShieldConfig(mode="switch"))
+            _EC.N[0] = _n_saved
 
         done = False
         leg_micro = []
@@ -1874,6 +1901,7 @@ def evaluate_multi_station_journey(
                 continue
 
             t_pol_0 = time.thread_time()
+            _EC.N[0] += 1   # pilot query
             if mode in ("RL_LEARNED", "RL_FREE_LEARNED"):
                 assert rl_policy is not None
                 act, _, _ = rl_policy.get_action_and_value(obs, deterministic=True)
@@ -1908,6 +1936,20 @@ def evaluate_multi_station_journey(
         n_micro_tot += len(leg_jrk)
         n_jerk_exceed += int(np.sum(leg_jrk > 0.48 + 1e-9))
         n_acc_exceed += int(np.sum(leg_acc > 1.20 + 1e-9))
+        # Actual-state safety: every control step, on the train's true motion (not the command).
+        leg_v = np.array([m["v"] for m in leg_micro])
+        leg_t = np.array([m["t"] for m in leg_micro])
+        leg_vlim = np.array([cor_leg.get_speed_limit(float(xx)) for xx in leg_x])
+        bad_v = leg_v > leg_vlim + 0.05   # 0.05 m/s (0.18 km/h) tolerance: below it is MPC ripple at the limit
+        bad_a = (leg_acc > cor_leg.comfort_accel_max + 1e-9) | (-leg_acc > cor_leg.comfort_braking_max + 1e-9)
+        bad_j = leg_jrk > 0.48 + 1e-9
+        bad_t = leg_t > cor_leg.deadline_s + 1e-9
+        n_state_unsafe += int(np.sum(bad_v | bad_a | bad_j | bad_t))
+        n_state_unsafe_phys += int(np.sum(bad_v | bad_a | bad_j))   # binding (physical) properties only
+        _ov = leg_v - leg_vlim
+        state_by_prop["ov_max"] = max(state_by_prop.get("ov_max", 0.0), float(np.max(_ov)) if len(_ov) else 0.0)
+        state_by_prop["speed"] += int(np.sum(bad_v)); state_by_prop["accel"] += int(np.sum(bad_a))
+        state_by_prop["jerk"] += int(np.sum(bad_j)); state_by_prop["deadline"] += int(np.sum(bad_t))
         all_step_us.extend([m["step_us"] for m in leg_micro])
 
         all_total_us.extend([m["total_step_us"] for m in leg_micro])
@@ -1943,14 +1985,19 @@ def evaluate_multi_station_journey(
         leg_stop_errs.append(abs(info["stop_error_m"]))
         tot_energy_kwh += info["energy_kwh"]
 
-        tot_eco_steps += env.eco_macro_steps
+        if env.eco is not None and hasattr(env.eco, "end_leg"):
+            env.eco.end_leg(env)
+        tot_eco_steps += env.eco.macro_steps if env.eco is not None else 0
         if mode != "BILBAO_CBTC_ATO":
             mass_abs_err_kg.append(abs(env.mass_hat_kg - float(leg["mass_kg"])))
             mass_prior_abs_err_kg.append(abs(env.mass_prior_kg - float(leg["mass_kg"])))
-        tot_eco_caps += env.eco_capped_steps
+        tot_eco_caps += env.eco.capped_steps if env.eco is not None else 0
         tot_macro += env.macro_steps_total
         tot_coast += env.coast_macro_steps
         tot_coast_aborts += env.coast_aborts
+        n_unsafe_tot += env.unsafe_steps
+        n_unsafe_prop_tot += env.unsafe_proposed_steps
+        n_monitored_tot += env.monitored_steps
         if sh_obj is not None:
             tot_sh_steps += sh_obj.total_steps
             tot_sh_ints += sh_obj.total_interventions
@@ -2044,6 +2091,17 @@ def evaluate_multi_station_journey(
         "n_micro_steps": int(n_micro_tot),
         "jerk_exceed_steps": int(n_jerk_exceed),
         "accel_exceed_steps": int(n_acc_exceed),
+        "unsafe_steps": int(n_unsafe_tot) if mode != "BILBAO_CBTC_ATO" else -1,
+        "monitored_steps": int(n_monitored_tot),
+        "unsafe_proposed_steps": int(n_unsafe_prop_tot) if mode != "BILBAO_CBTC_ATO" else -1,
+        "model_evals": int(_EC.N[0]),
+        "state_unsafe_steps": int(n_state_unsafe),
+        "state_unsafe_phys_steps": int(n_state_unsafe_phys),
+        "state_unsafe_speed": int(state_by_prop["speed"]),
+        "state_unsafe_accel": int(state_by_prop["accel"]),
+        "state_unsafe_jerk": int(state_by_prop["jerk"]),
+        "state_unsafe_deadline": int(state_by_prop["deadline"]),
+        "state_overspeed_max_mps": float(state_by_prop.get("ov_max", 0.0)),
         "comfort_pressure": comfort_press,
         "step_smooth_cost": step_smooth_cost,
         "energy_kwh": tot_energy_kwh,
@@ -2290,6 +2348,17 @@ def _serialize_scenarios_subset(
                 "n_micro_steps": int(r.get("n_micro_steps", 0)),
                 "jerk_exceed_steps": int(r.get("jerk_exceed_steps", 0)),
                 "accel_exceed_steps": int(r.get("accel_exceed_steps", 0)),
+                "unsafe_steps": int(r.get("unsafe_steps", -1)),
+                "monitored_steps": int(r.get("monitored_steps", 0)),
+                "unsafe_proposed_steps": int(r.get("unsafe_proposed_steps", -1)),
+                "model_evals": int(r.get("model_evals", 0)),
+                "state_unsafe_steps": int(r.get("state_unsafe_steps", 0)),
+                "state_unsafe_phys_steps": int(r.get("state_unsafe_phys_steps", 0)),
+                "state_unsafe_speed": int(r.get("state_unsafe_speed", 0)),
+                "state_unsafe_accel": int(r.get("state_unsafe_accel", 0)),
+                "state_unsafe_jerk": int(r.get("state_unsafe_jerk", 0)),
+                "state_unsafe_deadline": int(r.get("state_unsafe_deadline", 0)),
+                "state_overspeed_max_mps": round(float(r.get("state_overspeed_max_mps", 0.0)), 4),
                 "property_counts": dict(r.get("property_counts", {})),
                 "peak_pressures": dict(r.get("peak_pressures", {})),
             }
@@ -2320,6 +2389,17 @@ def _serialize_scenarios_subset(
                 "n_micro_steps": int(m_entry.get("n_micro_steps", 0)),
                 "jerk_exceed_steps": int(m_entry.get("jerk_exceed_steps", 0)),
                 "accel_exceed_steps": int(m_entry.get("accel_exceed_steps", 0)),
+                "unsafe_steps": int(m_entry.get("unsafe_steps", -1)),
+                "monitored_steps": int(m_entry.get("monitored_steps", 0)),
+                "unsafe_proposed_steps": int(m_entry.get("unsafe_proposed_steps", -1)),
+                "model_evals": int(m_entry.get("model_evals", 0)),
+                "state_unsafe_steps": int(m_entry.get("state_unsafe_steps", 0)),
+                "state_unsafe_phys_steps": int(m_entry.get("state_unsafe_phys_steps", 0)),
+                "state_unsafe_speed": int(m_entry.get("state_unsafe_speed", 0)),
+                "state_unsafe_accel": int(m_entry.get("state_unsafe_accel", 0)),
+                "state_unsafe_jerk": int(m_entry.get("state_unsafe_jerk", 0)),
+                "state_unsafe_deadline": int(m_entry.get("state_unsafe_deadline", 0)),
+                "state_overspeed_max_mps": round(float(m_entry.get("state_overspeed_max_mps", 0.0)), 4),
             })
 
         json_records.append({
@@ -2411,6 +2491,9 @@ def main():
     ap.add_argument("--save-extreme-plot", action="store_true", help="Also write an extra _extreme.png dual-axis plot in mixed mode")
     ap.add_argument("--load-checkpoint", type=str, default="", help="Path to .pt file (e.g. best_ppo_cosine_pilot.pt) to skip training")
     ap.add_argument("--real-data", action="store_true", help="Benchmark on real Digitraffic rail + Open-Meteo weather data")
+    ap.add_argument("--historic-suite", type=str, default="",
+                    help="JSON list of historic extreme-weather journeys (regime, date, train_number, ep, seed); with "
+                         "--real-data, the odd (extreme) episodes use these measured days instead of injected weather")
     ap.add_argument("--train-number", type=int, default=8311, help="Finnish Digitraffic train number (e.g. 8311 HSL commuter or 23 InterCity)")
     ap.add_argument("--train-date", type=str, default="", help="YYYY-MM-DD departure date for Digitraffic + Open-Meteo (default: latest completed run)")
     ap.add_argument(
@@ -2454,6 +2537,9 @@ def main():
                     help="No-cosine pilot exported from MASA (methods 6-7); overrides --free-checkpoint")
     ap.add_argument("--free-checkpoint", type=str, default="best_ppo_free_pilot.pt",
                     help="Checkpoint of the no-cosine PPO pilot (methods 6-7)")
+    ap.add_argument("--no-eco-energy-limits", action="store_true", help="Disable the eco-governor energy limits of the cosine pilots")
+    ap.add_argument("--eco-config", type=str, default="", help="JSON EcoConfig for the proposed pilots' eco governor, or 'off'")
+    ap.add_argument("--eco-mode", type=str, default="physical", choices=["physical", "rules"], help="Eco governor of the proposed pilots")
     ap.add_argument("--a-start-center", type=float, default=OUR_A_START_CENTER,
                     help="Acceleration-rate centre (m/s^2) for methods 2-7 (ablation: 0.81)")
     ap.add_argument("--train-cars", type=float, default=None,
@@ -2466,6 +2552,11 @@ def main():
         _rc.TRAIN_CARS = float(args.train_cars)
     STATION_ANEMOMETER2_X_M = float(args.anemometer2_x_m)
     OUR_A_START_CENTER = float(args.a_start_center)
+    if args.no_eco_energy_limits:
+        OUR_ECO_ENERGY_LIMITS = False
+    ECO_MODE = str(args.eco_mode)
+    if args.eco_config:
+        ECO_CONFIG = False if args.eco_config == "off" else EcoConfig.from_json(args.eco_config)
     WX_POLICY = str(args.weather_update)
     PILOT_COASTING = bool(args.coast)
 
@@ -2609,8 +2700,24 @@ def main():
     sample_ext_no_wind = None
     multi_scen_dmps = []
 
+    historic_by_ep = {}
+    if args.historic_suite:
+        import json as _json
+        for _h in _json.load(open(args.historic_suite)):
+            historic_by_ep[int(_h["ep"])] = _h
     for ep in range(args.eval_runs):
-        if args.real_data:
+        if args.real_data and historic_by_ep.get(ep) is not None:
+            h_ent = historic_by_ep[ep]
+            scen = fetch_real_world_multi_station_scenario(
+                date_str=h_ent["date"],
+                train_number=int(h_ent["train_number"]),
+                n_legs_max=args.n_legs,
+                seed=int(h_ent["seed"]),
+                ep_idx=0,
+                harsh_weather_mode="historic",
+            )
+            scen["historic_regime"] = h_ent["regime"]
+        elif args.real_data:
             scen = fetch_real_world_multi_station_scenario(
                 date_str=(args.train_date if args.train_date else None),
                 train_number=args.train_number,

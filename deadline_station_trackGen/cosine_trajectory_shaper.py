@@ -42,6 +42,8 @@ class CosineTrajectoryShaper:
         self.max_traction_accel_est = float(max_traction_accel)
         self.max_service_braking_est = float(max_service_braking)
 
+    stop_comfort_cap = None   # set by the environment for shielded methods
+
     def reset(self) -> None:
         self.ramp_v_start: float = 0.0
         self.ramp_v_goal: float = 0.0
@@ -334,6 +336,8 @@ class CosineTrajectoryShaper:
         mu_y = 1.0 if err_track <= 0.08 else (0.0 if err_track >= 0.60 else 1.0 - (err_track - 0.08) / 0.52)
         # Wang et al. (2026) Eq. 16 exponential fuzzy softening factor on curve flare width:
         alpha = float(min(0.46, alpha_base + 0.04 * (1.0 - mu_y)))
+        if self.stop_comfort_cap is not None and self.in_landing and getattr(self, "_alpha_land", None) is not None:
+            alpha = self._alpha_land   # shielded: the landing shape is fixed at its entry
         shape_k = 1.0 / (1.0 - alpha)
         land_k = max(1.66, shape_k)  # Ensure peak algebraic deceleration <= b_target across alpha
         dur_k = 1.78   # Soft-acceleration S-curve ramp duration factor
@@ -343,6 +347,8 @@ class CosineTrajectoryShaper:
         w_pos = d_wind_hat if d_wind_hat > 0.0 else 0.0
         b_phys_max = max(0.38, self.max_service_braking_est * 0.86 - w_pos)
         b_comf_hi = min(self.corridor.comfort_braking_max, b_phys_max)
+        if self.stop_comfort_cap is not None and b_comf_hi > self.stop_comfort_cap:
+            b_comf_hi = self.stop_comfort_cap   # shielded: tracking margin below the comfort braking limit
         b_comf_lo = min(0.60, b_comf_hi)
         b_raw = b_land_cmd - 0.12 * w_pos
         b_target = b_comf_lo if b_raw < b_comf_lo else (b_comf_hi if b_raw > b_comf_hi else float(b_raw))
@@ -352,16 +358,20 @@ class CosineTrajectoryShaper:
             b_blend = 0.78 * b_for_exact_time + 0.22 * b_target
             b_target = b_comf_lo if b_blend < b_comf_lo else (b_comf_hi if b_blend > b_comf_hi else float(b_blend))
 
-        t_land_now = (land_k * v_eff) / b_target if v_eff > 1e-4 else 0.0
+        b_trig = b_target
+        t_land_now = (land_k * v_eff) / b_trig if v_eff > 1e-4 else 0.0
         dx_brake_now = 0.5 * v_eff * t_land_now
         x_brake_now = self.corridor.station_x_m - dx_brake_now
 
         if (not self.in_landing) and (x_curr >= x_brake_now - 0.5 * v_curr * dt) and (rem_dist_now < 470.0):
             self.in_landing = True
+            self._alpha_land = alpha
             self.x_brake_dynamic = float(x_curr)
             self.v_entry_ref = float(max(1.0, v_curr))
             self.dx_land_ref = float(max(1.0, rem_dist_now))
             self.b_peak_ref = float((land_k * (self.v_entry_ref ** 2)) / (2.0 * self.dx_land_ref))
+            if self.stop_comfort_cap is not None and self.b_peak_ref > self.stop_comfort_cap:
+                self.b_peak_ref = self.stop_comfort_cap
             self.t_land_ref = float((land_k * self.v_entry_ref) / self.b_peak_ref)
         elif not self.in_landing:
             self.x_brake_dynamic = float(x_brake_now)
@@ -371,10 +381,12 @@ class CosineTrajectoryShaper:
         if self.in_landing:
             u_now = self.invert_trapezoidal_distance_phase(rem_dist_now / self.dx_land_ref, alpha)
             tilde_v = max(0.04, self._trap_vel_prog(1.0 - u_now, alpha))
-            if u_now < 0.88 and v_curr > 0.6:
+            if u_now < 0.88 and v_curr > 0.6 and self.stop_comfort_cap is None:   # shielded: keep the capped profile
                 v_entry_implied = v_curr / tilde_v
                 self.v_entry_ref = 0.80 * self.v_entry_ref + 0.20 * v_entry_implied
                 b_cap = self.feasible_comfort_braking(self.corridor.comfort_braking_max, d_wind_hat)
+                if self.stop_comfort_cap is not None and b_cap > self.stop_comfort_cap:
+                    b_cap = self.stop_comfort_cap
                 bp_raw = (land_k * (self.v_entry_ref ** 2)) / (2.0 * self.dx_land_ref)
                 b_min_ref = min(0.48, b_cap)
                 self.b_peak_ref = b_min_ref if bp_raw < b_min_ref else (b_cap if bp_raw > b_cap else float(bp_raw))
@@ -382,6 +394,8 @@ class CosineTrajectoryShaper:
 
             self.free_a_curr = -float((self.v_entry_ref / max(dt, self.t_land_ref)) * self._trap_acc_shape(1.0 - u_now, alpha))
             b_phys_stop = max(0.30, self.max_service_braking_est * 0.94 - max(0.0, d_wind_hat))
+            if self.stop_comfort_cap is not None and b_phys_stop > self.stop_comfort_cap:
+                b_phys_stop = self.stop_comfort_cap   # shielded: the stopping guard stays within comfort braking
             du_step = dt / max(dt, self.t_land_ref)
             sim_rem = rem_dist_now
             sim_v_l = v_curr
@@ -547,6 +561,8 @@ class CosineTrajectoryShaper:
                 self.t_land_ref = float((pi_val * self.v_entry_ref) / (2.0 * self.b_peak_ref))
 
             b_phys_stop = max(0.36, self.max_service_braking_est * 0.94 - max(0.0, d_wind_hat))
+            if self.stop_comfort_cap is not None and b_phys_stop > self.stop_comfort_cap:
+                b_phys_stop = self.stop_comfort_cap   # shielded: the stopping guard stays within comfort braking
             du_step = dt / max(dt, self.t_land_ref)
             sim_rem = rem_dist_now
             sim_v_l = v_curr

@@ -21,6 +21,8 @@ not the authors' code:
 The two convex planners use a small OSQP-style ADMM QP solver (numpy only; scipy is not a dependency).
 """
 from __future__ import annotations
+import os
+import eval_counter as _EC
 
 import copy
 import math
@@ -62,19 +64,28 @@ def encode_action(env, v_target: float, a_start: float = 0.96, b_land: float = 0
     ], dtype=np.float32)
 
 
-def training_scenario(seed: int, j: int) -> dict:
-    """Training journeys: same generator and extreme-weather mix (1 in 3) as the PPO pilots."""
+def training_scenario(journeys_seed: int, j: int) -> dict:
+    """Training journey j (0..1199) of the PPO pilots' protocol for training seed journeys_seed: the same journeys in
+    the same order as train_pure_ppo_cosine_pilot (epoch j // 3 + 1, batch j % 3; the third of each epoch extreme)."""
+    epoch, b = j // 3 + 1, j % 3
     return generate_multi_station_scenario(
-        seed=seed * 1000 + j * 53, n_legs=0, wind_mode="mixed",
-        allow_infeasible_breaks=False, extreme_noise=(j % 3 == 2),
+        seed=journeys_seed * 1000 + epoch * 53 + b * 17, n_legs=0, wind_mode="mixed",
+        allow_infeasible_breaks=False, extreme_noise=(b == 2),
     )
 
 
-def validation_scenarios() -> list[dict]:
+# Training budget and checkpoint-selection cadence of the PPO pilots (400 epochs x 3 journeys, validation every
+# 5 epochs = 15 journeys), used by every learned baseline.
+N_TRAIN_JOURNEYS = 1200
+VAL_EVERY_JOURNEYS = 15
+
+
+def validation_scenarios(journeys_seed: int = 42) -> list[dict]:
+    """The 6 validation journeys of training seed journeys_seed, as in train_pure_ppo_cosine_pilot."""
     return [
-        generate_multi_station_scenario(seed=s, n_legs=0, wind_mode="mixed", allow_infeasible_breaks=False,
-                                        extreme_noise=(i % 2 == 1))
-        for i, s in enumerate(VAL_SEEDS)
+        generate_multi_station_scenario(seed=70000 + journeys_seed * 13 + i * 31, n_legs=0, wind_mode="mixed",
+                                        allow_infeasible_breaks=False, extreme_noise=(i % 2 == 1))
+        for i in range(6)
     ]
 
 
@@ -206,6 +217,7 @@ def solve_qp_ipm(P, q, C, d, G, h, lb=None, ub=None, iters: int = 30, tol: float
     scale = 1.0 + max(np.max(np.abs(q)), 1.0)
     mu0 = max(1.0, float(s @ z) / m)
     for _ in range(iters):
+        _EC.N[0] += _EC.QP_NODES[0]
         r_d = P @ x + q + GTz(z) + C.T @ y
         r_e = C @ x - d
         r_i = Gx(x) + s - hf
@@ -289,6 +301,7 @@ class _QPBuilder:
         """Solve the QP.  With `states`, the equality rows flagged `dyn=True` (one per state variable) are used
         to condense the states out (x_S = affine(x_U)), as in condensed MPC: the KKT system then only involves
         the inputs, and state bounds become general inequality rows."""
+        _EC.QP_NODES[0] = len(states) if states is not None else self.n
         A = np.array(self.rows)
         lo, hi = np.array(self.lo), np.array(self.hi)
         n = self.n
@@ -745,17 +758,18 @@ class ShieldSARSAPilot(_TabularPilotBase):
         self.Q = d["Q"].copy()
 
 
-def train_tabular(pilot, emulator, n_journeys: int = 1200, seed: int = 11, val_every: int = 50, log=print):
+def train_tabular(pilot, emulator, n_journeys: int = N_TRAIN_JOURNEYS, seed: int = 11,
+                  val_every: int = VAL_EVERY_JOURNEYS, journeys_seed: int = 42, log=print):
     from dynamic_railroad_mpc import MPCTransitionRailroadEnv
     from railroad_corridor import RailroadCorridor
     env = MPCTransitionRailroadEnv(corridor=RailroadCorridor(), traj_shield=None, emulator=emulator)
-    val = validation_scenarios()
+    val = validation_scenarios(journeys_seed)
     best, best_sd = float("inf"), pilot.state_dict()
     is_sarsa = isinstance(pilot, ShieldSARSAPilot)
     for j in range(n_journeys):
         pilot.eps = max(0.05, 0.6 * (1.0 - j / (0.7 * n_journeys)))
         lr = 0.15 * max(0.15, 1.0 - j / n_journeys)
-        for leg in training_scenario(seed, j)["legs"]:
+        for leg in training_scenario(journeys_seed, j)["legs"]:
             obs = env.reset(corridor_override=leg["corridor"], wind_profile=leg["wind_profile"])
             s = tab_state(env)
             a = pilot.choose(env, explore=True)
@@ -889,6 +903,7 @@ def ssa_tree_shield(env, a: np.ndarray) -> np.ndarray:
         worst = -1e9
         for _ in range(depth):
             for _k in range(8):
+                _EC.N[0] += 1
                 ceil_x = cor.compute_smooth_spatial_ceiling(min(x, cor.station_x_m), 0.78)
                 acc = _clip((min(v_t, ceil_x) - v) / 2.0, -0.78, a_up)
                 v = max(0.0, v + 0.5 * acc)
@@ -910,8 +925,9 @@ def ssa_tree_shield(env, a: np.ndarray) -> np.ndarray:
     return best if best is not None else least_bad
 
 
-def train_ddpg(name: str, emulator, n_journeys: int = 600, seed: int = 21, supervised: bool = False,
-               shield_fn=None, binary_goal: bool = False, val_every: int = 25, log=print):
+def train_ddpg(name: str, emulator, n_journeys: int = N_TRAIN_JOURNEYS, seed: int = 21, supervised: bool = False,
+               shield_fn=None, binary_goal: bool = False, val_every: int = VAL_EVERY_JOURNEYS,
+               journeys_seed: int = 42, log=print):
     from dynamic_railroad_mpc import MPCTransitionRailroadEnv
     from railroad_corridor import RailroadCorridor
     torch.manual_seed(seed)
@@ -923,14 +939,15 @@ def train_ddpg(name: str, emulator, n_journeys: int = 600, seed: int = 21, super
     opt_c = optim.Adam(critic.parameters(), lr=1e-3)
     buf_o, buf_a, buf_r, buf_o2, buf_d, buf_sup = [], [], [], [], [], []
     cap = 60000
-    val = validation_scenarios()
+    val = validation_scenarios(journeys_seed)
     pilot = PolicyPilot(name, actor, shield_fn=shield_fn)
 
     if supervised:
-        # Step 1-2 of SRL-IETTO: behaviour-clone the ARTSOM operation-mode allocation.
+        # Step 1-2 of SRL-IETTO: behaviour-clone the ARTSOM operation-mode allocation (on the first 60 of the
+        # same training journeys, so the journey budget is unchanged).
         X, Y = [], []
         for j in range(60):
-            for leg in training_scenario(seed + 1, j)["legs"]:
+            for leg in training_scenario(journeys_seed, j)["legs"]:
                 obs = env.reset(corridor_override=leg["corridor"], wind_profile=leg["wind_profile"])
                 done = False
                 while not done:
@@ -948,7 +965,7 @@ def train_ddpg(name: str, emulator, n_journeys: int = 600, seed: int = 21, super
     log(f"  [{name}] init val LossScore {best:.4f}")
     for j in range(n_journeys):
         sig = 0.25 * max(0.1, 1.0 - j / n_journeys)
-        for leg in training_scenario(seed, j)["legs"]:
+        for leg in training_scenario(journeys_seed, j)["legs"]:
             obs = env.reset(corridor_override=leg["corridor"], wind_profile=leg["wind_profile"])
             done = False
             while not done:
@@ -1015,6 +1032,12 @@ LIT_METHOD_NAMES = [
 ]
 
 
+def _ck(fname: str) -> str:
+    """Checkpoint name for the training seed selected by LIT_CKPT_SUFFIX (e.g. "_r2"); empty = first seed."""
+    suf = os.environ.get("LIT_CKPT_SUFFIX", "")
+    return fname[:-3] + suf + ".pt" if suf else fname
+
+
 def load_literature_pilots(emulator, train_if_missing: bool = True, log=print) -> dict:
     """Returns {method name: pilot factory}. RL baselines are loaded from checkpoints/lit_*.pt (trained once
     with the same journey budget and validation protocol as the PPO pilots if missing)."""
@@ -1025,7 +1048,7 @@ def load_literature_pilots(emulator, train_if_missing: bool = True, log=print) -
     out[XiaoConvexSHMPCPilot.name] = lambda: XiaoConvexSHMPCPilot()
     out[ZhongPseudospectralMPCPilot.name] = lambda: ZhongPseudospectralMPCPilot()
 
-    for cls, fname in ((CDQPilot, "lit_cdq.pt"), (ShieldSARSAPilot, "lit_shield_sarsa.pt")):
+    for cls, fname in ((CDQPilot, _ck("lit_cdq.pt")), (ShieldSARSAPilot, _ck("lit_shield_sarsa.pt"))):
         p = CKPT_DIR / fname
         pil = cls()
         if p.exists():
@@ -1035,7 +1058,7 @@ def load_literature_pilots(emulator, train_if_missing: bool = True, log=print) -
             torch.save(pil.state_dict(), str(p))
         out[cls.name] = (lambda pil=pil: pil)
 
-    p = CKPT_DIR / "best_lit_eitop.pt"
+    p = CKPT_DIR / _ck("best_lit_eitop.pt")
     eit = CosineTrajectoryRLPolicy(18, 3, 64)
     if p.exists():
         eit.load_state_dict(torch.load(str(p), map_location="cpu"))
@@ -1046,8 +1069,8 @@ def load_literature_pilots(emulator, train_if_missing: bool = True, log=print) -
     out[LIT_METHOD_NAMES[4]] = lambda: PolicyPilot(LIT_METHOD_NAMES[4], eit, pilot_filter=eitop_expert_filter)
 
     for nm, fname, kw in (
-        (LIT_METHOD_NAMES[5], "lit_srl_ietto.pt", dict(supervised=True, binary_goal=True)),
-        (LIT_METHOD_NAMES[6], "lit_ssa_drl.pt", dict(shield_fn=ssa_tree_shield)),
+        (LIT_METHOD_NAMES[5], _ck("lit_srl_ietto.pt"), dict(supervised=True, binary_goal=True)),
+        (LIT_METHOD_NAMES[6], _ck("lit_ssa_drl.pt"), dict(shield_fn=ssa_tree_shield)),
     ):
         p = CKPT_DIR / fname
         act = DDPGActor()
@@ -1076,6 +1099,7 @@ def _pm_worst_ceiling_margin(env, v_t: float, a_up: float, n_steps: int = 8) -> 
     x, v = env.x_curr, env.v_meas
     worst = -1e9
     for _ in range(n_steps):
+        _EC.N[0] += 1
         acc = _clip((v_t - v) / 2.0, -0.78, a_up)
         v = max(0.0, v + 0.5 * acc)
         x += 0.5 * v
@@ -1178,10 +1202,11 @@ def esmedrl_refine(env, v_cmd: float, a_start: float, b_land: float, v_feas: flo
     return v, a_start, b_land
 
 
-def train_esmedrl(name: str, emulator, n_journeys: int = 600, seed: int = 31, val_every: int = 25, log=print,
-                  lam_max: float = float("inf")):
+def train_esmedrl(name: str, emulator, n_journeys: int = N_TRAIN_JOURNEYS, seed: int = 31,
+                  val_every: int = VAL_EVERY_JOURNEYS, log=print, lam_max: float = float("inf"), journeys_seed: int = 42):
     """Maximum-entropy actor-critic (SAC, automatic temperature) on the LossScore reward, with Lagrange
-    multipliers on the speed, acceleration and jerk violations (dual ascent towards zero violations)."""
+    multipliers on the speed, acceleration and jerk violations (dual ascent towards zero violations).
+    lam_max caps the multipliers (default: uncapped, as in the method)."""
     from dynamic_railroad_mpc import MPCTransitionRailroadEnv
     from railroad_corridor import RailroadCorridor
     torch.manual_seed(seed)
@@ -1199,13 +1224,13 @@ def train_esmedrl(name: str, emulator, n_journeys: int = 600, seed: int = 31, va
     lam = np.zeros(3)                                     # Lagrange multipliers: speed, accel, jerk
     buf = []
     cap = 60000
-    val = validation_scenarios()
+    val = validation_scenarios(journeys_seed)
     pilot = PolicyPilot(name, actor, pilot_filter=esmedrl_refine)
     best, best_sd = validation_loss(pilot, emulator, val), copy.deepcopy(actor.state_dict())
     log(f"  [{name}] init val LossScore {best:.4f}")
     for j in range(n_journeys):
         viol_sum, n_steps = np.zeros(3), 0
-        legs_j = training_scenario(seed, j)["legs"]
+        legs_j = training_scenario(journeys_seed, j)["legs"]
         for leg in legs_j:
             obs = env.reset(corridor_override=leg["corridor"], wind_profile=leg["wind_profile"])
             done = False
@@ -1280,8 +1305,9 @@ def tan_expert_action(env) -> np.ndarray:
     return encode_action(env, v_feas + 0.4, 0.96, 0.78)
 
 
-def train_ga_ddpg(name: str, emulator, n_journeys: int = 600, seed: int = 41, val_every: int = 25,
-                  pop: int = 4, gen_len: int = 25, log=print):
+def train_ga_ddpg(name: str, emulator, n_journeys: int = N_TRAIN_JOURNEYS, seed: int = 41,
+                  val_every: int = VAL_EVERY_JOURNEYS, pop: int = 4, gen_len: int = 25, journeys_seed: int = 42,
+                  log=print):
     from dynamic_railroad_mpc import MPCTransitionRailroadEnv
     from railroad_corridor import RailroadCorridor
     torch.manual_seed(seed)
@@ -1294,7 +1320,7 @@ def train_ga_ddpg(name: str, emulator, n_journeys: int = 600, seed: int = 41, va
     opt_c = optim.Adam(critic.parameters(), lr=1e-3)
     buf = []
     cap = 60000
-    val = validation_scenarios()
+    val = validation_scenarios(journeys_seed)
     pilot = PolicyPilot(name, actor, pilot_filter=tan_expert_rules)
     # Genetic algorithm over the exploration-noise scale: each individual explores for gen_len // pop journeys,
     # fitness = mean training return; selection keeps the best half, mutation multiplies by lognormal noise.
@@ -1307,7 +1333,7 @@ def train_ga_ddpg(name: str, emulator, n_journeys: int = 600, seed: int = 41, va
         sig = sigmas[ind]
         p_guide = 0.5 * max(0.0, 1.0 - 2.0 * j / n_journeys)   # expert guidance, annealed to 0 by mid-training
         ret = 0.0
-        for leg in training_scenario(seed, j)["legs"]:
+        for leg in training_scenario(journeys_seed, j)["legs"]:
             obs = env.reset(corridor_override=leg["corridor"], wind_profile=leg["wind_profile"])
             done = False
             while not done:
@@ -1367,7 +1393,7 @@ def load_extra_literature_pilots(emulator, train_if_missing: bool = True, log=pr
     from dynamic_railroad_mpc import CosineTrajectoryRLPolicy, train_pure_ppo_cosine_pilot
     from railroad_corridor import RailroadCorridor
     out = {}
-    p = CKPT_DIR / "best_lit_sppo.pt"
+    p = CKPT_DIR / _ck("best_lit_sppo.pt")
     sp = CosineTrajectoryRLPolicy(18, 3, 64)
     if p.exists():
         sp.load_state_dict(torch.load(str(p), map_location="cpu"))
@@ -1378,8 +1404,8 @@ def load_extra_literature_pilots(emulator, train_if_missing: bool = True, log=pr
     sp.eval()
     out[EXTRA_LIT_NAMES[0]] = lambda: PolicyPilot(EXTRA_LIT_NAMES[0], sp, pilot_filter=sppo_safe_rechoose)
     for nm, fname, cls, trainer, filt in (
-        (EXTRA_LIT_NAMES[1], "lit_esmedrl.pt", SACActor, train_esmedrl, esmedrl_refine),
-        (EXTRA_LIT_NAMES[2], "lit_ga_ddpg.pt", DDPGActor, train_ga_ddpg, tan_expert_rules),
+        (EXTRA_LIT_NAMES[1], _ck("lit_esmedrl.pt"), SACActor, train_esmedrl, esmedrl_refine),
+        (EXTRA_LIT_NAMES[2], _ck("lit_ga_ddpg.pt"), DDPGActor, train_ga_ddpg, tan_expert_rules),
     ):
         p = CKPT_DIR / fname
         act = cls()

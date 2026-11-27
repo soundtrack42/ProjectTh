@@ -11,6 +11,7 @@ Generate publication-grade diagrams and empirical multi-panel paper figures insi
 from __future__ import annotations
 
 import copy
+import json
 import csv
 import re
 import os
@@ -87,53 +88,55 @@ def generate_pipeline_stages(out_path: Path) -> None:
     shield (contract search tree only when the plan is unsafe) -> shaper + MPC -> back to force estimation.
     The eco governor never coasts or brakes (it holds speed and softens starts when early); coasting is the
     shield's C4 backup. The learned speed-range predictor lives inside the shield (and caps the pilot's speed).
+    Drawn on a compact canvas (data units = inches) so the text stays readable when scaled to text width.
     """
-    W, H = 16.0, 3.75
+    W, H = 12.1, 4.15
     fig, ax = plt.subplots(figsize=(W, H), dpi=300)
     ax.set_xlim(0, W)
-    ax.set_ylim(-0.12, H - 0.25)
+    ax.set_ylim(0, H)
     ax.axis("off")
 
     stages = [
-        ("1. Force estimation", ["Mass + wind at departure", "Wind and grip along route"], "#F5F3FF", "#6250D6", "#6250D6"),
-        ("2. PPO pilot", ["Picks a speed plan every 4 s"], "#EFF6FF", "#2A78D6", "#2A78D6"),
-        ("3. Eco governor", ["When early: hold speed.", "Depart more gently"], "#F0FDF4", "#4D9A3A", "#3F7F30"),
-        ("4. Shield", ["Predicts the 99% speed range,", "checks the proposed plan"], "#FFF1F2", "#E34948", "#C73534"),
-        ("5. MPC tracker", ["Smooth speed curve,", "traction / brake command"], "#ECFDF5", "#008300", "#006A00"),
+        ("E · Estimate forces", ["Mass + wind", "at departure", "Wind and grip", "along route"], "#F5F3FF", "#6250D6", "#6250D6"),
+        ("L · Learn: PPO pilot", ["Picks a speed plan", "every 4 s"], "#EFF6FF", "#2A78D6", "#2A78D6"),
+        ("E · Economize", ["Eco governor.", "When early:", "hold speed.", "Depart more gently"], "#F0FDF4", "#4D9A3A", "#3F7F30"),
+        ("C · Certify: shield", ["Predicts the 99%", "speed range, checks", "the proposed plan"], "#FFF1F2", "#E34948", "#C73534"),
+        ("T · Track: MPC", ["Smooth speed curve,", "traction / brake", "command"], "#ECFDF5", "#008300", "#006A00"),
     ]
     flow = ["estimated\nforces", "speed\nplan", "capped\nplan", "safe\nplan"]
-    x0, w, top_y, top_h = 0.35, 2.45, 2.1, 1.35
+    FT, FB, FS = 10.6, 10.5, 9.4
+    x0, w, top_y, top_h = 0.06, 1.72, 2.45, 1.52
     gap = (W - 2 * x0 - len(stages) * w) / (len(stages) - 1)
     xs = [x0 + i * (w + gap) for i in range(len(stages))]
     cx = [x + w / 2 for x in xs]
     for x, (title, lines, fc, ec, hc) in zip(xs, stages):
-        _card(ax, x, top_y, w, top_h, title, lines, fc, ec, hc, ft=9.4, fb=8.3)
-    ym = top_y + 0.42
+        _card(ax, x, top_y, w, top_h, title, lines, fc, ec, hc, ft=FT, fb=FB, line_step=0.235)
+    ym = top_y + 0.5
     for i in range(len(stages) - 1):
-        _arr(ax, (xs[i] + w, ym), (xs[i + 1], ym), col=stages[i][3])
-        ax.text(xs[i] + w + gap / 2, ym + 0.12, flow[i], ha="center", va="bottom",
-                fontsize=7.6, color="#334155", linespacing=1.05, zorder=6)
+        _arr(ax, (xs[i] + w + 0.04, ym), (xs[i + 1] - 0.04, ym), col=stages[i][3], ms=15)
+        ax.text(xs[i] + w + gap / 2, ym + 0.1, flow[i], ha="center", va="bottom",
+                fontsize=FS, color="#334155", linespacing=1.05, zorder=6)
 
     # Contract search: a separate branch, entered only when the shield finds the plan unsafe
-    bk_w = 3.4
-    bk_x = cx[3] - bk_w / 2
-    _card(ax, bk_x, 0.25, bk_w, 1.15, "Contract search tree (only if unsafe)",
-          ["Backup contracts C1-C4 x 3 blend strengths;", "prune unsafe leaves, keep the best reward"],
-          "#FEF2F2", "#E34948", "#991B1B", ft=8.6, fb=8.0)
-    _arr(ax, (cx[3] - 0.45, top_y), (cx[3] - 0.45, 1.40), col="#C73534", lw=1.6, ls="--")
-    _pill(ax, cx[3] - 1.20, 1.76, "unsafe", col="#991B1B", bg="#FEF2F2", ec="#F87171", fs=7.4)
-    _arr(ax, (cx[3] + 0.45, 1.40), (cx[3] + 0.45, top_y), col="#C73534", lw=1.6)
-    _pill(ax, cx[3] + 1.25, 1.76, "best among safe option", col="#991B1B", bg="#FEF2F2", ec="#F87171", fs=7.4)
+    bk_w, bk_h, bk_y = 3.45, 1.22, 0.42
+    bk_x = cx[3] - 0.2 - bk_w / 2
+    _card(ax, bk_x, bk_y, bk_w, bk_h, "Contract search tree (only if unsafe)",
+          ["Backup contracts C1-C4 x 3 blend strengths;", "prune unsafe leaves,", "keep the best reward"],
+          "#FEF2F2", "#E34948", "#991B1B", ft=FT, fb=FB, line_step=0.235)
+    _arr(ax, (cx[3] - 0.4, top_y - 0.04), (cx[3] - 0.4, bk_y + bk_h + 0.05), col="#C73534", lw=1.7, ls="--", ms=15)
+    _pill(ax, cx[3] - 0.95, 2.02, "unsafe", col="#991B1B", bg="#FEF2F2", ec="#F87171", fs=FS)
+    _arr(ax, (cx[3] + 0.4, bk_y + bk_h + 0.05), (cx[3] + 0.4, top_y - 0.04), col="#C73534", lw=1.7, ms=15)
+    _pill(ax, cx[3] + 1.12, 2.02, "best among\nsafe option", col="#991B1B", bg="#FEF2F2", ec="#F87171", fs=FS)
 
     # Closed loop: MPC command acts on the train, measurements feed force estimation again
-    xa, xb, yb = cx[4], cx[0], -0.04
-    ax.plot([xa, xa, xb, xb], [top_y, yb, yb, top_y - 0.2], color="#475569", lw=1.6, zorder=3)
-    _arr(ax, (xb, top_y - 0.2), (xb, top_y), col="#475569", lw=1.6)
-    _pill(ax, xa, 0.95, "traction / brake\napplied to train", col="#065F46", bg="#ECFDF5", ec="#10B981", fs=7.4)
-    _pill(ax, xb, 0.95, "measured speed,\nwind, grip", col="#3B2F99", bg="#F5F3FF", ec="#A78BFA", fs=7.4)
+    xa, xb, yb = cx[4], cx[0], 0.1
+    ax.plot([xa, xa, xb, xb], [top_y - 0.04, yb, yb, top_y - 0.3], color="#475569", lw=1.7, zorder=3)
+    _arr(ax, (xb, top_y - 0.3), (xb, top_y - 0.04), col="#475569", lw=1.7, ms=15)
+    _pill(ax, xa, 1.05, "traction / brake\napplied to train", col="#065F46", bg="#ECFDF5", ec="#10B981", fs=FS)
+    _pill(ax, xb, 1.05, "measured speed,\nwind, grip", col="#3B2F99", bg="#F5F3FF", ec="#A78BFA", fs=FS)
 
-    fig.tight_layout(pad=0.25)
-    fig.savefig(str(out_path), dpi=300, bbox_inches="tight")
+    fig.tight_layout(pad=0.1)
+    fig.savefig(str(out_path), dpi=300, bbox_inches="tight", pad_inches=0.03)
     plt.close(fig)
 
 
@@ -338,9 +341,14 @@ def generate_empirical_figures(fig_dir: Path) -> None:
     sc_base = fetch_real_world_multi_station_scenario(
         date_str=FIG_DATE, train_number=8311, n_legs_max=0, seed=9000, ep_idx=0, harsh_weather_mode="mixed"
     )
+    # Extreme panel: a historic storm day from the benchmark's measured extreme suite (no injected weather)
+    _h_ext = next(h for h in json.load(open(SCRIPT_DIR / "historic_extreme_suite.json")) if h["date"] == "2020-11-02")
     sc_ext = fetch_real_world_multi_station_scenario(
-        date_str=FIG_DATE, train_number=8311, n_legs_max=0, seed=9000 + 11 * 29, ep_idx=11, harsh_weather_mode="mixed"
+        date_str=_h_ext["date"], train_number=int(_h_ext["train_number"]), n_legs_max=0, seed=int(_h_ext["seed"]),
+        ep_idx=0, harsh_weather_mode="historic"
     )
+    _ext_tag = (f"Real-world journey, storm of 2 Nov 2020 (train {sc_ext['train_number']}, {sc_ext['n_legs']} stops, "
+                f"{sc_ext['total_length_m'] / 1000:.1f} km)")
     sc_clean = generate_multi_station_scenario(seed=9000, n_legs=3, wind_mode="none", allow_infeasible_breaks=False, extreme_noise=False)
 
     specs = [
@@ -354,6 +362,11 @@ def generate_empirical_figures(fig_dir: Path) -> None:
         ("8. Bilbao'25", "BILBAO_CBTC_ATO", None, None, "goldenrod", "-."),
     ]
 
+    # Labels shown in the figures (the keys above stay unchanged for lookups)
+    disp = {"1. Greedy": "1. Greedy", "2. PPO Unsh": "2. ELECT-Cos", "3. Switch": "3. ELECT-Cos + Switch",
+            "4. 1-Step DCBF": "4. ELECT-Cos + DCBF", "5. UCB-DMPS": "5. ELECT-Cos + UCB-DMPS",
+            "6. NonCos Unsh": "6. ELECT-Herm", "7. NonCos UCB": "7. ELECT-Herm + UCB-DMPS", "8. Bilbao'25": "8. Bilbao'25"}
+
     trajs_base = {nm: evaluate_multi_station_journey(nm, sc_base, md, rl_policy=pl, shield_mode=sh, emulator=emu, record_traj=True) for nm, md, pl, sh, _, _ in specs}
     trajs_ext = {nm: evaluate_multi_station_journey(nm, sc_ext, md, rl_policy=pl, shield_mode=sh, emulator=emu, record_traj=True) for nm, md, pl, sh, _, _ in specs}
     trajs_clean = {nm: evaluate_multi_station_journey(nm, sc_clean, md, rl_policy=pl, shield_mode=sh, emulator=emu, record_traj=True) for nm, md, pl, sh, _, _ in specs}
@@ -366,7 +379,7 @@ def generate_empirical_figures(fig_dir: Path) -> None:
                              gridspec_kw={"height_ratios": [3.0, 1.0, 1.0, 1.1]})
     for col_idx, (title_tag, scen_obj, tr_map) in enumerate([
         ("Real-world journey, measured weather (4 stops, 16.2 km)", sc_base, trajs_base),
-        ("Real-world journey, injected storm and slush (4 stops, 15.6 km)", sc_ext, trajs_ext),
+        (_ext_tag, sc_ext, trajs_ext),
     ]):
         tr_sh = tr_map["5. UCB-DMPS"]["traj"]
         tr_un = tr_map["2. PPO Unsh"]["traj"]
@@ -379,8 +392,8 @@ def generate_empirical_figures(fig_dir: Path) -> None:
                           tr_sh["v_emu"] + tr_sh["scissor_rad"], color=C_UCB, alpha=0.18, lw=0, label="99% speed band (shield)")
         ax_t.plot(xg_c / 1000.0, vc_g, color=C_CEIL, ls=":", lw=1.2, label="Speed limit")
         ax_t.plot(tr_bb["x"] / 1000.0, tr_bb["v"], color=C_BIL, ls="-.", lw=1.4, label="8. Bilbao CBTC-ATO")
-        ax_t.plot(tr_un["x"] / 1000.0, tr_un["v"], color=C_UNSH, ls="--", lw=1.4, label="2. PPO cosine, unshielded")
-        ax_t.plot(x_sh, tr_sh["v"], color=C_UCB, ls="-", lw=2.0, label="5. PPO cosine + UCB-DMPS")
+        ax_t.plot(tr_un["x"] / 1000.0, tr_un["v"], color=C_UNSH, ls="--", lw=1.4, label="2. ELECT-Cos (unshielded)")
+        ax_t.plot(x_sh, tr_sh["v"], color=C_UCB, ls="-", lw=2.0, label="5. ELECT-Cos + UCB-DMPS")
         im = tr_sh["intervened"]
         if np.any(im):
             ax_t.scatter(x_sh[im], tr_sh["v"][im], color=C_UCB, edgecolor="white", s=22, zorder=6, label="Shield intervention")
@@ -445,10 +458,14 @@ def generate_empirical_figures(fig_dir: Path) -> None:
             }
         return out
 
-    csv_real_b = _load_csv_means(SCRIPT_DIR / "data" / "real_world_api_baseline_metrics.csv")
-    csv_real_e = _load_csv_means(SCRIPT_DIR / "data" / "real_world_api_extreme_metrics.csv")
-    csv_synth = _load_csv_means(SCRIPT_DIR / "data" / "synthetic_baseline_metrics.csv",
-                                SCRIPT_DIR / "data" / "synthetic_extreme_metrics.csv")
+    # Final benchmark: first run of every method, with the planners 9-10 measured on the idle machine
+    # (the same values as the report tables). Falls back to data/ if the merged folder is missing.
+    dd = SCRIPT_DIR / "data" / "figures_source"
+    if not dd.is_dir():
+        dd = SCRIPT_DIR / "data"
+    csv_real_b = _load_csv_means(dd / "real_world_api_baseline_metrics.csv")
+    csv_real_e = _load_csv_means(dd / "real_world_api_extreme_metrics.csv")
+    csv_synth = _load_csv_means(dd / "synthetic_baseline_metrics.csv", dd / "synthetic_extreme_metrics.csv")
 
     full_method_keys = [
         "1. Max-Speed Greedy Cosine + MPC",
@@ -460,7 +477,7 @@ def generate_empirical_figures(fig_dir: Path) -> None:
         "7. Stable-Accel PPO + Jerk-Horizon UCB-DMPS",
         "8. Bilbao (2025) CBTC-ATO (RMBTP + PI)",
     ]
-    short_lbls = ["Greedy", "PPO Unsh", "Switch", "DCBF", "UCB-Cos", "NonCos", "NonCos+UCB", "Bilbao'25"]
+    short_lbls = ["Greedy", "ELECT-Cos", "ELECT-Cos+Switch", "ELECT-Cos+DCBF", "ELECT-Cos+UCB", "ELECT-Herm", "ELECT-Herm+UCB", "Bilbao'25"]
     full_method_keys = [_canon(k) for k in full_method_keys]
     lit_short = [("Xiao (2023)", "Xiao'23"), ("Zhong (2022)", "Zhong'22"), ("Chen (2025)", "CDQ'25"),
                  ("Zhao (2023)", "S-SARSA'23"), ("Huang (2025)", "EITOP'25"), ("Li (2023)", "SRL'23"),
@@ -477,7 +494,7 @@ def generate_empirical_figures(fig_dir: Path) -> None:
     # Row 0: Sample closed-loop profiles (all 10 methods in Panel 1!)
     for nm, _, _, _, col, ls in specs:
         r = trajs_base[nm]
-        ax_a[0, 0].plot(r["traj"]["x"], r["traj"]["v"], color=col, ls=ls, lw=1.35, label=nm)
+        ax_a[0, 0].plot(r["traj"]["x"], r["traj"]["v"], color=col, ls=ls, lw=1.35, label=disp[nm])
     ax_a[0, 0].set_title("1. Speed profiles, methods 1-8 (real journey)", fontweight="bold", fontsize=10.5)
     ax_a[0, 0].set_xlabel("Position (m)")
     ax_a[0, 0].set_ylabel("Speed (m/s)")
@@ -493,7 +510,7 @@ def generate_empirical_figures(fig_dir: Path) -> None:
     ax_a[0, 1].text(0.98, 0.04, f"Jerk above 0.48 m/s³ on {n_over} of {len(tr_dmps['jerk'])} steps\n"
                     f"(peak {jmax:.2f} m/s³, at the end of departure ramps)", transform=ax_a[0, 1].transAxes,
                     ha="right", va="bottom", fontsize=8.5, bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#c3c2b7"))
-    ax_a[0, 1].set_title("2. Acceleration within comfort limits (UCB-DMPS)", fontweight="bold", fontsize=10.5)
+    ax_a[0, 1].set_title("2. Acceleration within comfort limits (ELECT-Cos + UCB-DMPS)", fontweight="bold", fontsize=10.5)
     ax_a[0, 1].set_xlabel("Time (s)")
     ax_a[0, 1].set_ylabel("Acceleration (m/s²)")
     ax_a[0, 1].set_ylim(-1.4, 1.6)
@@ -522,7 +539,7 @@ def generate_empirical_figures(fig_dir: Path) -> None:
         ve = [csv_real_e[k][mkey] for k in full_method_keys]
         vs = [csv_synth[k][mkey] for k in full_method_keys]
         ax_p.bar(xp - bw, vb, bw, color="#2a78d6", label="Real, measured weather (15)")
-        ax_p.bar(xp, ve, bw, color="#eb6834", label="Real, extreme weather (15)")
+        ax_p.bar(xp, ve, bw, color="#eb6834", label="Real, historic extreme weather (15)")
         ax_p.bar(xp + bw, vs, bw, color="#1baf7a", label="Synthetic (30)")
         ax_p.set_title(ttl, fontweight="bold", fontsize=10.5)
         ax_p.set_ylabel(ylbl)
@@ -561,10 +578,10 @@ def generate_empirical_figures(fig_dir: Path) -> None:
     plot_9 = [s for s in specs if s[0] != "4. 1-Step DCBF"]
     for c_i, (lbl, sc_obj, tmap) in enumerate([
         ("Synthetic journey without wind (3 stops)", sc_clean, trajs_clean),
-        ("Real-world journey, injected storm and slush (4 stops)", sc_ext, trajs_ext),
+        (_ext_tag, sc_ext, trajs_ext),
     ]):
         for nm, _, _, _, col, ls in plot_9:
-            ax_d[0, c_i].plot(tmap[nm]["traj"]["x"], tmap[nm]["traj"]["v"], color=col, ls=ls, lw=1.4, label=nm)
+            ax_d[0, c_i].plot(tmap[nm]["traj"]["x"], tmap[nm]["traj"]["v"], color=col, ls=ls, lw=1.4, label=disp[nm])
         xg_d, vc_d = _compute_scenario_ceil_grid(sc_obj)
         ax_d[0, c_i].plot(xg_d, vc_d, "k:", lw=1.2, label="Speed limit")
         ax_d[0, c_i].set_title(lbl, fontweight="bold", fontsize=10.0)
@@ -575,7 +592,7 @@ def generate_empirical_figures(fig_dir: Path) -> None:
         tr7 = tmap["5. UCB-DMPS"]["traj"]
         ax_d[1, c_i].plot(tr7["x"], tr7["wind_true"], color="navy", lw=1.4, label="Wind push, true (m/s²)")
         ax_d[1, c_i].plot(tr7["x"], tr7["wind_hat"], color="dodgerblue", ls=":", lw=1.3, label="Wind push, estimated (m/s²)")
-        ax_d[1, c_i].plot(tr7["x"], tr7["u_act"], color="crimson", alpha=0.75, lw=1.1, label="Traction/brake command (UCB-DMPS, fraction)")
+        ax_d[1, c_i].plot(tr7["x"], tr7["u_act"], color="crimson", alpha=0.75, lw=1.1, label="Traction/brake command (ELECT-Cos + UCB-DMPS, fraction)")
         ax_d[1, c_i].set_xlabel("Position (m)")
         ax_d[1, c_i].set_ylabel("Wind and command")
         ax_d[1, c_i].set_ylim(-1.1, 1.1)

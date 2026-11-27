@@ -352,7 +352,7 @@ def _resolve_train_and_date(
             comp_cand = _http_get_json(
                 f"https://rata.digitraffic.fi/api/v1/compositions/{chosen_date}/{selected_num}",
                 headers=DIGITRAFFIC_HEADERS,
-                timeout=5.0,
+                timeout=20.0, retries=4,
             )
             if isinstance(comp_cand, dict) and "journeySections" in comp_cand:
                 comp_obj = comp_cand
@@ -532,6 +532,12 @@ def apply_harsh_weather_stress_noise(
     raw_name, raw_mu, raw_drag = _classify_raw_weather(weather_dict)
     if harsh_mode in ("raw", "none"):
         return dict(weather_dict), raw_name, raw_mu, raw_drag, False
+    if harsh_mode == "historic":
+        # Historic extreme day: the measured weather is kept as is (nothing injected); the leg is still an
+        # extreme-suite leg, so the non-weather stresses (sensor noise, unmodeled drag, tight slack) apply.
+        w = dict(weather_dict)
+        w["source"] = f"{weather_dict['source']} [historic extreme day, measured]"
+        return w, raw_name, raw_mu, raw_drag, True
 
     if harsh_mode == "mixed" and (ep_idx % 2 == 0):
         # Balanced 50/50 split: keep even episodes as pure unperturbed Real Open-Meteo Baseline
